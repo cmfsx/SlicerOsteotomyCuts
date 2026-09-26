@@ -10,10 +10,18 @@ sagittal + vertical buccal, connected), Le Fort I, genioplasty, segmental cuts.
 
 ## Roadmap
 - Phase 1: polyline cut (points on surface → extruded sheet → fragments)
-- Phase 2: kerf thickness (saw blade width) and limited cut depth
+- Phase 2: kerf thickness (saw blade width), limited cut depth, and capping
+  of fragment cut faces (watertight fragments)
 - Phase 3: templates for BSSO / Le Fort I / genioplasty driven by landmarks
 - Phase 4: interactive editing handles, fragment naming, STL export
 Build one phase at a time. Design each so later phases need no rewrite.
+
+Phase 2 notes (agreed during Phase 1 planning):
+- Prefer UNSIGNED distance to the sheet interior for kerf removal: remove
+  material where |d| < kerf/2, then separate with connectivity. This avoids
+  sign problems and allows finite, depth-limited sheets.
+- Locally subdivide the mesh near the sheet so edge length < kerf/2.
+- The zero-kerf path stays signed, as in Phase 1.
 
 ## Environment
 - Windows 11. Project: C:\Dev\OsteotomyCuts
@@ -50,8 +58,10 @@ Build one phase at a time. Design each so later phases need no rewrite.
 ## Testing
 - Tests use synthetic geometry (vtkCubeSource, vtkSphereSource) or SampleData.
 - NEVER read, open or copy any patient data folder or DICOM directory.
-- Headless test run (PowerShell):
-  & "C:\ProgramData\slicer.org\3D Slicer 5.13.0-2026-06-30\Slicer.exe" --no-splash --no-main-window --python-code "import slicer; slicer.util.selectModule('OsteotomyCuts'); import OsteotomyCuts; OsteotomyCuts.OsteotomyCutsTest().runTest(); slicer.util.exit(0)"
+- Headless test run (PowerShell); exit code 0 = all passed, 1 = failure:
+  & "C:\ProgramData\slicer.org\3D Slicer 5.13.0-2026-06-30\Slicer.exe" --no-splash --no-main-window --python-script "C:\Dev\OsteotomyCuts\OsteotomyCuts\Testing\Python\run_headless_tests.py" | Out-Host; $LASTEXITCODE
+- Do not use slicer.util.selectModule() headlessly: it needs a main window,
+  raises, and Slicer then never exits.
 
 ## Style
 - British English in UI text and comments.
