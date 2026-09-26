@@ -1,0 +1,20 @@
+   # Python cache
+   __pycache__/
+   *.pyc
+
+   # Build output
+   build/
+   *-build/
+
+   # Editor and OS files
+   .vscode/
+   .DS_Store
+   Thumbs.db
+
+   # Never commit patient or test data
+   *.dcm
+   *.nrrd
+   *.nii
+   *.nii.gz
+   *.mrb
+   *.stl
