@@ -160,7 +160,7 @@
       <item row="2" column="0">
        <widget class="QRadioButton" name="directionLineRadioButton">
         <property name="toolTip">
-         <string>Extrude the cut path along a markups line (from its first to its second point).</string>
+         <string>Extrude the cut path along a markups line. Place its first point outside the bone and its second point towards the inside: the cut depth is measured in that direction.</string>
         </property>
         <property name="text">
          <string>Markups line</string>
@@ -204,6 +204,90 @@
        <widget class="qSlicerMarkupsPlaceWidget" name="directionLinePlaceWidget">
         <property name="toolTip">
          <string>Place the two points of the direction line.</string>
+        </property>
+       </widget>
+      </item>
+     </layout>
+    </widget>
+   </item>
+   <item>
+    <widget class="ctkCollapsibleButton" name="sawCollapsibleButton">
+     <property name="text">
+      <string>Saw</string>
+     </property>
+     <layout class="QFormLayout" name="sawFormLayout">
+      <item row="0" column="0">
+       <widget class="QLabel" name="kerfWidthLabel">
+        <property name="text">
+         <string>Kerf width:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="0" column="1">
+       <widget class="ctkDoubleSpinBox" name="kerfWidthSpinBox">
+        <property name="toolTip">
+         <string>Width of bone removed by the saw blade (typically about 1.0 mm for an oscillating saw, 0.3-0.5 mm for a piezo insert). 0 gives a zero-width cut.</string>
+        </property>
+        <property name="decimals">
+         <number>2</number>
+        </property>
+        <property name="singleStep">
+         <double>0.100000000000000</double>
+        </property>
+        <property name="maximum">
+         <double>10.000000000000000</double>
+        </property>
+        <property name="suffix">
+         <string> mm</string>
+        </property>
+        <property name="SlicerParameterName" stdset="0">
+         <string>options.kerfWidth</string>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="0">
+       <widget class="QLabel" name="depthLabel">
+        <property name="text">
+         <string>Cut depth (0 = through):</string>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="1">
+       <widget class="ctkDoubleSpinBox" name="depthSpinBox">
+        <property name="toolTip">
+         <string>How deep the cut goes from the path points along the extrusion direction. 0 cuts through the whole model. A limited depth needs a kerf width greater than 0.</string>
+        </property>
+        <property name="decimals">
+         <number>1</number>
+        </property>
+        <property name="singleStep">
+         <double>0.500000000000000</double>
+        </property>
+        <property name="maximum">
+         <double>1000.000000000000000</double>
+        </property>
+        <property name="suffix">
+         <string> mm</string>
+        </property>
+        <property name="SlicerParameterName" stdset="0">
+         <string>options.depth</string>
+        </property>
+       </widget>
+      </item>
+      <item row="2" column="0">
+       <widget class="QLabel" name="capCutFacesLabel">
+        <property name="text">
+         <string>Cap cut faces:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="2" column="1">
+       <widget class="QCheckBox" name="capCutFacesCheckBox">
+        <property name="toolTip">
+         <string>Close the cut faces so that the fragments are watertight (needed for STL export and printing).</string>
+        </property>
+        <property name="SlicerParameterName" stdset="0">
+         <string>options.capCutFaces</string>
         </property>
        </widget>
       </item>
@@ -320,6 +404,35 @@
         </property>
         <property name="SlicerParameterName" stdset="0">
          <string>options.minFragmentFraction</string>
+        </property>
+       </widget>
+      </item>
+      <item row="2" column="0">
+       <widget class="QLabel" name="refineEdgeLengthLabel">
+        <property name="text">
+         <string>Max. edge near cut (0 = auto):</string>
+        </property>
+       </widget>
+      </item>
+      <item row="2" column="1">
+       <widget class="ctkDoubleSpinBox" name="refineEdgeLengthSpinBox">
+        <property name="toolTip">
+         <string>Mesh edges near the cut are subdivided until they are shorter than this, so the kerf faces are accurate. 0 uses half the kerf width.</string>
+        </property>
+        <property name="decimals">
+         <number>2</number>
+        </property>
+        <property name="singleStep">
+         <double>0.050000000000000</double>
+        </property>
+        <property name="maximum">
+         <double>10.000000000000000</double>
+        </property>
+        <property name="suffix">
+         <string> mm</string>
+        </property>
+        <property name="SlicerParameterName" stdset="0">
+         <string>options.refineEdgeLength</string>
         </property>
        </widget>
       </item>

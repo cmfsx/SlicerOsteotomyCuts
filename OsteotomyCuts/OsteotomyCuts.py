@@ -89,12 +89,21 @@ def isDirectionCaptured(direction: tuple[float, float, float]) -> bool:
 
 @parameterPack
 class CutOptions:
-    """Options for one cut. Phase 2 adds kerf width, depth and capping here."""
+    """Options for one cut. With kerfWidth = 0 and depth = 0 the cut is the Phase 1 zero-width
+    through-cut."""
 
     # Distance (mm) the sheet extends past the path; 0 = automatic (bounding-box diagonal)
     extension: Annotated[float, WithinRange(0.0, 10000.0)] = 0.0
     # Free-standing pieces smaller than this fraction of the model's points are discarded
     minFragmentFraction: Annotated[float, WithinRange(0.0, 0.5)] = 0.001
+    # Saw blade width (mm): bone closer than kerfWidth / 2 to the sheet is removed
+    kerfWidth: Annotated[float, WithinRange(0.0, 10.0)] = 0.0
+    # Cut depth (mm) from the path points along the extrusion direction; 0 = through the model
+    depth: Annotated[float, WithinRange(0.0, 1000.0)] = 0.0
+    # Close the cut faces so that fragments are watertight
+    capCutFaces: bool = True
+    # Maximum edge length (mm) near the sheet before cutting; 0 = automatic (kerfWidth / 2)
+    refineEdgeLength: Annotated[float, WithinRange(0.0, 10.0)] = 0.0
 
 
 @dataclass
@@ -430,13 +439,15 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
     #
 
     def buildSheetPolyData(self, pathPoints: np.ndarray, directions: np.ndarray,
-                           extent: float, closed: bool = False) -> vtk.vtkPolyData:
+                           extent: float, closed: bool = False,
+                           depth: Optional[float | np.ndarray] = None) -> vtk.vtkPolyData:
         """Build a ruled cutting sheet by extruding a polyline.
 
-        Each path point P is extruded to A = P - extent * d and B = P + extent * d, so the sheet
-        reaches ``extent`` to both sides of the path. An open path is also extended by
-        ``extent`` at both ends, along the end tangent with its component along d removed,
-        so that the sheet edges lie outside the model.
+        The direction d points into the model (away from the viewer). Each path point P is
+        extruded outward to A = P - extent * d and inward to B = P + depth * d (``depth``
+        defaults to ``extent``, a through-cut). An open path is also extended by ``extent`` at
+        both ends, along the end tangent with its component along d removed, so that the sheet
+        edges lie outside the model.
 
         Output point order is A, B pairs along the (extended) path:
         ``[A_start, B_start, A_0, B_0, ..., A_last, B_last, A_end, B_end]`` for an open path and
@@ -448,9 +459,11 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
             (Phase 3 BSSO templates use a different direction per segment). Normalised here.
         :param extent: distance (mm) the sheet reaches along +/- direction and past the ends.
         :param closed: join the last point to the first and do not extend the ends.
+        :param depth: inward reach (mm) along d from the path: one value, or (N,) one per path
+            point (for templates). None means ``extent`` (through-cut).
         :return: triangulated sheet with consistent winding, point and cell normals.
         :raises ValueError: too few distinct points, a zero or malformed direction, a
-            non-positive extent, or a path segment (nearly) parallel to its direction.
+            non-positive extent or depth, or a path segment (nearly) parallel to its direction.
         """
         points = np.asarray(pathPoints, dtype=float)
         if points.ndim != 2 or points.shape[1] != 3:
@@ -468,13 +481,21 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
             raise ValueError(_("The extrusion direction must not be a zero vector."))
         dirs = dirs / lengths[:, np.newaxis]
 
+        depths = np.full(len(points), float(extent)) if depth is None else np.asarray(depth, dtype=float)
+        if depths.ndim == 0:
+            depths = np.full(len(points), float(depths))
+        elif depths.shape != (len(points),):
+            raise ValueError(_("Depth must be a single value or one value per path point."))
+        if np.any(~(depths > 0)):
+            raise ValueError(_("The cut depth must be positive."))
+
         # Remove consecutive duplicates (and, for a closed path, a repeated first point at the end)
         if len(points) > 0:
             keep = np.ones(len(points), dtype=bool)
             keep[1:] = np.linalg.norm(np.diff(points, axis=0), axis=1) > self.DUPLICATE_POINT_TOLERANCE
-            points, dirs = points[keep], dirs[keep]
+            points, dirs, depths = points[keep], dirs[keep], depths[keep]
         if closed and len(points) > 1 and np.linalg.norm(points[-1] - points[0]) <= self.DUPLICATE_POINT_TOLERANCE:
-            points, dirs = points[:-1], dirs[:-1]
+            points, dirs, depths = points[:-1], dirs[:-1], depths[:-1]
 
         minPoints = 3 if closed else 2
         if len(points) < minPoints:
@@ -497,11 +518,12 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
             endPoint = points[-1] + extent * self._endExtensionDirection(points[-1] - points[-2], dirs[-1])
             points = np.vstack([startPoint, points, endPoint])
             dirs = np.vstack([dirs[0], dirs, dirs[-1]])
+            depths = np.concatenate([depths[:1], depths, depths[-1:]])
 
-        # Interleaved A_i, B_i vertices
+        # Interleaved A_i (outward), B_i (inward) vertices
         vertices = np.empty((2 * len(points), 3))
         vertices[0::2] = points - extent * dirs
-        vertices[1::2] = points + extent * dirs
+        vertices[1::2] = points + depths[:, np.newaxis] * dirs
 
         vtkPoints = vtk.vtkPoints()
         vtkPoints.SetData(numpy_support.numpy_to_vtk(vertices, deep=True))
@@ -642,10 +664,13 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         with unsigned distance to the sheet interior (see CLAUDE.md).
 
         :param polyWithDistance: mesh with the distance point array (computeSheetDistance).
-        :param options: cut options (unused until Phase 2 adds kerf).
+        :param options: cut options; kerf removal (kerfWidth > 0) is added in Phase 2 step 3.
         :param arrayName: name of the distance array.
         :return: (positive side, negative side), both triangulated; either may be empty.
+        :raises ValueError: for kerfWidth > 0, until kerf removal is implemented.
         """
+        if options.kerfWidth > 0:
+            raise ValueError(_("Cutting with a kerf width is not available yet. Set the kerf width to 0."))
         polyWithDistance.GetPointData().SetActiveScalars(arrayName)
         clipper = vtk.vtkClipPolyData()
         clipper.SetInputData(polyWithDistance)
@@ -879,6 +904,9 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
             self.resolveDirection(parameterNode)
         except ValueError as error:
             return str(error)
+        if parameterNode.options.depth > 0 and not parameterNode.options.kerfWidth > 0:
+            # A zero-width cut that stops inside the model removes nothing and separates nothing
+            return _("A limited cut depth needs a kerf width greater than 0.")
         return None
 
     def getWorldPolyData(self, modelNode: vtkMRMLModelNode) -> vtk.vtkPolyData:
@@ -975,10 +1003,11 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         reason = self.validateInputs(parameterNode)
         if reason:
             raise ValueError(reason)
-        curveNode = parameterNode.cutCurve
+        curveNode, options = parameterNode.cutCurve, parameterNode.options
         return self.buildSheetPolyData(self.getPathPoints(curveNode), self.resolveDirection(parameterNode),
-                                       self.computeModelExtent(parameterNode.inputModel, parameterNode.options),
-                                       closed=self.isClosedCurve(curveNode))
+                                       self.computeModelExtent(parameterNode.inputModel, options),
+                                       closed=self.isClosedCurve(curveNode),
+                                       depth=options.depth if options.depth > 0 else None)
 
     def updateSheetModel(self, parameterNode: OsteotomyCutsParameterNode) -> Optional[vtkMRMLModelNode]:
         """Show the cutting sheet for the current inputs (live preview).
@@ -1361,6 +1390,11 @@ class OsteotomyCutsTest(ScriptedLoadableModuleTest):
         self.assertEqual(parameterNode.directionMode, DirectionMode.VIEW)
         self.assertEqual(parameterNode.options.extension, 0.0)
         self.assertAlmostEqual(parameterNode.options.minFragmentFraction, 0.001)
+        # Phase 2 defaults reproduce the Phase 1 zero-width through-cut
+        self.assertEqual(parameterNode.options.kerfWidth, 0.0)
+        self.assertEqual(parameterNode.options.depth, 0.0)
+        self.assertTrue(parameterNode.options.capCutFaces)
+        self.assertEqual(parameterNode.options.refineEdgeLength, 0.0)
 
         parameterNode.viewDirection = (0.0, 1.0, 0.0)
         parameterNode.directionMode = DirectionMode.LINE
@@ -2055,3 +2089,57 @@ class OsteotomyCutsTest(ScriptedLoadableModuleTest):
         logic.removeCutResult(curve)
         self.assertEqual(logic.getCurveResult(curve), [])
         self.assertTrue(self._isVisible(parameterNode.inputModel))
+
+    #
+    # Phase 2 step 1: depth, options
+    #
+
+    def test_sheet_depth(self):
+        """With a depth, the sheet reaches outward by the extent but inward only by the depth."""
+        logic = OsteotomyCutsLogic()
+        extent, depth = 50.0, 8.0
+        path = np.array([[-10.0, 0.0, 0.0], [10.0, 0.0, 0.0]])
+        down = np.array([0.0, 0.0, -1.0])
+        sheet = logic.buildSheetPolyData(path, down, extent, depth=depth)
+
+        points = self._points(sheet)
+        np.testing.assert_allclose(points[0::2, 2], extent)  # outward vertices (against d)
+        np.testing.assert_allclose(points[1::2, 2], -depth)  # inward vertices (along d)
+        self.assertAlmostEqual(sheet.GetBounds()[4], -depth)
+
+        # One depth per path point; end extensions take the depth of their end point
+        sheet = logic.buildSheetPolyData(path, down, extent, depth=np.array([2.0, 6.0]))
+        np.testing.assert_allclose(self._points(sheet)[1::2, 2], [-2.0, -2.0, -6.0, -6.0])
+
+        # No depth is a through-cut, as in Phase 1
+        np.testing.assert_allclose(self._points(logic.buildSheetPolyData(path, down, extent))[1::2, 2], -extent)
+
+    def test_sheet_depth_errors(self):
+        """Zero, negative or wrongly sized depths raise ValueError."""
+        logic = OsteotomyCutsLogic()
+        path = np.array([[-10.0, 0.0, 0.0], [10.0, 0.0, 0.0]])
+        down = np.array([0.0, 0.0, -1.0])
+        for depth in (0.0, -1.0, np.array([1.0, 2.0, 3.0]), np.array([1.0, 0.0])):
+            with self.assertRaises(ValueError, msg=str(depth)):
+                logic.buildSheetPolyData(path, down, 50.0, depth=depth)
+
+    def test_depthOptions(self):
+        """Depth needs a kerf; the preview sheet follows the depth; kerf cutting is not available yet."""
+        logic = OsteotomyCutsLogic()
+        model = self._addModel(self._box(), "Box")
+        curve = self._addCurve(self.X_CUT_PATH, "CutA")
+        parameterNode = self._configure(model, curve)
+
+        parameterNode.options.depth = 12.0
+        self.assertIn("kerf width", logic.validateInputs(parameterNode))
+        self.assertIsNone(logic.updateSheetModel(parameterNode))
+
+        parameterNode.options.kerfWidth = 1.0
+        self.assertIsNone(logic.validateInputs(parameterNode))
+        sheetNode = logic.updateSheetModel(parameterNode)
+        self.assertAlmostEqual(sheetNode.GetPolyData().GetBounds()[4], 50.0 - 12.0, places=6)
+
+        with self.assertRaises(ValueError):  # until Phase 2 step 3
+            logic.applyCut(parameterNode)
+        self.assertEqual(logic.getCurveResult(curve), [])
+        self.assertTrue(self._isVisible(model))
