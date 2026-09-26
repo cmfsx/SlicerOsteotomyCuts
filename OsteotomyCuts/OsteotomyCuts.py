@@ -175,6 +175,7 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._resultMessage = ""  # outcome of the last action, shown while inputs are valid
         self._previewTimer = None  # throttles sheet preview rebuilds while points are dragged
         self._snapping = False  # guards against reacting to our own snapping edits
+        self._reconnectAfterImport = False  # GUI was connected when a scene import started
 
     def setup(self) -> None:
         """Called when the user opens the module the first time and the widget is initialised."""
@@ -190,6 +191,9 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # These connections ensure that we update parameter node when scene is closed
         self.addObserver(slicer.mrmlScene, slicer.mrmlScene.StartCloseEvent, self.onSceneStartClose)
         self.addObserver(slicer.mrmlScene, slicer.mrmlScene.EndCloseEvent, self.onSceneEndClose)
+        # A loaded scene may bring a parameter node saved by an earlier version of the module
+        self.addObserver(slicer.mrmlScene, slicer.mrmlScene.StartImportEvent, self.onSceneStartImport)
+        self.addObserver(slicer.mrmlScene, slicer.mrmlScene.EndImportEvent, self.onSceneEndImport)
 
         # The direction mode enum has no ready-made radio button connector, so it is wired here
         self.ui.directionViewRadioButton.connect("toggled(bool)", self.onDirectionModeToggled)
@@ -227,7 +231,7 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if self._parameterNode:
             self._parameterNode.disconnectGui(self._parameterNodeGuiTag)
             self._parameterNodeGuiTag = None
-            self.removeObserver(self._parameterNode, vtk.vtkCommand.ModifiedEvent, self._updateGuiFromParameterNode)
+            self.removeObserver(self._parameterNode.parameterNode, vtk.vtkCommand.ModifiedEvent, self._updateGuiFromParameterNode)
         self._observeMarkupsNodes([])
         if self._previewTimer:
             self._previewTimer.stop()
@@ -241,6 +245,20 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if self.parent.isEntered:
             self.initializeParameterNode()
 
+    def onSceneStartImport(self, caller, event) -> None:
+        """Called before a scene is loaded: let go of the parameter node while it may be replaced
+        by one saved with fewer parameters (reading it half-loaded would fail)."""
+        self._reconnectAfterImport = self._parameterNodeGuiTag is not None
+        self.setParameterNode(None)
+
+    def onSceneEndImport(self, caller, event) -> None:
+        """Called after a scene is loaded: upgrade the parameter node and reconnect the GUI."""
+        if self._reconnectAfterImport:
+            self.initializeParameterNode()  # logic.getParameterNode() adds missing parameters
+        else:
+            self.logic.getParameterNode()  # upgrade now; the GUI connects on the next enter()
+        self._reconnectAfterImport = False
+
     def initializeParameterNode(self) -> None:
         """Ensure parameter node exists and observed."""
         self.setParameterNode(self.logic.getParameterNode())
@@ -249,13 +267,16 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         """Set and observe parameter node, so that the GUI follows parameter changes."""
         if self._parameterNode:
             self._parameterNode.disconnectGui(self._parameterNodeGuiTag)
-            self.removeObserver(self._parameterNode, vtk.vtkCommand.ModifiedEvent, self._updateGuiFromParameterNode)
+            self._parameterNodeGuiTag = None
+            # The raw MRML node is observed, not the wrapper: VTKObservationMixin keeps a
+            # reference to every object it has observed, which would keep old wrappers alive.
+            self.removeObserver(self._parameterNode.parameterNode, vtk.vtkCommand.ModifiedEvent, self._updateGuiFromParameterNode)
         self._observeMarkupsNodes([])
         self._parameterNode = inputParameterNode
         if self._parameterNode:
             # Widgets with a "SlicerParameterName" property in the .ui file are connected here
             self._parameterNodeGuiTag = self._parameterNode.connectGui(self.ui)
-            self.addObserver(self._parameterNode, vtk.vtkCommand.ModifiedEvent, self._updateGuiFromParameterNode)
+            self.addObserver(self._parameterNode.parameterNode, vtk.vtkCommand.ModifiedEvent, self._updateGuiFromParameterNode)
             self._updateGuiFromParameterNode()
 
     def onDirectionModeToggled(self, checked: bool) -> None:
@@ -368,11 +389,17 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         """New cut paths are polylines: straight segments between the placed points."""
         curveNode.SetCurveTypeToLinear()
 
+    def _requireParameterNode(self) -> OsteotomyCutsParameterNode:
+        """Return the parameter node, reconnecting it if a scene close or load left none."""
+        if self._parameterNode is None:
+            self.initializeParameterNode()
+        return self._parameterNode
+
     def onCaptureViewDirection(self) -> None:
         """Store the viewing direction of the first 3D view."""
         with slicer.util.tryWithErrorDisplay(_("Failed to capture the view direction."), waitCursor=True):
             viewNode = slicer.app.layoutManager().threeDWidget(0).mrmlViewNode()
-            self.logic.captureViewDirection(self._parameterNode, viewNode)
+            self.logic.captureViewDirection(self._requireParameterNode(), viewNode)
 
     def onApplyButton(self) -> None:
         """Cut the model, with a progress dialog."""
@@ -385,7 +412,7 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         try:
             with slicer.util.tryWithErrorDisplay(_("Failed to cut the model."), waitCursor=True):
-                fragments = self.logic.applyCut(self._parameterNode, reportProgress)
+                fragments = self.logic.applyCut(self._requireParameterNode(), reportProgress)
                 self._resultMessage = _("{count} fragments created.").format(count=len(fragments))
         finally:
             progress.close()
@@ -394,14 +421,15 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     def onUndoButton(self) -> None:
         """Remove the fragments of the selected cut path and show its input model again."""
         with slicer.util.tryWithErrorDisplay(_("Failed to undo the cut."), waitCursor=True):
-            self.logic.removeCutResult(self._parameterNode.cutCurve)
+            self.logic.removeCutResult(self._requireParameterNode().cutCurve)
             self._resultMessage = _("Cut undone.")
         self._updateActionState()
 
     def onMergeButton(self) -> None:
         """Join the ticked fragments into one model."""
         with slicer.util.tryWithErrorDisplay(_("Failed to merge the fragments."), waitCursor=True):
-            merged = self.logic.mergeFragments(list(self.ui.mergeFragmentsSelector.checkedNodes()))
+            self._requireParameterNode()
+            merged =self.logic.mergeFragments(list(self.ui.mergeFragmentsSelector.checkedNodes()))
             self._resultMessage = _("Fragments merged into {name}.").format(name=merged.GetName())
         self._updateActionState()
 
@@ -431,8 +459,35 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
     SNAP_TOLERANCE = 1e-3
 
     def getParameterNode(self) -> OsteotomyCutsParameterNode:
-        """Return the module's parameter node, creating it if needed."""
-        return OsteotomyCutsParameterNode(super().getParameterNode())
+        """Return the module's parameter node, creating it if needed.
+
+        Parameters added in a later version are filled in with their defaults first, so that
+        scenes saved by an earlier version still load.
+        """
+        parameterNode = super().getParameterNode()
+        self.addMissingParameters(parameterNode)
+        return OsteotomyCutsParameterNode(parameterNode)
+
+    @staticmethod
+    def addMissingParameters(parameterNode) -> list[str]:
+        """Write default values for parameters the node does not have yet (scene upgrade).
+
+        parameterNodeWrapper only writes defaults when a whole parameter (e.g. the ``options``
+        pack) is missing; a pack saved with fewer fields fails to read. Existing values are
+        never changed.
+
+        :param parameterNode: the raw vtkMRMLScriptedModuleNode.
+        :return: names of the parameters that were added.
+        """
+        defaults = slicer.vtkMRMLScriptedModuleNode()
+        OsteotomyCutsParameterNode(defaults)  # writes every default value into the temporary node
+        existing = set(parameterNode.GetParameterNames())
+        if not existing:
+            return []  # new node: the wrapper writes all defaults itself
+        added = [name for name in defaults.GetParameterNames() if name not in existing]
+        for name in added:
+            parameterNode.SetParameter(name, defaults.GetParameter(name))
+        return added
 
     #
     # Geometry (no MRML)
@@ -2143,3 +2198,31 @@ class OsteotomyCutsTest(ScriptedLoadableModuleTest):
             logic.applyCut(parameterNode)
         self.assertEqual(logic.getCurveResult(curve), [])
         self.assertTrue(self._isVisible(model))
+
+    def test_oldSceneUpgrade(self):
+        """A scene saved before newer options existed loads, keeps its values and gets defaults."""
+        import os
+        logic = OsteotomyCutsLogic()
+        parameterNode = self._configure(self._addModel(self._box(), "Box"), self._addCurve(self.X_CUT_PATH, "CutA"))
+        parameterNode.options.extension = 250.0
+        rawNode = parameterNode.parameterNode
+        del parameterNode  # the wrapper would try (and fail) to re-read the node as it is edited
+        newOptions = ("options.kerfWidth", "options.depth", "options.capCutFaces", "options.refineEdgeLength")
+        for name in newOptions:  # as saved by Phase 1
+            rawNode.UnsetParameter(name)
+
+        scenePath = os.path.join(slicer.app.temporaryPath, "OsteotomyCutsOldScene.mrb")
+        try:
+            self.assertTrue(slicer.util.saveScene(scenePath))
+            slicer.mrmlScene.Clear()
+            slicer.util.loadScene(scenePath)
+        finally:
+            if os.path.exists(scenePath):
+                os.remove(scenePath)
+
+        parameterNode = logic.getParameterNode()  # failed before the upgrade was added
+        self.assertEqual(parameterNode.options.extension, 250.0)
+        self.assertEqual(parameterNode.options.kerfWidth, 0.0)
+        self.assertTrue(parameterNode.options.capCutFaces)
+        self.assertEqual(parameterNode.cutCurve.GetName(), "CutA")
+        self.assertEqual(logic.addMissingParameters(parameterNode.parameterNode), [])
