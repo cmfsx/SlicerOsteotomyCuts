@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from typing import Annotated, Callable, Optional
 
 import numpy as np
+import qt
 import vtk
 from vtk.util import numpy_support
 
@@ -151,6 +152,9 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     https://github.com/Slicer/Slicer/blob/main/Base/Python/slicer/ScriptedLoadableModule.py
     """
 
+    # Delay after the last point edit before the sheet preview is rebuilt
+    PREVIEW_DELAY_MS = 80
+
     def __init__(self, parent=None) -> None:
         """Called when the user opens the module the first time and the widget is initialised."""
         ScriptedLoadableModuleWidget.__init__(self, parent)
@@ -160,6 +164,8 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._parameterNodeGuiTag = None
         self._observedMarkupsNodes = []  # curve and line whose point edits refresh the GUI
         self._resultMessage = ""  # outcome of the last action, shown while inputs are valid
+        self._previewTimer = None  # throttles sheet preview rebuilds while points are dragged
+        self._snapping = False  # guards against reacting to our own snapping edits
 
     def setup(self) -> None:
         """Called when the user opens the module the first time and the widget is initialised."""
@@ -186,12 +192,20 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.ui.undoButton.connect("clicked(bool)", self.onUndoButton)
         self.ui.mergeButton.connect("clicked(bool)", self.onMergeButton)
         self.ui.mergeFragmentsSelector.connect("checkedNodesChanged()", self._updateMergeButton)
+        self.ui.sheetOpacitySliderWidget.connect("valueChanged(double)", self._applySheetOpacity)
+
+        self._previewTimer = qt.QTimer()
+        self._previewTimer.setSingleShot(True)
+        self._previewTimer.setInterval(self.PREVIEW_DELAY_MS)
+        self._previewTimer.connect("timeout()", self._updatePreview)
 
         # Make sure parameter node is initialised (needed for module reload)
         self.initializeParameterNode()
 
     def cleanup(self) -> None:
         """Called when the application closes and the module widget is destroyed."""
+        if self._previewTimer:
+            self._previewTimer.stop()
         self.removeObservers()
         self._observedMarkupsNodes = []
 
@@ -206,6 +220,8 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self._parameterNodeGuiTag = None
             self.removeObserver(self._parameterNode, vtk.vtkCommand.ModifiedEvent, self._updateGuiFromParameterNode)
         self._observeMarkupsNodes([])
+        if self._previewTimer:
+            self._previewTimer.stop()
 
     def onSceneStartClose(self, caller, event) -> None:
         """Called just before the scene is closed."""
@@ -266,6 +282,45 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         self._observeMarkupsNodes([self._parameterNode.cutCurve, self._parameterNode.directionLine])
         self._updateActionState()
+        self._schedulePreview()
+
+    def _onMarkupsModified(self, caller=None, event=None) -> None:
+        """Points of the cut path or direction line changed."""
+        self._updateActionState()
+        self._schedulePreview()
+
+    def _onCurvePointsPlaced(self, caller=None, event=None) -> None:
+        """After a point is placed or dragged, put the cut path back on the model surface."""
+        parameterNode = self._parameterNode
+        if (self._snapping or not parameterNode or not parameterNode.snapToSurface
+                or parameterNode.inputModel is None or parameterNode.cutCurve is None
+                or caller is None or caller.GetID() != parameterNode.cutCurve.GetID()):
+            return
+        self._snapping = True
+        try:
+            self.logic.snapCurveToSurface(parameterNode.cutCurve, parameterNode.inputModel)
+        except ValueError:
+            pass  # empty model or non-linear transform: validateInputs already reports it
+        finally:
+            self._snapping = False
+
+    def _schedulePreview(self) -> None:
+        """Rebuild the sheet preview shortly, once point edits pause."""
+        if self._previewTimer:
+            self._previewTimer.start()
+
+    def _updatePreview(self) -> None:
+        """Show, update or hide the cutting sheet preview."""
+        if not self._parameterNode:
+            return
+        if self.logic.updateSheetModel(self._parameterNode) is not None:
+            self._applySheetOpacity()
+
+    def _applySheetOpacity(self, value: Optional[float] = None) -> None:
+        """Set the opacity of the sheet preview from the slider (display only, not a parameter)."""
+        sheetNode = self._parameterNode.sheetModel if self._parameterNode else None
+        if sheetNode is not None and sheetNode.GetDisplayNode() is not None:
+            sheetNode.GetDisplayNode().SetOpacity(self.ui.sheetOpacitySliderWidget.value)
 
     def _updateActionState(self, caller=None, event=None) -> None:
         """Enable Apply / Undo and show why a cut cannot run yet."""
@@ -282,19 +337,23 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.ui.mergeButton.enabled = len(self.ui.mergeFragmentsSelector.checkedNodes()) >= 2
 
     def _observeMarkupsNodes(self, nodes: list) -> None:
-        """Refresh the GUI when points of these markups nodes are added, removed or moved."""
+        """Refresh the GUI and preview when points of these markups nodes change, and snap
+        cut path points to the surface when a placement or drag ends."""
         nodes = [node for node in nodes if node is not None]
         if [n.GetID() for n in nodes] == [n.GetID() for n in self._observedMarkupsNodes]:
             return
-        events = (slicer.vtkMRMLMarkupsNode.PointAddedEvent, slicer.vtkMRMLMarkupsNode.PointRemovedEvent,
-                  slicer.vtkMRMLMarkupsNode.PointModifiedEvent)
+        markups = slicer.vtkMRMLMarkupsNode
+        observations = [(event, self._onMarkupsModified) for event in
+                        (markups.PointAddedEvent, markups.PointRemovedEvent, markups.PointModifiedEvent)]
+        observations += [(event, self._onCurvePointsPlaced) for event in
+                         (markups.PointEndInteractionEvent, markups.PointPositionDefinedEvent)]
         for node in self._observedMarkupsNodes:
-            for event in events:
-                self.removeObserver(node, event, self._updateActionState)
+            for event, callback in observations:
+                self.removeObserver(node, event, callback)
         self._observedMarkupsNodes = nodes
         for node in nodes:
-            for event in events:
-                self.addObserver(node, event, self._updateActionState)
+            for event, callback in observations:
+                self.addObserver(node, event, callback)
 
     def onCutCurveAdded(self, curveNode) -> None:
         """New cut paths are polylines: straight segments between the placed points."""
@@ -349,6 +408,8 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
     def __init__(self) -> None:
         """Initialise the logic."""
         ScriptedLoadableModuleLogic.__init__(self)
+        # (cache key, vtkCellLocator) for snapping to the last used model surface
+        self._surfaceLocatorCache = None
 
     # A path segment closer than this angle to its extrusion direction is rejected, because the
     # sheet would degenerate to a sliver there.
@@ -356,6 +417,9 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
 
     # Consecutive path points closer than this (mm) are treated as duplicates
     DUPLICATE_POINT_TOLERANCE = 1e-6
+
+    # Points closer than this (mm) to the surface are not moved when snapping
+    SNAP_TOLERANCE = 1e-3
 
     def getParameterNode(self) -> OsteotomyCutsParameterNode:
         """Return the module's parameter node, creating it if needed."""
@@ -739,6 +803,9 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         """
         if curveNode is None or curveNode.GetNumberOfControlPoints() < 2:
             raise ValueError(_("The cut path needs at least 2 points."))
+        if curveNode.GetCurveType() == slicer.vtkCurveGenerator.CURVE_TYPE_LINEAR_SPLINE:
+            # The sampled curve adds redundant points along straight segments
+            return np.array(slicer.util.arrayFromMarkupsControlPoints(curveNode, world=True), dtype=float)
         return np.array(slicer.util.arrayFromMarkupsCurvePoints(curveNode, world=True), dtype=float)
 
     @staticmethod
@@ -840,6 +907,119 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         result.DeepCopy(transformFilter.GetOutput())
         return result
 
+    def snapCurveToSurface(self, curveNode: vtkMRMLMarkupsCurveNode, modelNode: vtkMRMLModelNode) -> int:
+        """Move each control point of the curve to the closest point on the model surface.
+
+        Used after points are placed or dragged (also in slice views, where they are not on
+        the surface), and by Phase 3 templates placing landmarks.
+
+        :return: number of points that were moved.
+        :raises ValueError: if the model is empty or under a non-linear transform.
+        """
+        locator = self._getSurfaceLocator(modelNode)
+        position, closest = [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]
+        cellId, subId, distance2 = vtk.reference(0), vtk.reference(0), vtk.reference(0.0)
+        moved = 0
+        wasModifying = curveNode.StartModify()
+        try:
+            for i in range(curveNode.GetNumberOfControlPoints()):
+                curveNode.GetNthControlPointPositionWorld(i, position)
+                locator.FindClosestPoint(position, closest, cellId, subId, distance2)
+                if float(distance2) > self.SNAP_TOLERANCE ** 2:
+                    curveNode.SetNthControlPointPositionWorld(i, *closest)
+                    moved += 1
+        finally:
+            curveNode.EndModify(wasModifying)
+        return moved
+
+    def _getSurfaceLocator(self, modelNode: vtkMRMLModelNode) -> vtk.vtkCellLocator:
+        """Cell locator on the model surface in world coordinates, cached until the model changes."""
+        transformNode = modelNode.GetParentTransformNode()
+        polyData = modelNode.GetPolyData()
+        matrixKey = None
+        if transformNode is not None and transformNode.IsTransformToWorldLinear():
+            matrix = vtk.vtkMatrix4x4()
+            transformNode.GetMatrixTransformToWorld(matrix)
+            matrixKey = tuple(matrix.GetElement(r, c) for r in range(4) for c in range(4))
+        key = (modelNode.GetID(), polyData.GetMTime() if polyData else 0, matrixKey)
+        if self._surfaceLocatorCache is None or self._surfaceLocatorCache[0] != key:
+            locator = vtk.vtkCellLocator()
+            locator.SetDataSet(self.getWorldPolyData(modelNode))
+            locator.BuildLocator()
+            self._surfaceLocatorCache = (key, locator)
+        return self._surfaceLocatorCache[1]
+
+    #
+    # Cutting sheet preview (MRML)
+    #
+
+    def computeModelExtent(self, modelNode: vtkMRMLModelNode, options: CutOptions) -> float:
+        """Sheet extent for a model: options.extension if set, otherwise its world bounding-box diagonal.
+
+        Uses the node's world (RAS) bounds, so it is cheap enough for live preview.
+        """
+        if options.extension > 0:
+            return float(options.extension)
+        bounds = np.zeros(6)
+        modelNode.GetRASBounds(bounds)
+        diagonal = float(np.linalg.norm(bounds[1::2] - bounds[0::2]))
+        if not diagonal > 0:
+            raise ValueError(_("The selected model is empty."))
+        return diagonal
+
+    def buildSheetForParameters(self, parameterNode: OsteotomyCutsParameterNode) -> vtk.vtkPolyData:
+        """Build the cutting sheet from the parameter node's model, cut path, direction and options.
+
+        :raises ValueError: if the inputs are invalid.
+        """
+        reason = self.validateInputs(parameterNode)
+        if reason:
+            raise ValueError(reason)
+        curveNode = parameterNode.cutCurve
+        return self.buildSheetPolyData(self.getPathPoints(curveNode), self.resolveDirection(parameterNode),
+                                       self.computeModelExtent(parameterNode.inputModel, parameterNode.options),
+                                       closed=self.isClosedCurve(curveNode))
+
+    def updateSheetModel(self, parameterNode: OsteotomyCutsParameterNode) -> Optional[vtkMRMLModelNode]:
+        """Show the cutting sheet for the current inputs (live preview).
+
+        Creates the "CuttingSheet" model node on first use (semi-transparent red, hidden from
+        node selectors, not selectable so points are not placed on it) and stores it in the
+        parameter node. The sheet is hidden if live preview is off or the inputs are invalid.
+
+        :return: the sheet model node, or None if no sheet is shown.
+        """
+        if not parameterNode.livePreview:
+            self.hideSheetModel(parameterNode)
+            return None
+        try:
+            sheet = self.buildSheetForParameters(parameterNode)
+        except ValueError:
+            self.hideSheetModel(parameterNode)
+            return None
+
+        sheetNode = parameterNode.sheetModel
+        if sheetNode is None:
+            sheetNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode", "CuttingSheet")
+            sheetNode.SetHideFromEditors(True)
+            sheetNode.SetSelectable(False)
+            sheetNode.CreateDefaultDisplayNodes()
+            displayNode = sheetNode.GetDisplayNode()
+            displayNode.SetColor(0.9, 0.2, 0.2)
+            displayNode.SetOpacity(0.4)
+            displayNode.SetBackfaceCulling(False)
+            displayNode.SetVisibility2D(True)
+            parameterNode.sheetModel = sheetNode
+        sheetNode.SetAndObservePolyData(sheet)
+        sheetNode.GetDisplayNode().SetVisibility(True)
+        return sheetNode
+
+    def hideSheetModel(self, parameterNode: OsteotomyCutsParameterNode) -> None:
+        """Hide the cutting sheet preview, if there is one."""
+        sheetNode = parameterNode.sheetModel
+        if sheetNode is not None and sheetNode.GetDisplayNode() is not None:
+            sheetNode.GetDisplayNode().SetVisibility(False)
+
     #
     # Cut results (MRML)
     #
@@ -867,9 +1047,7 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         report = progressCallback or (lambda percent, message: None)
         report(0, _("Preparing..."))
         polyData = self.getWorldPolyData(inputModel)
-        extent = parameterNode.options.extension or self.computeAutoExtent(polyData)
-        sheet = self.buildSheetPolyData(self.getPathPoints(curveNode), self.resolveDirection(parameterNode),
-                                        extent, closed=self.isClosedCurve(curveNode))
+        sheet = self.buildSheetForParameters(parameterNode)
         fragments = self.cutPolyData(polyData, [sheet], parameterNode.options, progressCallback)
         if len(fragments) < 2:
             raise ValueError(_("The cutting sheet does not divide the model. Check the cut path and direction."))
@@ -1774,3 +1952,106 @@ class OsteotomyCutsTest(ScriptedLoadableModuleTest):
 
         self.assertEqual(self._ids(logic.getCurveResult(curve)), nodeIds)
         self.assertFalse(self._isVisible(model))
+
+    #
+    # Step 5: preview, snapping, scene round trip
+    #
+
+    def test_snap(self):
+        """Points off the surface are moved onto it; points on it are left alone."""
+        logic = OsteotomyCutsLogic()
+        model = self._addModel(self._sphere(30.0), "Sphere")
+        curve = self._addCurve([[35.0, 0.0, 0.0], [0.0, 25.0, 0.0], [0.0, 0.0, 34.0]], "CutA")
+
+        self.assertEqual(logic.snapCurveToSurface(curve, model), 3)
+        radii = np.linalg.norm(slicer.util.arrayFromMarkupsControlPoints(curve, world=True), axis=1)
+        np.testing.assert_allclose(radii, 30.0, atol=0.1)
+        self.assertEqual(logic.snapCurveToSurface(curve, model), 0)
+
+    def test_snap_transformedModel(self):
+        """Snapping uses the model surface in world coordinates."""
+        logic = OsteotomyCutsLogic()
+        model = self._addModel(self._sphere(30.0), "Sphere")
+        transform = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLinearTransformNode")
+        matrix = vtk.vtkMatrix4x4()
+        matrix.SetElement(1, 3, 50.0)
+        transform.SetMatrixTransformToParent(matrix)
+        model.SetAndObserveTransformNodeID(transform.GetID())
+        curve = self._addCurve([[0.0, 50.0, 40.0], [0.0, 90.0, 0.0]], "CutA")
+
+        logic.snapCurveToSurface(curve, model)
+
+        points = slicer.util.arrayFromMarkupsControlPoints(curve, world=True)
+        np.testing.assert_allclose(np.linalg.norm(points - [0.0, 50.0, 0.0], axis=1), 30.0, atol=0.1)
+
+    def test_sheetPreview(self):
+        """The preview sheet follows the inputs, and is hidden when they are invalid or preview is off."""
+        logic = OsteotomyCutsLogic()
+        model = self._addModel(self._box(), "Box")
+        curve = self._addCurve(self.X_CUT_PATH, "CutA")
+        parameterNode = self._configure(model, curve)
+
+        sheetNode = logic.updateSheetModel(parameterNode)
+        self.assertIsNotNone(sheetNode)
+        self.assertEqual(parameterNode.sheetModel.GetID(), sheetNode.GetID())
+        self.assertTrue(sheetNode.GetHideFromEditors())
+        self.assertFalse(sheetNode.GetSelectable())
+        self.assertTrue(sheetNode.GetDisplayNode().GetVisibility())
+        self.assertEqual(sheetNode.GetPolyData().GetNumberOfPoints(), 8)
+        self.assertAlmostEqual(sheetNode.GetPolyData().GetBounds()[0], 1.3, places=6)
+
+        # Moving a point updates the same sheet node
+        curve.SetNthControlPointPositionWorld(1, 20.0, 40.0, 50.0)
+        self.assertEqual(logic.updateSheetModel(parameterNode).GetID(), sheetNode.GetID())
+        self.assertGreater(sheetNode.GetPolyData().GetBounds()[1], 20.0)
+
+        # The preview and the cut use the same sheet
+        np.testing.assert_allclose(logic.buildSheetForParameters(parameterNode).GetBounds(),
+                                   sheetNode.GetPolyData().GetBounds())
+
+        parameterNode.viewDirection = NOT_CAPTURED
+        self.assertIsNone(logic.updateSheetModel(parameterNode))
+        self.assertFalse(sheetNode.GetDisplayNode().GetVisibility())
+
+        parameterNode.viewDirection = self.DOWN
+        parameterNode.livePreview = False
+        self.assertIsNone(logic.updateSheetModel(parameterNode))
+        self.assertFalse(sheetNode.GetDisplayNode().GetVisibility())
+        self.assertEqual(len(slicer.util.getNodes("CuttingSheet*")), 1)
+
+    def test_sceneRoundTrip(self):
+        """Parameters, the captured direction and cut results survive saving and reloading a scene."""
+        import os
+        logic = OsteotomyCutsLogic()
+        model = self._addModel(self._box(), "Box")
+        curve = self._addCurve(self.X_CUT_PATH, "CutA")
+        parameterNode = self._configure(model, curve, direction=(0.0, 0.6, -0.8))
+        parameterNode.options.minFragmentFraction = 0.02
+        logic.updateSheetModel(parameterNode)
+        fragmentNames = [node.GetName() for node in logic.applyCut(parameterNode)]
+
+        scenePath = os.path.join(slicer.app.temporaryPath, "OsteotomyCutsRoundTrip.mrb")
+        try:
+            self.assertTrue(slicer.util.saveScene(scenePath))
+            slicer.mrmlScene.Clear()
+            slicer.util.loadScene(scenePath)
+        finally:
+            if os.path.exists(scenePath):
+                os.remove(scenePath)
+
+        parameterNode = OsteotomyCutsLogic().getParameterNode()
+        self.assertEqual(parameterNode.inputModel.GetName(), "Box")
+        self.assertEqual(parameterNode.cutCurve.GetName(), "CutA")
+        np.testing.assert_allclose(parameterNode.viewDirection, (0.0, 0.6, -0.8), atol=1e-9)
+        self.assertAlmostEqual(parameterNode.options.minFragmentFraction, 0.02)
+        self.assertIsNotNone(parameterNode.sheetModel)
+
+        logic = OsteotomyCutsLogic()
+        curve = parameterNode.cutCurve
+        self.assertEqual([node.GetName() for node in logic.getCurveResult(curve)], fragmentNames)
+        self.assertEqual(curve.GetNodeReference(INPUT_REFERENCE_ROLE).GetName(), "Box")
+        self.assertFalse(self._isVisible(parameterNode.inputModel))
+
+        logic.removeCutResult(curve)
+        self.assertEqual(logic.getCurveResult(curve), [])
+        self.assertTrue(self._isVisible(parameterNode.inputModel))
