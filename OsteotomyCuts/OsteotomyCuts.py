@@ -458,6 +458,10 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
     # Points closer than this (mm) to the surface are not moved when snapping
     SNAP_TOLERANCE = 1e-3
 
+    # Limits for mesh refinement near the sheet (each iteration halves the edges it splits)
+    MAX_REFINE_ITERATIONS = 30
+    MAX_REFINED_POINTS = 20_000_000
+
     def getParameterNode(self) -> OsteotomyCutsParameterNode:
         """Return the module's parameter node, creating it if needed.
 
@@ -735,6 +739,161 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         return (self._ensureTriangles(clipper.GetOutput()),
                 self._ensureTriangles(clipper.GetClippedOutput()))
 
+    @staticmethod
+    def effectiveRefineEdgeLength(options: CutOptions) -> float:
+        """Maximum edge length near the sheet: options.refineEdgeLength, or kerfWidth / 2 when
+        that is 0 (automatic). 0 means no refinement (zero kerf, no explicit length)."""
+        if options.refineEdgeLength > 0:
+            return float(options.refineEdgeLength)
+        return options.kerfWidth / 2.0
+
+    def refineNearSheet(self, polyWithDistance: vtk.vtkPolyData, sheetPolyData: vtk.vtkPolyData,
+                        maxEdgeLength: float, bandWidth: float,
+                        arrayName: str = "SheetDistance") -> vtk.vtkPolyData:
+        """Subdivide mesh edges near the sheet until they are no longer than maxEdgeLength.
+
+        An edge is split at its midpoint when it is too long and may reach within bandWidth of
+        the sheet (the distance is 1-Lipschitz, so the smallest distance along an edge of length
+        L with end distances d0, d1 is at least (|d0| + |d1| - L) / 2). The split decision is
+        made per edge, so both triangles sharing an edge agree: the result has no cracks and a
+        closed mesh stays closed. Each triangle is re-split by how many of its edges were split
+        (1, 2 or 3), keeping its orientation. Geometry is unchanged; the original points keep
+        their ids. Point data is interpolated at new points (integer arrays take the value of
+        the first edge end, as a whole edge lies in one component); the distance array is
+        evaluated exactly at new points.
+
+        :param polyWithDistance: mesh with the signed distance point array (computeSheetDistance).
+        :param sheetPolyData: the cutting sheet, to evaluate the distance at new points.
+        :param maxEdgeLength: target maximum edge length (mm) near the sheet.
+        :param bandWidth: distance (mm) from the sheet within which edges are refined.
+        :param arrayName: name of the distance array.
+        :return: refined triangle mesh with all point data arrays, including exact distances.
+        :raises ValueError: for a non-positive edge length, or if refinement would exceed
+            MAX_REFINED_POINTS (edge length too small for the model).
+        """
+        if not maxEdgeLength > 0:
+            raise ValueError(_("The maximum edge length must be positive."))
+        mesh = self._ensureTriangles(polyWithDistance)
+        points = numpy_support.vtk_to_numpy(mesh.GetPoints().GetData()).astype(float)
+        triangles = numpy_support.vtk_to_numpy(mesh.GetPolys().GetConnectivityArray()).reshape(-1, 3).astype(np.int64)
+        pointData = mesh.GetPointData()
+        arrays = {}
+        for i in range(pointData.GetNumberOfArrays()):
+            array = pointData.GetArray(i)
+            if array is not None:
+                arrays[array.GetName()] = (numpy_support.vtk_to_numpy(array).copy(), array.GetDataType())
+        if arrayName not in arrays:
+            raise ValueError(_("The mesh has no sheet distance array."))
+        normalsName = pointData.GetNormals().GetName() if pointData.GetNormals() else None
+        scalarsName = pointData.GetScalars().GetName() if pointData.GetScalars() else None
+
+        implicitDistance = vtk.vtkImplicitPolyDataDistance()
+        implicitDistance.SetInput(sheetPolyData)
+
+        for _iteration in range(self.MAX_REFINE_ITERATIONS):
+            pointCount = len(points)
+            distances = np.abs(arrays[arrayName][0])
+
+            # Unique edges, and for each triangle the index of its edges (v0v1, v1v2, v2v0)
+            triangleEdges = np.stack([triangles[:, [0, 1]], triangles[:, [1, 2]], triangles[:, [2, 0]]], axis=1)
+            sortedEdges = np.sort(triangleEdges.reshape(-1, 2), axis=1)
+            keys, edgeOfTriangle = np.unique(sortedEdges[:, 0] * pointCount + sortedEdges[:, 1], return_inverse=True)
+            edgeStart, edgeEnd = keys // pointCount, keys % pointCount
+            edgeOfTriangle = edgeOfTriangle.reshape(-1, 3)
+
+            lengths = np.linalg.norm(points[edgeStart] - points[edgeEnd], axis=1)
+            closestAlongEdge = (distances[edgeStart] + distances[edgeEnd] - lengths) / 2.0
+            split = (lengths > maxEdgeLength) & (closestAlongEdge < bandWidth)
+            splitCount = int(np.count_nonzero(split))
+            if splitCount == 0:
+                break
+            if pointCount + splitCount > self.MAX_REFINED_POINTS:
+                raise ValueError(_("Refining the mesh near the cut would create too many points. "
+                                   "Increase the maximum edge length near the cut or the kerf width."))
+
+            # New midpoints, with exact distances and interpolated point data
+            splitStart, splitEnd = edgeStart[split], edgeEnd[split]
+            midpoints = (points[splitStart] + points[splitEnd]) / 2.0
+            for name, (values, dataType) in arrays.items():
+                if name == arrayName:
+                    newDistances = vtk.vtkDoubleArray()
+                    implicitDistance.FunctionValue(numpy_support.numpy_to_vtk(midpoints, deep=True), newDistances)
+                    newValues = numpy_support.vtk_to_numpy(newDistances).astype(values.dtype)
+                elif np.issubdtype(values.dtype, np.floating):
+                    newValues = (values[splitStart] + values[splitEnd]) / 2.0
+                    if name == normalsName:
+                        norms = np.linalg.norm(newValues, axis=1, keepdims=True)
+                        newValues = newValues / np.where(norms > 0, norms, 1.0)
+                else:
+                    newValues = values[splitStart]
+                arrays[name] = (np.concatenate([values, newValues.astype(values.dtype)]), dataType)
+            points = np.vstack([points, midpoints])
+
+            midpointOfEdge = np.full(len(keys), -1, dtype=np.int64)
+            midpointOfEdge[split] = pointCount + np.arange(splitCount)
+            triangles = self._splitTriangles(triangles, midpointOfEdge[edgeOfTriangle])
+
+        return self._buildTriangleMesh(points, triangles, arrays, normalsName, scalarsName)
+
+    @staticmethod
+    def _splitTriangles(triangles: np.ndarray, midpoints: np.ndarray) -> np.ndarray:
+        """Re-split triangles whose edges got midpoints, keeping the vertex order (orientation).
+
+        :param triangles: (M, 3) vertex ids (v0, v1, v2).
+        :param midpoints: (M, 3) midpoint id of edges (v0v1, v1v2, v2v0), or -1 if not split.
+        :return: (M', 3) triangles.
+        """
+        isSplit = midpoints >= 0
+        splitCounts = isSplit.sum(axis=1)
+        result = [triangles[splitCounts == 0]]
+
+        def rotated(rows: np.ndarray, shift: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+            order = (shift[:, np.newaxis] + np.arange(3)) % 3
+            return (np.take_along_axis(triangles[rows], order, axis=1),
+                    np.take_along_axis(midpoints[rows], order, axis=1))
+
+        # One split edge: rotate it to v0v1, then two triangles meeting at the midpoint
+        rows = np.flatnonzero(splitCounts == 1)
+        v, m = rotated(rows, np.argmax(isSplit[rows], axis=1))
+        result += [np.column_stack([v[:, 0], m[:, 0], v[:, 2]]), np.column_stack([m[:, 0], v[:, 1], v[:, 2]])]
+
+        # Two split edges: rotate them to v0v1 and v1v2, then the corner and the remaining quad
+        rows = np.flatnonzero(splitCounts == 2)
+        v, m = rotated(rows, (np.argmin(isSplit[rows], axis=1) + 1) % 3)
+        result += [np.column_stack([m[:, 0], v[:, 1], m[:, 1]]), np.column_stack([v[:, 0], m[:, 0], m[:, 1]]),
+                   np.column_stack([v[:, 0], m[:, 1], v[:, 2]])]
+
+        # Three split edges: four triangles
+        rows = np.flatnonzero(splitCounts == 3)
+        v, m = triangles[rows], midpoints[rows]
+        result += [np.column_stack([v[:, 0], m[:, 0], m[:, 2]]), np.column_stack([m[:, 0], v[:, 1], m[:, 1]]),
+                   np.column_stack([m[:, 2], m[:, 1], v[:, 2]]), np.column_stack([m[:, 0], m[:, 1], m[:, 2]])]
+        return np.vstack(result)
+
+    @staticmethod
+    def _buildTriangleMesh(points: np.ndarray, triangles: np.ndarray, arrays: dict,
+                           normalsName: Optional[str], scalarsName: Optional[str]) -> vtk.vtkPolyData:
+        """Assemble a vtkPolyData from numpy points, triangles and named point data arrays."""
+        mesh = vtk.vtkPolyData()
+        vtkPoints = vtk.vtkPoints()
+        vtkPoints.SetData(numpy_support.numpy_to_vtk(np.ascontiguousarray(points), deep=True))
+        mesh.SetPoints(vtkPoints)
+        cells = vtk.vtkCellArray()
+        offsets = np.arange(0, 3 * len(triangles) + 1, 3, dtype=np.int64)
+        cells.SetData(numpy_support.numpy_to_vtk(offsets, deep=True, array_type=vtk.VTK_ID_TYPE),
+                      numpy_support.numpy_to_vtk(np.ascontiguousarray(triangles.ravel(), dtype=np.int64),
+                                                 deep=True, array_type=vtk.VTK_ID_TYPE))
+        mesh.SetPolys(cells)
+        for name, (values, dataType) in arrays.items():
+            array = numpy_support.numpy_to_vtk(np.ascontiguousarray(values), deep=True, array_type=dataType)
+            array.SetName(name)
+            mesh.GetPointData().AddArray(array)
+            if name == normalsName:
+                mesh.GetPointData().SetNormals(array)
+            elif name == scalarsName:
+                mesh.GetPointData().SetScalars(array)
+        return mesh
+
     def extractFragments(self, polyData: vtk.vtkPolyData,
                          sideSignature: tuple[int, ...]) -> list[FragmentPiece]:
         """Split a mesh into its connected pieces.
@@ -837,7 +996,12 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
             report(15 + int(60 * sheetIndex / len(sheets)), _("Cutting..."))
             nextSides = []
             for mesh, signature in sides:
-                positive, negative = self.splitByDistance(self.computeSheetDistance(mesh, sheet), options)
+                withDistance = self.computeSheetDistance(mesh, sheet)
+                maxEdgeLength = self.effectiveRefineEdgeLength(options)
+                if maxEdgeLength > 0:
+                    withDistance = self.refineNearSheet(withDistance, sheet, maxEdgeLength,
+                                                        options.kerfWidth / 2.0 + maxEdgeLength)
+                positive, negative = self.splitByDistance(withDistance, options)
                 for part, side in ((positive, 1), (negative, -1)):
                     if part.GetNumberOfCells() > 0:
                         nextSides.append((part, signature + (side,)))
@@ -2226,3 +2390,119 @@ class OsteotomyCutsTest(ScriptedLoadableModuleTest):
         self.assertTrue(parameterNode.options.capCutFaces)
         self.assertEqual(parameterNode.cutCurve.GetName(), "CutA")
         self.assertEqual(logic.addMissingParameters(parameterNode.parameterNode), [])
+
+    #
+    # Phase 2 step 2: refinement near the sheet
+    #
+
+    @staticmethod
+    def _openEdgeCount(polyData: vtk.vtkPolyData) -> int:
+        """Number of boundary and non-manifold edges (0 for a closed, crack-free surface)."""
+        edges = vtk.vtkFeatureEdges()
+        edges.SetInputData(polyData)
+        edges.BoundaryEdgesOn()
+        edges.NonManifoldEdgesOn()
+        edges.FeatureEdgesOff()
+        edges.ManifoldEdgesOff()
+        edges.Update()
+        return edges.GetOutput().GetNumberOfCells()
+
+    @staticmethod
+    def _volume(polyData: vtk.vtkPolyData) -> float:
+        massProperties = vtk.vtkMassProperties()
+        massProperties.SetInputData(polyData)
+        massProperties.Update()
+        return massProperties.GetVolume()
+
+    @staticmethod
+    def _edges(polyData: vtk.vtkPolyData) -> tuple[np.ndarray, np.ndarray]:
+        """Unique edges of a triangle mesh as (start ids, end ids)."""
+        triangles = numpy_support.vtk_to_numpy(polyData.GetPolys().GetConnectivityArray()).reshape(-1, 3)
+        edges = np.sort(np.vstack([triangles[:, [0, 1]], triangles[:, [1, 2]], triangles[:, [2, 0]]]), axis=1)
+        edges = np.unique(edges, axis=0)
+        return edges[:, 0], edges[:, 1]
+
+    def _refinedBox(self, maxEdgeLength=1.0, bandWidth=2.0):
+        logic = OsteotomyCutsLogic()
+        box = self._box(level=5)  # 6 divisions per side: 16.7 mm edges
+        sheet = logic.buildSheetPolyData(np.array([[1.3, -40.0, 50.0], [1.3, 40.0, 50.0]]),
+                                         np.array([0.0, 0.0, -1.0]), logic.computeAutoExtent(box))
+        withDistance = logic.computeSheetDistance(box, sheet)
+        return logic, box, sheet, withDistance, logic.refineNearSheet(withDistance, sheet, maxEdgeLength, bandWidth)
+
+    def test_refine_edgesNearSheet(self):
+        """Edges within the band are no longer than the maximum; edges far away are untouched."""
+        maxEdgeLength, bandWidth = 1.0, 2.0
+        logic, box, sheet, withDistance, refined = self._refinedBox(maxEdgeLength, bandWidth)
+
+        self.assertGreater(refined.GetNumberOfPoints(), box.GetNumberOfPoints())
+        points = self._points(refined)
+        start, end = self._edges(refined)
+        lengths = np.linalg.norm(points[start] - points[end], axis=1)
+        distances = np.abs(numpy_support.vtk_to_numpy(refined.GetPointData().GetArray("SheetDistance")))
+        nearSheet = np.maximum(distances[start], distances[end]) < bandWidth
+        self.assertTrue(np.any(nearSheet))
+        self.assertLessEqual(lengths[nearSheet].max(), maxEdgeLength + 1e-9)
+        # Edges far from the sheet are original edges (original points keep their ids)
+        farAway = np.minimum(distances[start], distances[end]) > bandWidth + 25.0
+        self.assertTrue(np.any(farAway))
+        originalStart, originalEnd = self._edges(box)
+        originalEdges = set(zip(originalStart.tolist(), originalEnd.tolist()))
+        self.assertTrue(set(zip(start[farAway].tolist(), end[farAway].tolist())) <= originalEdges)
+
+    def test_refine_conformingAndExact(self):
+        """Refinement leaves no cracks, keeps the shape and orientation, and keeps original points."""
+        logic, box, sheet, withDistance, refined = self._refinedBox()
+
+        self.assertEqual(self._openEdgeCount(box), 0)
+        self.assertEqual(self._openEdgeCount(refined), 0)
+        self.assertAlmostEqual(self._volume(refined), self._volume(box), delta=1e-6 * self._volume(box))
+        np.testing.assert_array_equal(self._points(refined)[:box.GetNumberOfPoints()], self._points(box))
+        # Distances at new points are exact, not interpolated
+        exact = logic.computeSheetDistance(refined, sheet)
+        np.testing.assert_allclose(numpy_support.vtk_to_numpy(refined.GetPointData().GetArray("SheetDistance")),
+                                   numpy_support.vtk_to_numpy(exact.GetPointData().GetArray("SheetDistance")),
+                                   atol=1e-9)
+
+    def test_refine_pointData(self):
+        """Integer arrays keep their values at new points; normals stay unit length."""
+        logic = OsteotomyCutsLogic()
+        sphere = self._sphere(30.0, resolution=16)
+        labelled = logic.labelEnclosedComponents(sphere, 0.001)
+        sheet = logic.buildSheetPolyData(np.array([[1.3, -40.0, 29.0], [1.3, 40.0, 29.0]]),
+                                         np.array([0.0, 0.0, -1.0]), 100.0)
+        refined = logic.refineNearSheet(logic.computeSheetDistance(labelled, sheet), sheet, 0.5, 1.0)
+
+        componentIds = numpy_support.vtk_to_numpy(refined.GetPointData().GetArray("ComponentId"))
+        self.assertEqual(set(componentIds.tolist()), {0})
+        normals = numpy_support.vtk_to_numpy(refined.GetPointData().GetNormals())
+        np.testing.assert_allclose(np.linalg.norm(normals, axis=1), 1.0, atol=1e-5)
+
+    def test_refine_noopAndErrors(self):
+        """Short edges are left alone; invalid lengths or too many points raise ValueError."""
+        logic, box, sheet, withDistance, refined = self._refinedBox(maxEdgeLength=50.0)
+        self.assertEqual(refined.GetNumberOfPoints(), box.GetNumberOfPoints())
+        with self.assertRaises(ValueError):
+            logic.refineNearSheet(withDistance, sheet, 0.0, 1.0)
+        logic.MAX_REFINED_POINTS = box.GetNumberOfPoints() + 10
+        with self.assertRaises(ValueError):
+            logic.refineNearSheet(withDistance, sheet, 0.01, 1.0)
+
+    def test_cut_withRefinement(self):
+        """A zero-kerf cut with refinement gives the same fragments, with short edges at the cut."""
+        options = CutOptions()
+        options.refineEdgeLength = 1.0
+        x = 1.3
+        fragments = self._cut(self._box(level=5), [[[x, -40.0, 50.0], [x, 40.0, 50.0]]], [0.0, 0.0, -1.0],
+                              options=options)
+
+        self.assertEqual(len(fragments), 2)
+        boundsList = sorted((fragment.GetBounds() for fragment in fragments), key=lambda b: b[0])
+        self.assertAlmostEqual(boundsList[0][1], x, places=6)
+        self.assertAlmostEqual(boundsList[1][0], x, places=6)
+        for fragment in fragments:
+            points = self._points(fragment)
+            start, end = self._edges(fragment)
+            atCut = (np.abs(points[start, 0] - x) < 1e-6) & (np.abs(points[end, 0] - x) < 1e-6)
+            lengths = np.linalg.norm(points[start] - points[end], axis=1)
+            self.assertLessEqual(lengths[atCut].max(), 1.0 + 1e-6)
