@@ -6,8 +6,8 @@
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>325</width>
-    <height>311</height>
+    <width>360</width>
+    <height>620</height>
    </rect>
   </property>
   <layout class="QVBoxLayout" name="verticalLayout">
@@ -16,26 +16,29 @@
      <property name="text">
       <string>Inputs</string>
      </property>
-     <layout class="QFormLayout" name="formLayout_2">
+     <layout class="QFormLayout" name="inputsFormLayout">
       <item row="0" column="0">
-       <widget class="QLabel" name="label">
+       <widget class="QLabel" name="inputModelLabel">
         <property name="text">
-         <string>Input volume:</string>
+         <string>Model to cut:</string>
         </property>
        </widget>
       </item>
       <item row="0" column="1">
-       <widget class="qMRMLNodeComboBox" name="inputSelector">
+       <widget class="qMRMLNodeComboBox" name="inputModelSelector">
         <property name="toolTip">
-         <string>Pick the input to the algorithm.</string>
+         <string>Bone model to cut. This may also be a fragment from an earlier cut.</string>
         </property>
         <property name="nodeTypes">
          <stringlist notr="true">
-          <string>vtkMRMLScalarVolumeNode</string>
+          <string>vtkMRMLModelNode</string>
          </stringlist>
         </property>
         <property name="showChildNodeTypes">
          <bool>false</bool>
+        </property>
+        <property name="noneEnabled">
+         <bool>true</bool>
         </property>
         <property name="addEnabled">
          <bool>false</bool>
@@ -44,36 +47,74 @@
          <bool>false</bool>
         </property>
         <property name="SlicerParameterName" stdset="0">
-         <string>inputVolume</string>
+         <string>inputModel</string>
         </property>
        </widget>
       </item>
-      <item row="2" column="0">
-       <widget class="QLabel" name="label_3">
+      <item row="1" column="0">
+       <widget class="QLabel" name="cutCurveLabel">
         <property name="text">
-         <string>Image threshold:</string>
+         <string>Cut path:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="1">
+       <widget class="qMRMLNodeComboBox" name="cutCurveSelector">
+        <property name="toolTip">
+         <string>Markups curve whose points are placed on the bone surface along the osteotomy.</string>
+        </property>
+        <property name="nodeTypes">
+         <stringlist notr="true">
+          <string>vtkMRMLMarkupsCurveNode</string>
+         </stringlist>
+        </property>
+        <property name="showChildNodeTypes">
+         <bool>true</bool>
+        </property>
+        <property name="baseName">
+         <string>Cut</string>
+        </property>
+        <property name="noneEnabled">
+         <bool>true</bool>
+        </property>
+        <property name="addEnabled">
+         <bool>true</bool>
+        </property>
+        <property name="removeEnabled">
+         <bool>true</bool>
+        </property>
+        <property name="renameEnabled">
+         <bool>true</bool>
+        </property>
+        <property name="SlicerParameterName" stdset="0">
+         <string>cutCurve</string>
         </property>
        </widget>
       </item>
       <item row="2" column="1">
-       <widget class="ctkSliderWidget" name="imageThresholdSliderWidget">
+       <widget class="qSlicerMarkupsPlaceWidget" name="cutCurvePlaceWidget">
         <property name="toolTip">
-         <string>Set threshold value for computing the output image. Voxels that have intensities lower than this value will set to zero.</string>
+         <string>Place points of the cut path on the bone surface.</string>
         </property>
-        <property name="singleStep">
-         <double>0.100000000000000</double>
+        <property name="placeMultipleMarkups">
+         <enum>qSlicerMarkupsPlaceWidget::ForcePlaceMultipleMarkups</enum>
         </property>
-        <property name="minimum">
-         <double>-100.000000000000000</double>
+       </widget>
+      </item>
+      <item row="3" column="0">
+       <widget class="QLabel" name="snapToSurfaceLabel">
+        <property name="text">
+         <string>Snap to surface:</string>
         </property>
-        <property name="maximum">
-         <double>500.000000000000000</double>
-        </property>
-        <property name="value">
-         <double>0.500000000000000</double>
+       </widget>
+      </item>
+      <item row="3" column="1">
+       <widget class="QCheckBox" name="snapToSurfaceCheckBox">
+        <property name="toolTip">
+         <string>Keep the cut path points on the surface of the model to cut.</string>
         </property>
         <property name="SlicerParameterName" stdset="0">
-         <string>imageThreshold</string>
+         <string>snapToSurface</string>
         </property>
        </widget>
       </item>
@@ -81,64 +122,66 @@
     </widget>
    </item>
    <item>
-    <widget class="ctkCollapsibleButton" name="outputsCollapsibleButton">
+    <widget class="ctkCollapsibleButton" name="directionCollapsibleButton">
      <property name="text">
-      <string>Outputs</string>
+      <string>Extrusion direction</string>
      </property>
-     <layout class="QFormLayout" name="formLayout_4">
+     <layout class="QGridLayout" name="directionGridLayout">
       <item row="0" column="0">
-       <widget class="QLabel" name="label_2">
+       <widget class="QRadioButton" name="directionViewRadioButton">
+        <property name="toolTip">
+         <string>Extrude the cut path along the viewing direction of the 3D view, captured when the button is pressed.</string>
+        </property>
         <property name="text">
-         <string>Thresholded volume:</string>
+         <string>Current 3D view</string>
+        </property>
+        <property name="checked">
+         <bool>true</bool>
         </property>
        </widget>
       </item>
       <item row="0" column="1">
-       <widget class="qMRMLNodeComboBox" name="outputSelector">
+       <widget class="QPushButton" name="captureViewDirectionButton">
         <property name="toolTip">
-         <string>Pick the output to the algorithm.</string>
+         <string>Store the current viewing direction of the first 3D view as the extrusion direction.</string>
         </property>
-        <property name="nodeTypes">
-         <stringlist notr="true">
-          <string>vtkMRMLScalarVolumeNode</string>
-         </stringlist>
-        </property>
-        <property name="showChildNodeTypes">
-         <bool>false</bool>
-        </property>
-        <property name="noneEnabled">
-         <bool>true</bool>
-        </property>
-        <property name="addEnabled">
-         <bool>true</bool>
-        </property>
-        <property name="removeEnabled">
-         <bool>true</bool>
-        </property>
-        <property name="SlicerParameterName" stdset="0">
-         <string>thresholdedVolume</string>
-        </property>
-       </widget>
-      </item>
-      <item row="1" column="0">
-       <widget class="QLabel" name="label_5">
         <property name="text">
-         <string>Inverted volume:</string>
+         <string>Capture view direction</string>
         </property>
        </widget>
       </item>
       <item row="1" column="1">
-       <widget class="qMRMLNodeComboBox" name="invertedOutputSelector">
+       <widget class="QLabel" name="viewDirectionLabel">
+        <property name="text">
+         <string>Not captured</string>
+        </property>
+       </widget>
+      </item>
+      <item row="2" column="0">
+       <widget class="QRadioButton" name="directionLineRadioButton">
         <property name="toolTip">
-         <string>Result with inverted threshold will be written into this volume</string>
+         <string>Extrude the cut path along a markups line (from its first to its second point).</string>
+        </property>
+        <property name="text">
+         <string>Markups line</string>
+        </property>
+       </widget>
+      </item>
+      <item row="2" column="1">
+       <widget class="qMRMLNodeComboBox" name="directionLineSelector">
+        <property name="toolTip">
+         <string>Markups line defining the extrusion direction.</string>
         </property>
         <property name="nodeTypes">
          <stringlist notr="true">
-          <string>vtkMRMLScalarVolumeNode</string>
+          <string>vtkMRMLMarkupsLineNode</string>
          </stringlist>
         </property>
         <property name="showChildNodeTypes">
          <bool>false</bool>
+        </property>
+        <property name="baseName">
+         <string>CutDirection</string>
         </property>
         <property name="noneEnabled">
          <bool>true</bool>
@@ -149,8 +192,70 @@
         <property name="removeEnabled">
          <bool>true</bool>
         </property>
+        <property name="renameEnabled">
+         <bool>true</bool>
+        </property>
         <property name="SlicerParameterName" stdset="0">
-         <string>invertedVolume</string>
+         <string>directionLine</string>
+        </property>
+       </widget>
+      </item>
+      <item row="3" column="1">
+       <widget class="qSlicerMarkupsPlaceWidget" name="directionLinePlaceWidget">
+        <property name="toolTip">
+         <string>Place the two points of the direction line.</string>
+        </property>
+       </widget>
+      </item>
+     </layout>
+    </widget>
+   </item>
+   <item>
+    <widget class="ctkCollapsibleButton" name="previewCollapsibleButton">
+     <property name="text">
+      <string>Preview</string>
+     </property>
+     <layout class="QFormLayout" name="previewFormLayout">
+      <item row="0" column="0">
+       <widget class="QLabel" name="livePreviewLabel">
+        <property name="text">
+         <string>Live preview:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="0" column="1">
+       <widget class="QCheckBox" name="livePreviewCheckBox">
+        <property name="toolTip">
+         <string>Show the cutting sheet and update it while the points are moved.</string>
+        </property>
+        <property name="SlicerParameterName" stdset="0">
+         <string>livePreview</string>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="0">
+       <widget class="QLabel" name="sheetOpacityLabel">
+        <property name="text">
+         <string>Sheet opacity:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="1">
+       <widget class="ctkSliderWidget" name="sheetOpacitySliderWidget">
+        <property name="toolTip">
+         <string>Opacity of the cutting sheet preview.</string>
+        </property>
+        <property name="singleStep">
+         <double>0.050000000000000</double>
+        </property>
+        <property name="minimum">
+         <double>0.000000000000000</double>
+        </property>
+        <property name="maximum">
+         <double>1.000000000000000</double>
+        </property>
+        <property name="value">
+         <double>0.400000000000000</double>
         </property>
        </widget>
       </item>
@@ -165,24 +270,56 @@
      <property name="collapsed">
       <bool>true</bool>
      </property>
-     <layout class="QFormLayout" name="formLayout_3">
+     <layout class="QFormLayout" name="advancedFormLayout">
       <item row="0" column="0">
-       <widget class="QLabel" name="label_4">
+       <widget class="QLabel" name="extensionLabel">
         <property name="text">
-         <string>Invert threshold: </string>
+         <string>Sheet extension (mm, 0 = auto):</string>
         </property>
        </widget>
       </item>
       <item row="0" column="1">
-       <widget class="QCheckBox" name="invertOutputCheckBox">
+       <widget class="ctkDoubleSpinBox" name="extensionSpinBox">
         <property name="toolTip">
-         <string>If checked, values above threshold are set to 0. If unchecked, values below are set to 0.</string>
+         <string>How far the cutting sheet extends beyond the path. 0 uses the model's bounding-box diagonal, which always cuts fully through.</string>
         </property>
+        <property name="decimals">
+         <number>1</number>
+        </property>
+        <property name="maximum">
+         <double>10000.000000000000000</double>
+        </property>
+        <property name="suffix">
+         <string> mm</string>
+        </property>
+        <property name="SlicerParameterName" stdset="0">
+         <string>options.extension</string>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="0">
+       <widget class="QLabel" name="minFragmentFractionLabel">
         <property name="text">
-         <string/>
+         <string>Min. fragment size (fraction):</string>
         </property>
-        <property name="invertThreshold" stdset="0">
-         <string/>
+       </widget>
+      </item>
+      <item row="1" column="1">
+       <widget class="ctkDoubleSpinBox" name="minFragmentFractionSpinBox">
+        <property name="toolTip">
+         <string>Free-standing pieces with fewer points than this fraction of the model are discarded. Enclosed pieces (canal, marrow voids) are always kept.</string>
+        </property>
+        <property name="decimals">
+         <number>4</number>
+        </property>
+        <property name="singleStep">
+         <double>0.001000000000000</double>
+        </property>
+        <property name="maximum">
+         <double>0.500000000000000</double>
+        </property>
+        <property name="SlicerParameterName" stdset="0">
+         <string>options.minFragmentFraction</string>
         </property>
        </widget>
       </item>
@@ -190,16 +327,83 @@
     </widget>
    </item>
    <item>
-    <widget class="QPushButton" name="applyButton">
-     <property name="enabled">
-      <bool>false</bool>
-     </property>
-     <property name="toolTip">
-      <string>Run the algorithm.</string>
-     </property>
+    <layout class="QHBoxLayout" name="applyButtonsLayout">
+     <item>
+      <widget class="QPushButton" name="applyButton">
+       <property name="enabled">
+        <bool>false</bool>
+       </property>
+       <property name="toolTip">
+        <string>Cut the model along the cutting sheet.</string>
+       </property>
+       <property name="text">
+        <string>Apply cut</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="undoButton">
+       <property name="enabled">
+        <bool>false</bool>
+       </property>
+       <property name="toolTip">
+        <string>Remove the fragments produced by the selected cut path and show its input model again.</string>
+       </property>
+       <property name="text">
+        <string>Undo cut (this curve)</string>
+       </property>
+      </widget>
+     </item>
+    </layout>
+   </item>
+   <item>
+    <widget class="QLabel" name="statusLabel">
      <property name="text">
-      <string>Apply</string>
+      <string/>
      </property>
+     <property name="wordWrap">
+      <bool>true</bool>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="ctkCollapsibleButton" name="mergeCollapsibleButton">
+     <property name="text">
+      <string>Merge fragments</string>
+     </property>
+     <property name="collapsed">
+      <bool>true</bool>
+     </property>
+     <layout class="QHBoxLayout" name="mergeLayout">
+      <item>
+       <widget class="qMRMLCheckableNodeComboBox" name="mergeFragmentsSelector">
+        <property name="toolTip">
+         <string>Tick two or more fragments from the same cut to join them into one model.</string>
+        </property>
+        <property name="nodeTypes">
+         <stringlist notr="true">
+          <string>vtkMRMLModelNode</string>
+         </stringlist>
+        </property>
+        <property name="showChildNodeTypes">
+         <bool>false</bool>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QPushButton" name="mergeButton">
+        <property name="enabled">
+         <bool>false</bool>
+        </property>
+        <property name="toolTip">
+         <string>Join the ticked fragments into one model.</string>
+        </property>
+        <property name="text">
+         <string>Merge selected</string>
+        </property>
+       </widget>
+      </item>
+     </layout>
     </widget>
    </item>
    <item>
@@ -224,16 +428,37 @@
    <header>qMRMLNodeComboBox.h</header>
   </customwidget>
   <customwidget>
+   <class>qMRMLCheckableNodeComboBox</class>
+   <extends>qMRMLNodeComboBox</extends>
+   <header>qMRMLCheckableNodeComboBox.h</header>
+  </customwidget>
+  <customwidget>
    <class>qMRMLWidget</class>
    <extends>QWidget</extends>
    <header>qMRMLWidget.h</header>
    <container>1</container>
   </customwidget>
   <customwidget>
+   <class>qSlicerWidget</class>
+   <extends>QWidget</extends>
+   <header>qSlicerWidget.h</header>
+   <container>1</container>
+  </customwidget>
+  <customwidget>
+   <class>qSlicerMarkupsPlaceWidget</class>
+   <extends>qSlicerWidget</extends>
+   <header>qSlicerMarkupsPlaceWidget.h</header>
+  </customwidget>
+  <customwidget>
    <class>ctkCollapsibleButton</class>
    <extends>QWidget</extends>
    <header>ctkCollapsibleButton.h</header>
    <container>1</container>
+  </customwidget>
+  <customwidget>
+   <class>ctkDoubleSpinBox</class>
+   <extends>QWidget</extends>
+   <header>ctkDoubleSpinBox.h</header>
   </customwidget>
   <customwidget>
    <class>ctkSliderWidget</class>
@@ -246,50 +471,50 @@
   <connection>
    <sender>OsteotomyCuts</sender>
    <signal>mrmlSceneChanged(vtkMRMLScene*)</signal>
-   <receiver>inputSelector</receiver>
+   <receiver>inputModelSelector</receiver>
    <slot>setMRMLScene(vtkMRMLScene*)</slot>
-   <hints>
-    <hint type="sourcelabel">
-     <x>122</x>
-     <y>132</y>
-    </hint>
-    <hint type="destinationlabel">
-     <x>248</x>
-     <y>61</y>
-    </hint>
-   </hints>
   </connection>
   <connection>
    <sender>OsteotomyCuts</sender>
    <signal>mrmlSceneChanged(vtkMRMLScene*)</signal>
-   <receiver>outputSelector</receiver>
+   <receiver>cutCurveSelector</receiver>
    <slot>setMRMLScene(vtkMRMLScene*)</slot>
-   <hints>
-    <hint type="sourcelabel">
-     <x>82</x>
-     <y>135</y>
-    </hint>
-    <hint type="destinationlabel">
-     <x>220</x>
-     <y>161</y>
-    </hint>
-   </hints>
   </connection>
   <connection>
    <sender>OsteotomyCuts</sender>
    <signal>mrmlSceneChanged(vtkMRMLScene*)</signal>
-   <receiver>invertedOutputSelector</receiver>
+   <receiver>cutCurvePlaceWidget</receiver>
    <slot>setMRMLScene(vtkMRMLScene*)</slot>
-   <hints>
-    <hint type="sourcelabel">
-     <x>161</x>
-     <y>8</y>
-    </hint>
-    <hint type="destinationlabel">
-     <x>173</x>
-     <y>176</y>
-    </hint>
-   </hints>
+  </connection>
+  <connection>
+   <sender>OsteotomyCuts</sender>
+   <signal>mrmlSceneChanged(vtkMRMLScene*)</signal>
+   <receiver>directionLineSelector</receiver>
+   <slot>setMRMLScene(vtkMRMLScene*)</slot>
+  </connection>
+  <connection>
+   <sender>OsteotomyCuts</sender>
+   <signal>mrmlSceneChanged(vtkMRMLScene*)</signal>
+   <receiver>directionLinePlaceWidget</receiver>
+   <slot>setMRMLScene(vtkMRMLScene*)</slot>
+  </connection>
+  <connection>
+   <sender>OsteotomyCuts</sender>
+   <signal>mrmlSceneChanged(vtkMRMLScene*)</signal>
+   <receiver>mergeFragmentsSelector</receiver>
+   <slot>setMRMLScene(vtkMRMLScene*)</slot>
+  </connection>
+  <connection>
+   <sender>cutCurveSelector</sender>
+   <signal>currentNodeChanged(vtkMRMLNode*)</signal>
+   <receiver>cutCurvePlaceWidget</receiver>
+   <slot>setCurrentNode(vtkMRMLNode*)</slot>
+  </connection>
+  <connection>
+   <sender>directionLineSelector</sender>
+   <signal>currentNodeChanged(vtkMRMLNode*)</signal>
+   <receiver>directionLinePlaceWidget</receiver>
+   <slot>setCurrentNode(vtkMRMLNode*)</slot>
   </connection>
  </connections>
 </ui>
