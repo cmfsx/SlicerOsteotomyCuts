@@ -1,6 +1,6 @@
 import enum
 from dataclasses import dataclass
-from typing import Annotated, Optional
+from typing import Annotated, Callable, Optional
 
 import numpy as np
 import vtk
@@ -63,6 +63,22 @@ class DirectionMode(enum.Enum):
 
 
 NOT_CAPTURED = (0.0, 0.0, 0.0)
+
+# Called with (percent 0-100, message) to report progress of long operations
+ProgressCallback = Callable[[int, str], None]
+
+# Node reference roles linking cut paths, their input model and their fragments. Node
+# references are saved with the scene (subject hierarchy item IDs are not stable across reloads).
+FRAGMENT_REFERENCE_ROLE = "OsteotomyCuts.Fragment"  # curve -> fragments (several)
+INPUT_REFERENCE_ROLE = "OsteotomyCuts.Input"  # curve / fragment -> model that was cut
+CURVE_REFERENCE_ROLE = "OsteotomyCuts.Curve"  # fragment -> curve that produced it
+
+# Okabe-Ito colour-blind-safe palette followed by further distinct colours
+FRAGMENT_COLOURS = (
+    (0.90, 0.62, 0.00), (0.34, 0.71, 0.91), (0.00, 0.62, 0.45), (0.94, 0.89, 0.26),
+    (0.00, 0.45, 0.70), (0.84, 0.37, 0.00), (0.80, 0.47, 0.65), (0.55, 0.34, 0.16),
+    (0.60, 0.60, 0.60), (0.58, 0.40, 0.74), (0.74, 0.74, 0.13), (0.09, 0.75, 0.81),
+)
 
 
 def isDirectionCaptured(direction: tuple[float, float, float]) -> bool:
@@ -142,6 +158,8 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.logic = None
         self._parameterNode = None
         self._parameterNodeGuiTag = None
+        self._observedMarkupsNodes = []  # curve and line whose point edits refresh the GUI
+        self._resultMessage = ""  # outcome of the last action, shown while inputs are valid
 
     def setup(self) -> None:
         """Called when the user opens the module the first time and the widget is initialised."""
@@ -162,12 +180,20 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.ui.directionViewRadioButton.connect("toggled(bool)", self.onDirectionModeToggled)
         self.ui.directionLineRadioButton.connect("toggled(bool)", self.onDirectionModeToggled)
 
+        self.ui.cutCurveSelector.connect("nodeAddedByUser(vtkMRMLNode*)", self.onCutCurveAdded)
+        self.ui.captureViewDirectionButton.connect("clicked(bool)", self.onCaptureViewDirection)
+        self.ui.applyButton.connect("clicked(bool)", self.onApplyButton)
+        self.ui.undoButton.connect("clicked(bool)", self.onUndoButton)
+        self.ui.mergeButton.connect("clicked(bool)", self.onMergeButton)
+        self.ui.mergeFragmentsSelector.connect("checkedNodesChanged()", self._updateMergeButton)
+
         # Make sure parameter node is initialised (needed for module reload)
         self.initializeParameterNode()
 
     def cleanup(self) -> None:
         """Called when the application closes and the module widget is destroyed."""
         self.removeObservers()
+        self._observedMarkupsNodes = []
 
     def enter(self) -> None:
         """Called each time the user opens this module."""
@@ -179,6 +205,7 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self._parameterNode.disconnectGui(self._parameterNodeGuiTag)
             self._parameterNodeGuiTag = None
             self.removeObserver(self._parameterNode, vtk.vtkCommand.ModifiedEvent, self._updateGuiFromParameterNode)
+        self._observeMarkupsNodes([])
 
     def onSceneStartClose(self, caller, event) -> None:
         """Called just before the scene is closed."""
@@ -198,6 +225,7 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if self._parameterNode:
             self._parameterNode.disconnectGui(self._parameterNodeGuiTag)
             self.removeObserver(self._parameterNode, vtk.vtkCommand.ModifiedEvent, self._updateGuiFromParameterNode)
+        self._observeMarkupsNodes([])
         self._parameterNode = inputParameterNode
         if self._parameterNode:
             # Widgets with a "SlicerParameterName" property in the .ui file are connected here
@@ -236,11 +264,78 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         else:
             self.ui.viewDirectionLabel.text = "({:.2f}, {:.2f}, {:.2f})".format(*viewDirection)
 
-        # Cutting is added in later implementation steps
-        self.ui.applyButton.enabled = False
-        self.ui.undoButton.enabled = False
-        self.ui.mergeButton.enabled = False
-        self.ui.statusLabel.text = _("Cutting is not implemented yet.")
+        self._observeMarkupsNodes([self._parameterNode.cutCurve, self._parameterNode.directionLine])
+        self._updateActionState()
+
+    def _updateActionState(self, caller=None, event=None) -> None:
+        """Enable Apply / Undo and show why a cut cannot run yet."""
+        if not self._parameterNode:
+            return
+        reason = self.logic.validateInputs(self._parameterNode)
+        self.ui.applyButton.enabled = reason is None
+        self.ui.applyButton.toolTip = reason or _("Cut the model along the cutting sheet.")
+        self.ui.undoButton.enabled = bool(self.logic.getCurveResult(self._parameterNode.cutCurve))
+        self.ui.statusLabel.text = reason or self._resultMessage or _("Ready to cut.")
+        self._updateMergeButton()
+
+    def _updateMergeButton(self) -> None:
+        self.ui.mergeButton.enabled = len(self.ui.mergeFragmentsSelector.checkedNodes()) >= 2
+
+    def _observeMarkupsNodes(self, nodes: list) -> None:
+        """Refresh the GUI when points of these markups nodes are added, removed or moved."""
+        nodes = [node for node in nodes if node is not None]
+        if [n.GetID() for n in nodes] == [n.GetID() for n in self._observedMarkupsNodes]:
+            return
+        events = (slicer.vtkMRMLMarkupsNode.PointAddedEvent, slicer.vtkMRMLMarkupsNode.PointRemovedEvent,
+                  slicer.vtkMRMLMarkupsNode.PointModifiedEvent)
+        for node in self._observedMarkupsNodes:
+            for event in events:
+                self.removeObserver(node, event, self._updateActionState)
+        self._observedMarkupsNodes = nodes
+        for node in nodes:
+            for event in events:
+                self.addObserver(node, event, self._updateActionState)
+
+    def onCutCurveAdded(self, curveNode) -> None:
+        """New cut paths are polylines: straight segments between the placed points."""
+        curveNode.SetCurveTypeToLinear()
+
+    def onCaptureViewDirection(self) -> None:
+        """Store the viewing direction of the first 3D view."""
+        with slicer.util.tryWithErrorDisplay(_("Failed to capture the view direction."), waitCursor=True):
+            viewNode = slicer.app.layoutManager().threeDWidget(0).mrmlViewNode()
+            self.logic.captureViewDirection(self._parameterNode, viewNode)
+
+    def onApplyButton(self) -> None:
+        """Cut the model, with a progress dialog."""
+        progress = slicer.util.createProgressDialog(labelText=_("Cutting..."), maximum=100)
+
+        def reportProgress(percent: int, message: str) -> None:
+            progress.labelText = message
+            progress.value = percent
+            slicer.app.processEvents()
+
+        try:
+            with slicer.util.tryWithErrorDisplay(_("Failed to cut the model."), waitCursor=True):
+                fragments = self.logic.applyCut(self._parameterNode, reportProgress)
+                self._resultMessage = _("{count} fragments created.").format(count=len(fragments))
+        finally:
+            progress.close()
+            self._updateActionState()
+
+    def onUndoButton(self) -> None:
+        """Remove the fragments of the selected cut path and show its input model again."""
+        with slicer.util.tryWithErrorDisplay(_("Failed to undo the cut."), waitCursor=True):
+            self.logic.removeCutResult(self._parameterNode.cutCurve)
+            self._resultMessage = _("Cut undone.")
+        self._updateActionState()
+
+    def onMergeButton(self) -> None:
+        """Join the ticked fragments into one model."""
+        with slicer.util.tryWithErrorDisplay(_("Failed to merge the fragments."), waitCursor=True):
+            merged = self.logic.mergeFragments(list(self.ui.mergeFragmentsSelector.checkedNodes()))
+            self._resultMessage = _("Fragments merged into {name}.").format(name=merged.GetName())
+        self._updateActionState()
 
 
 #
@@ -569,7 +664,8 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         return fragments
 
     def cutPolyData(self, polyData: vtk.vtkPolyData, sheets: list[vtk.vtkPolyData],
-                    options: CutOptions) -> list[vtk.vtkPolyData]:
+                    options: CutOptions,
+                    progressCallback: Optional[ProgressCallback] = None) -> list[vtk.vtkPolyData]:
         """Cut a mesh with one or more sheets into separate fragments (headless core).
 
         Each sheet is applied in turn to every current piece, then the pieces are split into
@@ -579,18 +675,22 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         :param polyData: model mesh in world coordinates.
         :param sheets: cutting sheets from buildSheetPolyData.
         :param options: cut options.
+        :param progressCallback: called with (percent, message) between stages.
         :return: fragment meshes, largest first.
         :raises ValueError: if there is no sheet or the mesh has no polygons.
         """
+        report = progressCallback or (lambda percent, message: None)
         if not sheets:
             raise ValueError(_("At least one cutting sheet is needed."))
         triangles = self._ensureTriangles(polyData)
         if triangles.GetNumberOfCells() == 0:
             raise ValueError(_("The model has no surface polygons to cut."))
 
+        report(5, _("Finding internal shells..."))
         labelled = self.labelEnclosedComponents(triangles, options.minFragmentFraction)
         sides = [(labelled, ())]
-        for sheet in sheets:
+        for sheetIndex, sheet in enumerate(sheets):
+            report(15 + int(60 * sheetIndex / len(sheets)), _("Cutting..."))
             nextSides = []
             for mesh, signature in sides:
                 positive, negative = self.splitByDistance(self.computeSheetDistance(mesh, sheet), options)
@@ -599,6 +699,7 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
                         nextSides.append((part, signature + (side,)))
             sides = nextSides
 
+        report(75, _("Separating fragments..."))
         pieces = []
         for mesh, signature in sides:
             pieces.extend(self.extractFragments(mesh, signature))
@@ -624,6 +725,303 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         result = vtk.vtkPolyData()
         result.DeepCopy(clean.GetOutput())
         return result
+
+    #
+    # Inputs and directions (MRML)
+    #
+
+    def getPathPoints(self, curveNode: vtkMRMLMarkupsCurveNode) -> np.ndarray:
+        """Return the curve's points in world coordinates, (N, 3).
+
+        For a linear curve these are the control points; for a spline, the sampled curve.
+
+        :raises ValueError: if the curve has fewer than 2 control points.
+        """
+        if curveNode is None or curveNode.GetNumberOfControlPoints() < 2:
+            raise ValueError(_("The cut path needs at least 2 points."))
+        return np.array(slicer.util.arrayFromMarkupsCurvePoints(curveNode, world=True), dtype=float)
+
+    @staticmethod
+    def isClosedCurve(curveNode: vtkMRMLMarkupsCurveNode) -> bool:
+        """Return True for a closed curve (vtkMRMLMarkupsClosedCurveNode)."""
+        return curveNode.IsA("vtkMRMLMarkupsClosedCurveNode")
+
+    def directionFromLine(self, lineNode: vtkMRMLMarkupsLineNode) -> np.ndarray:
+        """Return the unit vector from the line's first to its second point (world coordinates).
+
+        :raises ValueError: if the line has fewer than 2 points or zero length.
+        """
+        if lineNode is None or lineNode.GetNumberOfControlPoints() < 2:
+            raise ValueError(_("The direction line needs 2 points."))
+        points = np.array(slicer.util.arrayFromMarkupsControlPoints(lineNode, world=True), dtype=float)
+        return self._normalised(points[1] - points[0], _("The direction line has zero length."))
+
+    def directionFromView(self, viewNode) -> np.ndarray:
+        """Return the viewing direction (direction of projection) of a 3D view's camera.
+
+        Uses only MRML nodes, so it also works without a GUI.
+
+        :param viewNode: vtkMRMLViewNode of the 3D view.
+        :raises ValueError: if the view has no camera.
+        """
+        cameraNode = slicer.modules.cameras.logic().GetViewActiveCameraNode(viewNode) if viewNode else None
+        if cameraNode is None:
+            raise ValueError(_("The 3D view has no camera."))
+        return self._normalised(np.array(cameraNode.GetFocalPoint()) - np.array(cameraNode.GetPosition()),
+                                _("The 3D view camera has no direction."))
+
+    def captureViewDirection(self, parameterNode: OsteotomyCutsParameterNode, viewNode) -> None:
+        """Store the current viewing direction of a 3D view as the extrusion direction."""
+        parameterNode.viewDirection = tuple(float(c) for c in self.directionFromView(viewNode))
+
+    def resolveDirection(self, parameterNode: OsteotomyCutsParameterNode) -> np.ndarray:
+        """Return the extrusion direction for the current direction mode.
+
+        :raises ValueError: if the view direction is not captured or the line is invalid.
+        """
+        if parameterNode.directionMode == DirectionMode.LINE:
+            if parameterNode.directionLine is None:
+                raise ValueError(_("Select a direction line."))
+            return self.directionFromLine(parameterNode.directionLine)
+        if not isDirectionCaptured(parameterNode.viewDirection):
+            raise ValueError(_("Capture a view direction first."))
+        return self._normalised(np.array(parameterNode.viewDirection), _("Capture a view direction first."))
+
+    def validateInputs(self, parameterNode: OsteotomyCutsParameterNode) -> Optional[str]:
+        """Check whether a cut can run.
+
+        :return: None if it can, otherwise a message for the user saying what is missing.
+        """
+        inputModel = parameterNode.inputModel
+        if inputModel is None:
+            return _("Select a model to cut.")
+        if inputModel.GetPolyData() is None or inputModel.GetPolyData().GetNumberOfPoints() == 0:
+            return _("The selected model is empty.")
+        transformNode = inputModel.GetParentTransformNode()
+        if transformNode is not None and not transformNode.IsTransformToWorldLinear():
+            return _("The model is under a non-linear transform. Harden the transform first.")
+        curveNode = parameterNode.cutCurve
+        if curveNode is None:
+            return _("Select or create a cut path.")
+        minPoints = 3 if self.isClosedCurve(curveNode) else 2
+        if curveNode.GetNumberOfControlPoints() < minPoints:
+            return _("Place at least {count} points on the cut path.").format(count=minPoints)
+        if inputModel.GetNodeReferenceID(CURVE_REFERENCE_ROLE) == curveNode.GetID():
+            return _("The model to cut was produced by this cut path. Select another model or path.")
+        try:
+            self.resolveDirection(parameterNode)
+        except ValueError as error:
+            return str(error)
+        return None
+
+    def getWorldPolyData(self, modelNode: vtkMRMLModelNode) -> vtk.vtkPolyData:
+        """Return a copy of the model mesh in world coordinates (the node is not modified).
+
+        :raises ValueError: if the model is empty or under a non-linear transform.
+        """
+        polyData = modelNode.GetPolyData()
+        if polyData is None or polyData.GetNumberOfPoints() == 0:
+            raise ValueError(_("The selected model is empty."))
+        result = vtk.vtkPolyData()
+        transformNode = modelNode.GetParentTransformNode()
+        if transformNode is None:
+            result.DeepCopy(polyData)
+            return result
+        if not transformNode.IsTransformToWorldLinear():
+            raise ValueError(_("The model is under a non-linear transform. Harden the transform first."))
+        matrix = vtk.vtkMatrix4x4()
+        transformNode.GetMatrixTransformToWorld(matrix)
+        transform = vtk.vtkTransform()
+        transform.SetMatrix(matrix)
+        transformFilter = vtk.vtkTransformPolyDataFilter()
+        transformFilter.SetInputData(polyData)
+        transformFilter.SetTransform(transform)
+        transformFilter.Update()
+        result.DeepCopy(transformFilter.GetOutput())
+        return result
+
+    #
+    # Cut results (MRML)
+    #
+
+    def applyCut(self, parameterNode: OsteotomyCutsParameterNode,
+                 progressCallback: Optional[ProgressCallback] = None) -> list[vtkMRMLModelNode]:
+        """Cut the input model with the cut path and create the fragment models.
+
+        The result this same curve produced before is replaced; results of other curves are
+        never touched. The fragments are computed first, so on failure the previous result
+        stays as it was.
+
+        :param parameterNode: module parameters (input model, cut path, direction, options).
+        :param progressCallback: called with (percent, message) between stages.
+        :return: the new fragment model nodes, largest first.
+        :raises ValueError: if inputs are invalid, the sheet does not cut the model, or later
+            cuts depend on the previous result of this curve.
+        """
+        reason = self.validateInputs(parameterNode)
+        if reason:
+            raise ValueError(reason)
+        inputModel, curveNode = parameterNode.inputModel, parameterNode.cutCurve
+        self._checkNoDependentCuts(curveNode)
+
+        report = progressCallback or (lambda percent, message: None)
+        report(0, _("Preparing..."))
+        polyData = self.getWorldPolyData(inputModel)
+        extent = parameterNode.options.extension or self.computeAutoExtent(polyData)
+        sheet = self.buildSheetPolyData(self.getPathPoints(curveNode), self.resolveDirection(parameterNode),
+                                        extent, closed=self.isClosedCurve(curveNode))
+        fragments = self.cutPolyData(polyData, [sheet], parameterNode.options, progressCallback)
+        if len(fragments) < 2:
+            raise ValueError(_("The cutting sheet does not divide the model. Check the cut path and direction."))
+
+        report(90, _("Creating fragment models..."))
+        self.removeCutResult(curveNode)
+        nodes = self.createFragmentNodes(fragments, inputModel, curveNode)
+        report(100, _("Done."))
+        return nodes
+
+    def createFragmentNodes(self, fragments: list[vtk.vtkPolyData], inputModel: vtkMRMLModelNode,
+                            curveNode: vtkMRMLMarkupsCurveNode) -> list[vtkMRMLModelNode]:
+        """Create one model node per fragment and hide the input model.
+
+        Nodes are named <InputModelName>_<CurveName>_<N>, coloured distinctly, placed in the
+        subject hierarchy folder "<InputModelName>_<CurveName>" next to the input model, and
+        linked to the curve and input model with node references.
+
+        :param fragments: fragment meshes in world coordinates.
+        :param inputModel: the model that was cut (hidden, not modified).
+        :param curveNode: the cut path that produced the fragments.
+        :return: the new model nodes, in the order of ``fragments``.
+        """
+        baseName = f"{inputModel.GetName()}_{curveNode.GetName()}"
+        shNode = slicer.mrmlScene.GetSubjectHierarchyNode()
+        parentItem = shNode.GetItemParent(shNode.GetItemByDataNode(inputModel))
+        folderItem = shNode.CreateFolderItem(parentItem, baseName)
+
+        curveNode.SetNodeReferenceID(INPUT_REFERENCE_ROLE, inputModel.GetID())
+        nodes = []
+        for index, fragment in enumerate(fragments):
+            node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode", f"{baseName}_{index + 1}")
+            node.SetAndObservePolyData(fragment)
+            node.CreateDefaultDisplayNodes()
+            node.GetDisplayNode().SetColor(self.fragmentColour(index))
+            shNode.SetItemParent(shNode.GetItemByDataNode(node), folderItem)
+            node.SetNodeReferenceID(CURVE_REFERENCE_ROLE, curveNode.GetID())
+            node.SetNodeReferenceID(INPUT_REFERENCE_ROLE, inputModel.GetID())
+            curveNode.AddNodeReferenceID(FRAGMENT_REFERENCE_ROLE, node.GetID())
+            nodes.append(node)
+
+        if inputModel.GetDisplayNode():
+            inputModel.GetDisplayNode().SetVisibility(False)
+        return nodes
+
+    def getCurveResult(self, curveNode: vtkMRMLMarkupsCurveNode) -> list[vtkMRMLModelNode]:
+        """Return the fragment models this curve produced (empty if it has not cut anything)."""
+        if curveNode is None:
+            return []
+        nodes = (curveNode.GetNthNodeReference(FRAGMENT_REFERENCE_ROLE, i)
+                 for i in range(curveNode.GetNumberOfNodeReferences(FRAGMENT_REFERENCE_ROLE)))
+        return [node for node in nodes if node is not None]
+
+    def getDependentCurves(self, curveNode: vtkMRMLMarkupsCurveNode) -> list[vtkMRMLMarkupsCurveNode]:
+        """Return the curves whose current result was cut from one of this curve's fragments."""
+        fragmentIds = {node.GetID() for node in self.getCurveResult(curveNode)}
+        dependents = []
+        for other in slicer.util.getNodesByClass("vtkMRMLMarkupsCurveNode"):
+            if other.GetID() == curveNode.GetID() or not self.getCurveResult(other):
+                continue
+            if other.GetNodeReferenceID(INPUT_REFERENCE_ROLE) in fragmentIds:
+                dependents.append(other)
+        return dependents
+
+    def removeCutResult(self, curveNode: vtkMRMLMarkupsCurveNode) -> None:
+        """Undo one curve's cut: delete its fragments and folder and show its input model again.
+
+        Does nothing if the curve has no result.
+
+        :raises ValueError: if other curves have cut this curve's fragments (undo those first).
+        """
+        fragments = self.getCurveResult(curveNode)
+        if not fragments:
+            return
+        self._checkNoDependentCuts(curveNode)
+
+        shNode = slicer.mrmlScene.GetSubjectHierarchyNode()
+        folderItems = {shNode.GetItemParent(shNode.GetItemByDataNode(node)) for node in fragments}
+        for node in fragments:
+            slicer.mrmlScene.RemoveNode(node)
+        for folderItem in folderItems:
+            if folderItem != shNode.GetSceneItemID() and shNode.GetNumberOfItemChildren(folderItem) == 0:
+                shNode.RemoveItem(folderItem)
+
+        inputModel = curveNode.GetNodeReference(INPUT_REFERENCE_ROLE)
+        if inputModel is not None and inputModel.GetDisplayNode():
+            inputModel.GetDisplayNode().SetVisibility(True)
+        curveNode.RemoveNodeReferenceIDs(FRAGMENT_REFERENCE_ROLE)
+        curveNode.RemoveNodeReferenceIDs(INPUT_REFERENCE_ROLE)
+
+    def mergeFragments(self, fragmentNodes: list[vtkMRMLModelNode]) -> vtkMRMLModelNode:
+        """Join two or more fragments of the same cut into one model.
+
+        The merged model keeps the name and colour of the lowest-numbered fragment; the other
+        fragments are removed. Undo of the cut still removes everything. This is the Phase 1
+        workaround for unwanted through-cuts (e.g. of the contralateral side).
+
+        :param fragmentNodes: fragment models, all produced by the same cut path.
+        :return: the merged model node.
+        :raises ValueError: fewer than 2 fragments, fragments of different cuts, different
+            parent transforms, or a fragment that has been cut further.
+        """
+        nodes = list({node.GetID(): node for node in fragmentNodes}.values())  # unique, order kept
+        if len(nodes) < 2:
+            raise ValueError(_("Select at least 2 fragments to merge."))
+        curveIds = {node.GetNodeReferenceID(CURVE_REFERENCE_ROLE) for node in nodes}
+        if len(curveIds) != 1 or None in curveIds:
+            raise ValueError(_("Only fragments produced by the same cut path can be merged."))
+        curveNode = nodes[0].GetNodeReference(CURVE_REFERENCE_ROLE)
+        if len({node.GetTransformNodeID() for node in nodes}) != 1:
+            raise ValueError(_("The fragments are under different transforms."))
+        nodeIds = {node.GetID() for node in nodes}
+        for other in self.getDependentCurves(curveNode):
+            if other.GetNodeReferenceID(INPUT_REFERENCE_ROLE) in nodeIds:
+                raise ValueError(_("Fragment {fragment} has been cut by {curve}. Undo that cut first.").format(
+                    fragment=other.GetNodeReference(INPUT_REFERENCE_ROLE).GetName(), curve=other.GetName()))
+
+        resultIds = [node.GetID() for node in self.getCurveResult(curveNode)]
+        nodes.sort(key=lambda node: resultIds.index(node.GetID()))
+        keep, others = nodes[0], nodes[1:]
+        keep.SetAndObservePolyData(self.mergePolyData([node.GetPolyData() for node in nodes]))
+        for node in others:
+            self._removeReference(curveNode, FRAGMENT_REFERENCE_ROLE, node)
+            slicer.mrmlScene.RemoveNode(node)
+        return keep
+
+    @staticmethod
+    def fragmentColour(index: int) -> tuple[float, float, float]:
+        """Return a distinct display colour for the fragment with the given 0-based index."""
+        return FRAGMENT_COLOURS[index % len(FRAGMENT_COLOURS)]
+
+    def _checkNoDependentCuts(self, curveNode: vtkMRMLMarkupsCurveNode) -> None:
+        """Raise ValueError if other curves have cut this curve's fragments."""
+        dependents = self.getDependentCurves(curveNode)
+        if dependents:
+            raise ValueError(_("Fragments of {curve} have been cut further by {others}. Undo those cuts first.").format(
+                curve=curveNode.GetName(), others=", ".join(other.GetName() for other in dependents)))
+
+    @staticmethod
+    def _removeReference(referencingNode, role: str, referencedNode) -> None:
+        """Remove one node reference of the given role pointing to referencedNode."""
+        for i in reversed(range(referencingNode.GetNumberOfNodeReferences(role))):
+            if referencingNode.GetNthNodeReferenceID(role, i) == referencedNode.GetID():
+                referencingNode.RemoveNthNodeReferenceID(role, i)
+
+    @staticmethod
+    def _normalised(vector: np.ndarray, errorMessage: str) -> np.ndarray:
+        """Return vector / |vector|, or raise ValueError(errorMessage) for a zero vector."""
+        length = float(np.linalg.norm(vector))
+        if length < 1e-9:
+            raise ValueError(errorMessage)
+        return np.asarray(vector, dtype=float) / length
 
     #
     # Mesh helpers
@@ -1092,3 +1490,287 @@ class OsteotomyCutsTest(ScriptedLoadableModuleTest):
                                          np.array([0.0, 0.0, 1.0]), 10.0)
         with self.assertRaises(ValueError):
             logic.cutPolyData(vtk.vtkPolyData(), [sheet], CutOptions())
+
+    #
+    # Step 4: MRML results
+    #
+
+    X_CUT_PATH = [[1.3, -40.0, 50.0], [1.3, 40.0, 50.0]]  # across the top of the test box, at x = 1.3
+    DOWN = (0.0, 0.0, -1.0)
+
+    @staticmethod
+    def _addModel(polyData: vtk.vtkPolyData, name: str) -> vtkMRMLModelNode:
+        node = slicer.modules.models.logic().AddModel(polyData)
+        node.SetName(name)
+        return node
+
+    @staticmethod
+    def _addCurve(points, name: str, closed: bool = False) -> vtkMRMLMarkupsCurveNode:
+        className = "vtkMRMLMarkupsClosedCurveNode" if closed else "vtkMRMLMarkupsCurveNode"
+        node = slicer.mrmlScene.AddNewNodeByClass(className, name)
+        node.SetCurveTypeToLinear()
+        slicer.util.updateMarkupsControlPointsFromArray(node, np.array(points, dtype=float))
+        return node
+
+    @staticmethod
+    def _configure(model, curve, direction=DOWN) -> OsteotomyCutsParameterNode:
+        parameterNode = OsteotomyCutsLogic().getParameterNode()
+        parameterNode.inputModel = model
+        parameterNode.cutCurve = curve
+        parameterNode.directionMode = DirectionMode.VIEW
+        parameterNode.viewDirection = tuple(direction)
+        return parameterNode
+
+    def _cutModel(self, model, curve, direction=DOWN) -> list:
+        return OsteotomyCutsLogic().applyCut(self._configure(model, curve, direction))
+
+    @staticmethod
+    def _ids(nodes) -> list:
+        return [node.GetID() for node in nodes]
+
+    @staticmethod
+    def _isVisible(model) -> bool:
+        return bool(model.GetDisplayNode().GetVisibility())
+
+    def test_mrml_output(self):
+        """Fragments are named, coloured, grouped, linked by references; the input is hidden only."""
+        logic = OsteotomyCutsLogic()
+        model = self._addModel(self._box(), "Box")
+        pointsBefore = self._points(model.GetPolyData()).copy()
+        curve = self._addCurve(self.X_CUT_PATH, "CutA")
+        nodes = self._cutModel(model, curve)
+
+        self.assertEqual([node.GetName() for node in nodes], ["Box_CutA_1", "Box_CutA_2"])
+        colours = {tuple(node.GetDisplayNode().GetColor()) for node in nodes}
+        self.assertEqual(len(colours), 2)
+
+        shNode = slicer.mrmlScene.GetSubjectHierarchyNode()
+        folders = {shNode.GetItemParent(shNode.GetItemByDataNode(node)) for node in nodes}
+        self.assertEqual(len(folders), 1)
+        folder = folders.pop()
+        self.assertEqual(shNode.GetItemName(folder), "Box_CutA")
+        self.assertEqual(shNode.GetItemParent(folder), shNode.GetItemParent(shNode.GetItemByDataNode(model)))
+
+        self.assertEqual(self._ids(logic.getCurveResult(curve)), self._ids(nodes))
+        self.assertEqual(curve.GetNodeReferenceID(INPUT_REFERENCE_ROLE), model.GetID())
+        for node in nodes:
+            self.assertEqual(node.GetNodeReferenceID(CURVE_REFERENCE_ROLE), curve.GetID())
+            self.assertEqual(node.GetNodeReferenceID(INPUT_REFERENCE_ROLE), model.GetID())
+            self.assertIsNone(node.GetParentTransformNode())
+            self.assertTrue(self._isVisible(node))
+
+        self.assertFalse(self._isVisible(model))
+        self.assertIsNotNone(slicer.mrmlScene.GetNodeByID(model.GetID()))
+        np.testing.assert_array_equal(self._points(model.GetPolyData()), pointsBefore)
+
+    def test_sequentialCut(self):
+        """Cutting a fragment gives sub-fragments and leaves the other fragments alone."""
+        logic = OsteotomyCutsLogic()
+        model = self._addModel(self._box(), "Box")
+        curveA = self._addCurve(self.X_CUT_PATH, "CutA")
+        fragmentsA = self._cutModel(model, curveA)
+        right = next(node for node in fragmentsA if node.GetPolyData().GetBounds()[0] > 0.0)
+        left = next(node for node in fragmentsA if node is not right)
+
+        curveB = self._addCurve([[10.0, 2.7, 50.0], [40.0, 2.7, 50.0]], "CutB")
+        fragmentsB = self._cutModel(right, curveB)
+
+        self.assertEqual(len(fragmentsB), 2)
+        for node in fragmentsB:
+            self.assertTrue(node.GetName().startswith(f"{right.GetName()}_CutB_"))
+            self.assertEqual(node.GetNodeReferenceID(INPUT_REFERENCE_ROLE), right.GetID())
+        self.assertFalse(self._isVisible(right))
+        self.assertTrue(self._isVisible(left))
+        self.assertEqual(self._ids(logic.getCurveResult(curveA)), self._ids(fragmentsA))
+        self.assertEqual(self._ids(logic.getDependentCurves(curveA)), [curveB.GetID()])
+
+    def test_reapplyPerCurve(self):
+        """Re-applying a curve replaces only its own result."""
+        logic = OsteotomyCutsLogic()
+        model1 = self._addModel(self._box(), "Box1")
+        model2 = self._addModel(self._box(), "Box2")
+        curveA = self._addCurve(self.X_CUT_PATH, "CutA")
+        curveB = self._addCurve(self.X_CUT_PATH, "CutB")
+        oldA = self._ids(self._cutModel(model1, curveA))
+        resultB = self._ids(self._cutModel(model2, curveB))
+
+        curveA.SetNthControlPointPositionWorld(0, 5.3, -40.0, 50.0)
+        curveA.SetNthControlPointPositionWorld(1, 5.3, 40.0, 50.0)
+        newA = self._cutModel(model1, curveA)
+
+        self.assertEqual(len(newA), 2)
+        self.assertEqual([node.GetName() for node in newA], ["Box1_CutA_1", "Box1_CutA_2"])
+        for nodeId in oldA:
+            self.assertIsNone(slicer.mrmlScene.GetNodeByID(nodeId))
+        self.assertEqual(self._ids(logic.getCurveResult(curveB)), resultB)
+        for nodeId in resultB:
+            self.assertIsNotNone(slicer.mrmlScene.GetNodeByID(nodeId))
+        self.assertFalse(self._isVisible(model1))
+        self.assertFalse(self._isVisible(model2))
+
+    def test_dependentBlocks(self):
+        """A cut whose fragments were cut further cannot be undone, re-applied or merged."""
+        logic = OsteotomyCutsLogic()
+        model = self._addModel(self._box(), "Box")
+        curveA = self._addCurve(self.X_CUT_PATH, "CutA")
+        fragmentsA = self._cutModel(model, curveA)
+        right = next(node for node in fragmentsA if node.GetPolyData().GetBounds()[0] > 0.0)
+        curveB = self._addCurve([[10.0, 2.7, 50.0], [40.0, 2.7, 50.0]], "CutB")
+        self._cutModel(right, curveB)
+
+        with self.assertRaises(ValueError):
+            logic.removeCutResult(curveA)
+        with self.assertRaises(ValueError):
+            self._cutModel(model, curveA)
+        with self.assertRaises(ValueError):
+            logic.mergeFragments(fragmentsA)
+        self.assertEqual(self._ids(logic.getCurveResult(curveA)), self._ids(fragmentsA))
+
+        logic.removeCutResult(curveB)
+        logic.removeCutResult(curveA)
+        self.assertEqual(logic.getCurveResult(curveA), [])
+        self.assertTrue(self._isVisible(model))
+
+    def test_undo(self):
+        """Undo removes the fragments and their folder and shows the input again."""
+        logic = OsteotomyCutsLogic()
+        model = self._addModel(self._box(), "Box")
+        curve = self._addCurve(self.X_CUT_PATH, "CutA")
+        nodeIds = self._ids(self._cutModel(model, curve))
+
+        logic.removeCutResult(curve)
+
+        for nodeId in nodeIds:
+            self.assertIsNone(slicer.mrmlScene.GetNodeByID(nodeId))
+        shNode = slicer.mrmlScene.GetSubjectHierarchyNode()
+        self.assertEqual(shNode.GetItemChildWithName(shNode.GetSceneItemID(), "Box_CutA"), 0)
+        self.assertTrue(self._isVisible(model))
+        self.assertEqual(logic.getCurveResult(curve), [])
+        self.assertIsNone(curve.GetNodeReferenceID(INPUT_REFERENCE_ROLE))
+        logic.removeCutResult(curve)  # nothing left to undo: no error
+
+    def test_mergeFragments(self):
+        """Merging keeps the lowest-numbered name and colour, and undo still removes everything."""
+        logic = OsteotomyCutsLogic()
+        radius, circleRadius = 30.0, 10.0
+        angles = np.linspace(0.0, 2.0 * np.pi, 24, endpoint=False)
+        z = np.sqrt(radius ** 2 - circleRadius ** 2)
+        circle = np.column_stack([circleRadius * np.cos(angles), circleRadius * np.sin(angles),
+                                  np.full_like(angles, z)])
+        model = self._addModel(self._sphere(radius), "Sphere")
+        curve = self._addCurve(circle, "Ring", closed=True)
+        band, cap1, cap2 = self._cutModel(model, curve, direction=(0.0, 0.0, 1.0))
+        capPoints = cap1.GetPolyData().GetNumberOfPoints() + cap2.GetPolyData().GetNumberOfPoints()
+        cap1Colour = tuple(cap1.GetDisplayNode().GetColor())
+        cap2Id = cap2.GetID()
+
+        with self.assertRaises(ValueError):
+            logic.mergeFragments([cap1])
+        otherModel = self._addModel(self._box(), "Box")
+        otherFragments = self._cutModel(otherModel, self._addCurve(self.X_CUT_PATH, "CutA"))
+        with self.assertRaises(ValueError):
+            logic.mergeFragments([cap1, otherFragments[0]])
+
+        merged = logic.mergeFragments([cap2, cap1])
+
+        self.assertEqual(merged.GetID(), cap1.GetID())
+        self.assertEqual(merged.GetName(), "Sphere_Ring_2")
+        self.assertEqual(tuple(merged.GetDisplayNode().GetColor()), cap1Colour)
+        self.assertEqual(merged.GetPolyData().GetNumberOfPoints(), capPoints)
+        self.assertIsNone(slicer.mrmlScene.GetNodeByID(cap2Id))
+        self.assertEqual(self._ids(logic.getCurveResult(curve)), [band.GetID(), merged.GetID()])
+
+        logic.removeCutResult(curve)
+        self.assertIsNone(slicer.mrmlScene.GetNodeByID(merged.GetID()))
+        self.assertIsNone(slicer.mrmlScene.GetNodeByID(band.GetID()))
+        self.assertTrue(self._isVisible(model))
+
+    def test_transformedInput(self):
+        """A model under a linear transform is cut in world coordinates."""
+        model = self._addModel(self._box(), "Box")
+        transform = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLinearTransformNode")
+        matrix = vtk.vtkMatrix4x4()
+        matrix.SetElement(0, 3, 100.0)
+        transform.SetMatrixTransformToParent(matrix)
+        model.SetAndObserveTransformNodeID(transform.GetID())
+        curve = self._addCurve([[101.3, -40.0, 50.0], [101.3, 40.0, 50.0]], "CutA")
+
+        nodes = self._cutModel(model, curve)
+
+        self.assertEqual(len(nodes), 2)
+        boundsList = sorted((node.GetPolyData().GetBounds() for node in nodes), key=lambda b: b[0])
+        self.assertAlmostEqual(boundsList[0][0], 50.0, places=3)
+        self.assertAlmostEqual(boundsList[0][1], 101.3, places=3)
+        self.assertAlmostEqual(boundsList[1][0], 101.3, places=3)
+        self.assertAlmostEqual(boundsList[1][1], 150.0, places=3)
+
+    def test_directions(self):
+        """Directions come from a markups line or a 3D view camera."""
+        logic = OsteotomyCutsLogic()
+        line = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsLineNode")
+        slicer.util.updateMarkupsControlPointsFromArray(line, np.array([[1.0, 2.0, 3.0], [1.0, 2.0, -7.0]]))
+        np.testing.assert_allclose(logic.directionFromLine(line), [0.0, 0.0, -1.0], atol=1e-9)
+
+        viewNode = slicer.vtkMRMLViewNode()
+        viewNode.SetLayoutName("OsteotomyCutsTestView")  # a view needs a layout name to own a camera
+        slicer.mrmlScene.AddNode(viewNode)
+        cameraNode = slicer.modules.cameras.logic().GetViewActiveCameraNode(viewNode)
+        if cameraNode is None:
+            cameraNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLCameraNode")
+            cameraNode.SetLayoutName(viewNode.GetLayoutName())
+        cameraNode.SetPosition(0.0, 100.0, 0.0)
+        cameraNode.SetFocalPoint(0.0, 0.0, 0.0)
+        np.testing.assert_allclose(logic.directionFromView(viewNode), [0.0, -1.0, 0.0], atol=1e-9)
+
+        parameterNode = logic.getParameterNode()
+        logic.captureViewDirection(parameterNode, viewNode)
+        np.testing.assert_allclose(parameterNode.viewDirection, [0.0, -1.0, 0.0], atol=1e-9)
+
+    def test_validateInputs(self):
+        """validateInputs says what is missing, and None once a cut can run."""
+        logic = OsteotomyCutsLogic()
+        parameterNode = logic.getParameterNode()
+        self.assertIn("model", logic.validateInputs(parameterNode))
+
+        model = self._addModel(self._box(), "Box")
+        parameterNode.inputModel = model
+        self.assertIn("cut path", logic.validateInputs(parameterNode))
+
+        curve = self._addCurve([[1.3, -40.0, 50.0]], "CutA")
+        parameterNode.cutCurve = curve
+        self.assertIn("2 points", logic.validateInputs(parameterNode))
+
+        curve.AddControlPointWorld(1.3, 40.0, 50.0)
+        self.assertIn("view direction", logic.validateInputs(parameterNode))
+
+        parameterNode.viewDirection = self.DOWN
+        self.assertIsNone(logic.validateInputs(parameterNode))
+
+        parameterNode.directionMode = DirectionMode.LINE
+        self.assertIn("direction line", logic.validateInputs(parameterNode))
+        line = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsLineNode")
+        slicer.util.updateMarkupsControlPointsFromArray(line, np.array([[0.0, 0.0, 10.0], [0.0, 0.0, 0.0]]))
+        parameterNode.directionLine = line
+        self.assertIsNone(logic.validateInputs(parameterNode))
+
+        # A fragment cannot be cut again by the curve that produced it
+        fragment = logic.applyCut(parameterNode)[0]
+        parameterNode.inputModel = fragment
+        self.assertIn("produced by this cut path", logic.validateInputs(parameterNode))
+        with self.assertRaises(ValueError):
+            logic.applyCut(parameterNode)
+
+    def test_failedCutKeepsResult(self):
+        """If a re-applied cut fails (sheet misses the model), the previous result stays."""
+        logic = OsteotomyCutsLogic()
+        model = self._addModel(self._box(), "Box")
+        curve = self._addCurve(self.X_CUT_PATH, "CutA")
+        nodeIds = self._ids(self._cutModel(model, curve))
+
+        curve.SetNthControlPointPositionWorld(0, 200.0, -40.0, 50.0)
+        curve.SetNthControlPointPositionWorld(1, 200.0, 40.0, 50.0)
+        with self.assertRaises(ValueError):
+            self._cutModel(model, curve)
+
+        self.assertEqual(self._ids(logic.getCurveResult(curve)), nodeIds)
+        self.assertFalse(self._isVisible(model))
