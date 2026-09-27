@@ -123,27 +123,40 @@ class FragmentPiece:
 
 
 class SheetParameterisation:
-    """2D coordinates on a cutting sheet from buildSheetPolyData, used to cap cut faces.
+    """A 2D chart of the cut surface of a sheet from buildSheetPolyData, used to cap cut faces.
 
-    On the sheet itself, u is the length along the (extended) path and v the distance from the
-    outer edge along the extrusion direction; the sheet is ruled, so (u, v) unrolls it, folds
-    included, into the plane. A kerf cut face lies on the surface at distance r = kerf / 2 on
-    one side of the sheet. There u is the length along that offset surface: at a fold that is
-    convex on that side, the offset surface has a rounded corner of length r * fold angle,
-    which gets its own stretch of u, and everything past it is shifted by that length. At a
-    concave fold the offset surface has a sharp crease and u simply jumps. For a closed sheet
-    u is periodic. Pure geometry, no MRML.
+    On the sheet itself, s is the length along the (extended) path and v the distance from the
+    outer edge along the extrusion direction; the sheet is ruled, so (s, v) unrolls it, folds
+    included, into the plane. The chart coordinates are (u, w), with u along the path and w
+    across it, measured from the inner edge of the sheet (height H there): w = v - H <= 0.
+
+    A kerf cut surface lies at distance r = kerf / 2 from the sheet: the offset surfaces on its
+    + and - side (relative to the sheet normals), joined around the inner edge by a half
+    cylinder, the rounded floor of a groove. Let theta be the angle of the offset direction
+    from the + normal towards the inner edge (0 on the + side, pi on the - side) and t the
+    distance from the inner edge along the sheet. Then w = -t on the + side, w = r * theta on
+    the floor and w = r * pi + t on the - side, so one chart covers both sides and the floor
+    (a groove's rim is a single loop) and its orientation is consistent across them.
+
+    At latitude theta the surface lies at the signed offset r * cos(theta) from the sheet, and u
+    is the length along it: at a fold that is convex on that side, the rounded corner of length
+    |offset| * fold angle gets its own stretch of u and everything past it is shifted by that
+    length; at a concave fold the offset faces meet in a crease and u jumps. For a closed sheet
+    u is periodic, with a period that depends on the latitude. With r = 0 the chart is the
+    sheet itself. Pure geometry, no MRML.
     """
 
-    # A closest point this close (mm) to a fold line in u is on the fold
+    # A closest point this close (mm) to a fold line in s is on the fold
     FOLD_TOLERANCE = 1e-6
 
-    def __init__(self, sheet: vtk.vtkPolyData) -> None:
-        """Derive the coordinates from the sheet's A, B point pairs.
+    def __init__(self, sheet: vtk.vtkPolyData, halfKerf: float = 0.0) -> None:
+        """Derive the chart from the sheet's A, B point pairs.
 
         :param sheet: triangulated sheet (buildSheetPolyData output).
+        :param halfKerf: offset r of the cut surface from the sheet (0 for a zero-kerf cut).
         """
         self.sheet = sheet
+        self.halfKerf = max(float(halfKerf), 0.0)
         self.points = numpy_support.vtk_to_numpy(sheet.GetPoints().GetData()).astype(float)
         self.triangles = numpy_support.vtk_to_numpy(sheet.GetPolys().GetConnectivityArray()).reshape(-1, 3)
         corners = self.points[self.triangles]
@@ -157,27 +170,37 @@ class SheetParameterisation:
         following = np.roll(middle, -1, axis=0) if self.closed else middle[1:]
         quadLengths = np.linalg.norm(following - middle[:len(following)], axis=1)
         quadCount = len(quadLengths)
-        self.quadStarts = np.concatenate([[0.0], np.cumsum(quadLengths)])  # u of each quad's start
+        self.quadStarts = np.concatenate([[0.0], np.cumsum(quadLengths)])  # s of each quad's start
         self.period = float(self.quadStarts[-1])
         self.heights = np.linalg.norm(inner - outer, axis=1)
+        self.foldDirections = (inner - outer) / self.heights[:, np.newaxis]  # along each fold line
 
-        # Per triangle: its quad, and (u, v) of its vertices (the closing quad of a closed
-        # sheet has its second pair at u = period, not 0)
+        # Per triangle: its quad, and (s, v) of its vertices (the closing quad of a closed
+        # sheet has its second pair at s = period, not 0)
         pairs = self.triangles // 2
         quads = pairs.min(axis=1)
         if self.closed:
             wraps = (pairs.max(axis=1) == pairCount - 1) & (quads == 0)
             quads[wraps] = pairCount - 1
         self.triangleQuads = quads
-        u = np.where(pairs == quads[:, np.newaxis], self.quadStarts[quads][:, np.newaxis],
+        s = np.where(pairs == quads[:, np.newaxis], self.quadStarts[quads][:, np.newaxis],
                      self.quadStarts[quads + 1][:, np.newaxis])
         v = (self.triangles % 2) * self.heights[pairs]
-        self.triangleUV = np.stack([u, v], axis=2)  # (M, 3, 2)
+        self.triangleUV = np.stack([s, v], axis=2)  # (M, 3, 2)
         self.quadTriangles = np.full((quadCount, 2), -1, dtype=np.int64)
         for triangleId, quad in enumerate(quads):
             self.quadTriangles[quad, 0 if self.quadTriangles[quad, 0] < 0 else 1] = triangleId
         quadNormals = self.cellNormals[self.quadTriangles].sum(axis=1)
         self.quadNormals = quadNormals / np.linalg.norm(quadNormals, axis=1, keepdims=True)
+
+        # Per quad: the direction in the sheet, across its inner edge and away from the sheet
+        # (where the floor of a groove starts)
+        innerTriangles = self.quadTriangles[np.arange(quadCount),
+                                            np.argmax((self.triangles[self.quadTriangles] % 2).sum(axis=2), axis=1)]
+        innerEdges = inner[(np.arange(quadCount) + 1) % pairCount] - inner[:quadCount]
+        across = np.cross(innerEdges, self.cellNormals[innerTriangles])
+        across *= np.sign(np.sum(across * self.foldDirections[:quadCount], axis=1))[:, np.newaxis]
+        self.innerDirections = across / np.linalg.norm(across, axis=1, keepdims=True)
 
         # Folds: pair p joins quad p - 1 (before) and quad p (after)
         self.foldAngles = np.zeros(pairCount)
@@ -188,79 +211,80 @@ class SheetParameterisation:
             self.foldAngles[p] = np.arccos(np.clip(np.dot(before, after), -1.0, 1.0))
             direction = middle[(p + 1) % pairCount] - middle[p]
             self.foldTurns[p] = np.sign(np.dot(before, direction))
+        # Never trim more than half a quad on either side of a crease
+        before = quadLengths[(np.arange(pairCount) - 1) % quadCount]
+        after = quadLengths[np.minimum(np.arange(pairCount), quadCount - 1)]
+        self.maxCreaseTrims = 0.5 * np.minimum(before, after)
 
         self.locator = vtk.vtkCellLocator()
         self.locator.SetDataSet(sheet)
         self.locator.BuildLocator()
 
-    def _offsetLayout(self, side: float, halfKerf: float
-                      ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
-        """How u on the offset surface of one side relates to u on the sheet.
+    def _layout(self, offsets: np.ndarray) -> dict[str, np.ndarray]:
+        """How u relates to s on the level surfaces at the given signed offsets from the sheet.
 
-        Where the sheet turns away from that side (convex), the offset surface has a rounded
-        corner of length r * fold angle. Where it turns towards it (concave), the offset
-        planes of the two faces meet in a crease r * tan(fold angle / 2) before the fold, and
-        the faces are trimmed there.
+        Where the sheet turns away from the offset side (convex), the level surface has a
+        rounded corner of length |offset| * fold angle. Where it turns towards it (concave), the
+        offset planes of the two faces meet in a crease |offset| * tan(fold angle / 2) before
+        the fold, and the faces are trimmed there.
 
-        :return: (shift of each quad's u, arc length at each pair (0 if none), start of each
-            pair's arc in u, crease trim at each pair (0 if none), period of the offset surface).
+        :param offsets: (K,) signed offsets (> 0 on the + side).
+        :return: per offset: "shifts" (K, Q) of each quad's u, "arcs" (K, P) arc length at each
+            pair (0 if none), "arcStarts" (K, P) u where it starts, "trims" (K, P) crease trim
+            at each pair (0 if none), "periods" (K,) period of u.
         """
-        pairCount = len(self.foldAngles)
-        if not halfKerf > 0:
-            zeros = np.zeros(pairCount)
-            return np.zeros(len(self.quadTriangles)), zeros, zeros, zeros, self.period
+        unique, inverse = np.unique(np.asarray(offsets, dtype=float), return_inverse=True)
+        radii = np.abs(unique)[:, np.newaxis]
         folded = self.foldAngles > 0
-        convex = folded & (self.foldTurns * side < 0)
+        convex = folded & (self.foldTurns * np.sign(unique)[:, np.newaxis] < 0)
         concave = folded & ~convex
-        arcLengths = np.where(convex, halfKerf * self.foldAngles, 0.0)
-        creaseTrims = np.where(concave, halfKerf * np.tan(self.foldAngles / 2.0), 0.0)
-        # Never trim more than half a quad on either side of the fold
-        quadLengths = np.diff(self.quadStarts)
-        before = quadLengths[(np.arange(pairCount) - 1) % len(quadLengths)]
-        after = quadLengths[np.minimum(np.arange(pairCount), len(quadLengths) - 1)]
-        creaseTrims = np.minimum(creaseTrims, 0.5 * np.minimum(before, after))
-        cumulative = np.cumsum(arcLengths - 2.0 * creaseTrims)  # the fold at pair p lies just before quad p
-        quadShifts = cumulative[:len(self.quadTriangles)]
-        arcStarts = self.quadStarts[:pairCount] + cumulative - arcLengths + 2.0 * creaseTrims
-        return quadShifts, arcLengths, arcStarts, creaseTrims, self.period + float(cumulative[-1])
+        arcs = np.where(convex, radii * self.foldAngles, 0.0)
+        trims = np.where(concave, np.minimum(radii * np.tan(self.foldAngles / 2.0), self.maxCreaseTrims), 0.0)
+        cumulative = np.cumsum(arcs - 2.0 * trims, axis=1)  # the fold at pair p lies just before quad p
+        pairCount = len(self.foldAngles)
+        layout = {"shifts": cumulative[:, :len(self.quadTriangles)], "arcs": arcs, "trims": trims,
+                  "arcStarts": self.quadStarts[:pairCount] + cumulative - arcs + 2.0 * trims,
+                  "periods": self.period + cumulative[:, -1]}
+        inverse = inverse.ravel()
+        return {name: values[inverse] for name, values in layout.items()}
 
-    def periodFor(self, side: float, halfKerf: float) -> float:
-        """Period of u on the cut surface of a closed sheet (the offset surface if halfKerf > 0)."""
-        return self._offsetLayout(side, halfKerf)[4]
+    def _latitudes(self, w: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """(theta, t) of chart coordinates w: the angle around the inner edge and the distance
+        from it along the sheet."""
+        r = self.halfKerf
+        if not r > 0:
+            return np.zeros(len(w)), np.maximum(-w, 0.0)
+        theta = np.clip(w / r, 0.0, np.pi)
+        t = np.where(w < 0.0, -w, np.maximum(w - r * np.pi, 0.0))
+        return theta, t
 
-    def bendCoordinates(self, side: float, halfKerf: float, tolerance: float) -> np.ndarray:
-        """Values of u where the cut surface bends, for placing cap points along the bends.
+    def _offsets(self, theta: np.ndarray) -> np.ndarray:
+        """Signed offset from the sheet of the level at latitude theta (exactly +/- r on the sides)."""
+        offsets = self.halfKerf * np.cos(theta)
+        offsets[theta <= 0.0] = self.halfKerf
+        offsets[theta >= np.pi] = -self.halfKerf
+        return offsets
 
-        These are the folds of the sheet (zero kerf), the creases of the offset surface, and
-        lines across its rounded corners spaced so that the chords stay within tolerance.
+    def _innerHeights(self, quads: np.ndarray, s: np.ndarray) -> np.ndarray:
+        """Height H of the sheet (v of its inner edge) at s in the given quads."""
+        pairCount = len(self.heights)
+        starts, ends = self.quadStarts[quads], self.quadStarts[quads + 1]
+        fraction = np.clip((s - starts) / np.maximum(ends - starts, 1e-300), 0.0, 1.0)
+        return self.heights[quads] * (1.0 - fraction) + self.heights[(quads + 1) % pairCount] * fraction
 
-        :param side: side from planarCoordinates.
-        :param halfKerf: offset of the cut surface from the sheet.
-        :param tolerance: allowed distance (mm) of a chord across a rounded corner from it.
-        :return: u values, in the coordinates of planarCoordinates.
-        """
-        quadShifts, arcLengths, arcStarts, creaseTrims, _period = self._offsetLayout(side, halfKerf)
-        folded = np.flatnonzero(self.foldAngles > 0)
-        if not halfKerf > 0:
-            return self.quadStarts[folded].astype(float)
-        values = []
-        quadCount = len(self.quadTriangles)
-        for p in folded:
-            if arcLengths[p] > 0:
-                chord = np.sqrt(8.0 * halfKerf * tolerance)  # sagitta of a chord on radius r
-                steps = max(1, int(np.ceil(arcLengths[p] / chord)))
-                values.extend(arcStarts[p] + arcLengths[p] * np.arange(steps + 1) / steps)
-            else:
-                values.append(self.quadStarts[p] + quadShifts[p % quadCount] + creaseTrims[p])
-        return np.array(values, dtype=float)
+    def periods(self, w: np.ndarray) -> np.ndarray:
+        """Period of u at chart coordinates w (closed sheets)."""
+        return self._layout(self._offsets(self._latitudes(np.asarray(w, dtype=float))[0]))["periods"]
 
-    def planarCoordinates(self, points: np.ndarray, halfKerf: float) -> tuple[np.ndarray, float]:
-        """Coordinates of points on the cut surface (the sheet, or its offset by halfKerf).
+    def signedDistances(self, w: np.ndarray) -> np.ndarray:
+        """Signed distance to the sheet of cut surface points at chart coordinates w."""
+        return np.where(np.asarray(w) <= self.halfKerf * np.pi / 2.0, self.halfKerf, -self.halfKerf)
 
-        :param points: (K, 3) points on the cut surface of one side.
-        :param halfKerf: offset of the cut surface from the sheet (0 for a zero-kerf cut).
-        :return: ((K, 2) coordinates (u, v), side of the sheet the points lie on relative to
-            its normals: +1, -1, or 0 for a zero-kerf cut).
+    def chartCoordinates(self, points: np.ndarray) -> np.ndarray:
+        """Chart coordinates (u, w) of points on the cut surface.
+
+        :param points: (K, 3) points on the cut surface (the sheet if halfKerf = 0).
+        :return: (K, 2) coordinates.
         """
         closest = np.empty_like(points, dtype=float)
         cellIds = np.empty(len(points), dtype=np.int64)
@@ -270,56 +294,77 @@ class SheetParameterisation:
             self.locator.FindClosestPoint(point.tolist(), position, cellId, subId, distance2)
             closest[i], cellIds[i] = position, int(cellId)
         weights = self._barycentric3D(closest, self.points[self.triangles[cellIds]])
-        uv = np.einsum("kj,kjc->kc", weights, self.triangleUV[cellIds])
-        if not halfKerf > 0:
-            return uv, 0.0
+        s, v = np.einsum("kj,kjc->kc", weights, self.triangleUV[cellIds]).T
+        quads = self.triangleQuads[cellIds]
+        t = np.maximum(self._innerHeights(quads, s) - v, 0.0)
+        r = self.halfKerf
+        if not r > 0:
+            return np.column_stack([s, -t])
 
         offsets = points - closest
-        side = 1.0 if np.sum(np.sum(offsets * self.cellNormals[cellIds], axis=1)) >= 0 else -1.0
-        quadShifts, arcLengths, arcStarts, _creaseTrims, _period = self._offsetLayout(side, halfKerf)
-        quads = self.triangleQuads[cellIds]
-        coordinates = uv.copy()
-        coordinates[:, 0] += quadShifts[quads]
+        theta = np.arctan2(np.maximum(np.sum(offsets * self.innerDirections[quads], axis=1), 0.0),
+                           np.sum(offsets * self.cellNormals[cellIds], axis=1))
+        u = s + self._layout(self._offsets(theta))["shifts"][np.arange(len(s)), quads]
 
-        # Points on a rounded corner: their closest sheet point is on the fold line
-        pairCount = len(arcLengths)
+        # Points on a rounded corner: their closest sheet point is on the fold line (or at its
+        # inner end, on the floor), and the offset lies in the wedge between the face normals
+        pairCount = len(self.foldAngles)
         quadCount = len(self.quadTriangles)
-        for pairs, onFold in (((quads + 1) % pairCount, self.quadStarts[quads + 1] - uv[:, 0] < self.FOLD_TOLERANCE),
-                              (quads, uv[:, 0] - self.quadStarts[quads] < self.FOLD_TOLERANCE)):
-            onArc = onFold & (arcLengths[pairs] > 0)
-            if not np.any(onArc):
+        for pairs, onFold in (((quads + 1) % pairCount, self.quadStarts[quads + 1] - s < self.FOLD_TOLERANCE),
+                              (quads, s - self.quadStarts[quads] < self.FOLD_TOLERANCE)):
+            ids = np.flatnonzero(onFold & (self.foldAngles[pairs] > 0))
+            if len(ids) == 0:
                 continue
-            p = pairs[onArc]
-            before = side * self.quadNormals[(p - 1) % quadCount]
-            directions = offsets[onArc] / np.linalg.norm(offsets[onArc], axis=1, keepdims=True)
-            angles = np.clip(np.arccos(np.clip(np.sum(directions * before, axis=1), -1.0, 1.0)),
-                             0.0, self.foldAngles[p])
-            coordinates[onArc, 0] = arcStarts[p] + halfKerf * angles
-        return coordinates, side
+            p = pairs[ids]
+            before, after = self.quadNormals[(p - 1) % quadCount], self.quadNormals[p % quadCount]
+            along = np.sum(offsets[ids] * self.foldDirections[p], axis=1)
+            perpendicular = offsets[ids] - along[:, np.newaxis] * self.foldDirections[p]
+            radii = np.linalg.norm(perpendicular, axis=1)
+            side = np.where(np.sum(perpendicular * (before + after), axis=1) >= 0, 1.0, -1.0)
+            convex = (self.foldTurns[p] * side < 0) & (radii > 1e-12)
+            ids, p, before, along, perpendicular, radii, side = (
+                values[convex] for values in (ids, p, before, along, perpendicular, radii, side))
+            if len(ids) == 0:
+                continue
+            theta[ids] = np.arctan2(np.maximum(along, 0.0), side * radii)
+            layout = self._layout(self._offsets(theta[ids]))
+            rows = np.arange(len(ids))
+            angles = np.clip(np.arccos(np.clip(np.sum(perpendicular / radii[:, np.newaxis] * side[:, np.newaxis]
+                                                      * before, axis=1), -1.0, 1.0)), 0.0, self.foldAngles[p])
+            u[ids] = layout["arcStarts"][rows, p] + r * np.abs(np.cos(theta[ids])) * angles
+        w = r * theta + np.where(theta < np.pi / 2.0, -t, t)
+        return np.column_stack([u, w])
 
-    def surfacePoints(self, coordinates: np.ndarray, side: float, halfKerf: float) -> np.ndarray:
-        """Points on the cut surface at the given coordinates (inverse of planarCoordinates).
+    def surfacePoints(self, coordinates: np.ndarray) -> np.ndarray:
+        """Points on the cut surface at the given chart coordinates (inverse of chartCoordinates).
 
-        :param coordinates: (K, 2) coordinates (u, v); u wraps for a closed sheet and is
+        :param coordinates: (K, 2) coordinates (u, w); u wraps for a closed sheet and is
             clamped for an open one.
-        :param side: side from planarCoordinates.
-        :param halfKerf: offset of the cut surface from the sheet.
         :return: (K, 3) points.
         """
         quadCount = len(self.quadTriangles)
-        quadShifts, arcLengths, arcStarts, creaseTrims, period = self._offsetLayout(side, halfKerf)
-        u = np.mod(coordinates[:, 0], period) if self.closed else coordinates[:, 0]
-        v = coordinates[:, 1]
-        # Each quad's stretch of u, less the parts beyond a crease
-        pairCount = len(creaseTrims)
-        trimStarts = creaseTrims[np.arange(quadCount)]
-        trimEnds = creaseTrims[(np.arange(quadCount) + 1) % pairCount]
-        flatStarts = self.quadStarts[:-1] + quadShifts + trimStarts
-        quads = np.clip(np.searchsorted(flatStarts, u, side="right") - 1, 0, quadCount - 1)
-        sheetU = np.clip(u - quadShifts[quads], self.quadStarts[quads] + trimStarts[quads],
-                         self.quadStarts[quads + 1] - trimEnds[quads])
+        pairCount = len(self.foldAngles)
+        r = self.halfKerf
+        u, w = coordinates[:, 0].astype(float), coordinates[:, 1].astype(float)
+        theta, t = self._latitudes(w)
+        offsets = self._offsets(theta) if r > 0 else np.zeros(len(u))
+        layout = self._layout(offsets)
+        if self.closed:
+            u = np.mod(u, layout["periods"])
+        rows = np.arange(len(u))
 
-        query = np.column_stack([sheetU, v])
+        # Each quad's stretch of u, less the parts beyond a crease
+        trims = layout["trims"]
+        trimStarts = trims[:, :quadCount]
+        trimEnds = trims[:, (np.arange(quadCount) + 1) % pairCount]
+        flatStarts = self.quadStarts[:quadCount] + layout["shifts"] + trimStarts
+        quads = np.clip(np.count_nonzero(flatStarts <= u[:, np.newaxis], axis=1) - 1, 0, quadCount - 1)
+        s = np.clip(u - layout["shifts"][rows, quads], self.quadStarts[quads] + trimStarts[rows, quads],
+                    self.quadStarts[quads + 1] - trimEnds[rows, quads])
+        heights = self._innerHeights(quads, s)
+        v = np.clip(heights - t, 0.0, heights)
+
+        query = np.column_stack([s, v])
         best = np.full(len(u), -1, dtype=np.int64)
         bestWeights = np.zeros((len(u), 3))
         bestScore = np.full(len(u), -np.inf)
@@ -330,23 +375,70 @@ class SheetParameterisation:
             better = score > bestScore
             best[better], bestWeights[better], bestScore[better] = triangleIds[better], weights[better], score[better]
         result = np.einsum("kj,kjc->kc", bestWeights, self.points[self.triangles[best]])
-        result += side * halfKerf * self.cellNormals[best]
+        if not r > 0:
+            return result
+        result += r * (np.cos(theta)[:, np.newaxis] * self.cellNormals[best]
+                       + np.sin(theta)[:, np.newaxis] * self.innerDirections[quads])
 
         # Points on the rounded corners
-        for p in np.flatnonzero(arcLengths > 0):
-            onArc = (u >= arcStarts[p]) & (u <= arcStarts[p] + arcLengths[p])
-            if not np.any(onArc):
-                continue
+        arcs, arcStarts = layout["arcs"], layout["arcStarts"]
+        onArc = (arcs > 0) & (u[:, np.newaxis] >= arcStarts) & (u[:, np.newaxis] <= arcStarts + arcs)
+        ids = np.flatnonzero(onArc.any(axis=1))
+        if len(ids) > 0:
+            p = np.argmax(onArc[ids], axis=1)
+            side = np.sign(offsets[ids])[:, np.newaxis]
+            radii = np.abs(offsets[ids])
             before = side * self.quadNormals[(p - 1) % quadCount]
             after = side * self.quadNormals[p % quadCount]
-            towards = after - np.dot(after, before) * before
-            towards /= np.linalg.norm(towards)
-            angles = (u[onArc] - arcStarts[p]) / halfKerf
+            towards = after - np.sum(after * before, axis=1, keepdims=True) * before
+            towards /= np.linalg.norm(towards, axis=1, keepdims=True)
+            angles = ((u[ids] - arcStarts[ids, p]) / radii)[:, np.newaxis]
             outer, inner = self.points[2 * p], self.points[2 * p + 1]
-            foldPoints = outer + np.clip(v[onArc] / self.heights[p], 0.0, 1.0)[:, np.newaxis] * (inner - outer)
-            result[onArc] = foldPoints + halfKerf * (np.cos(angles)[:, np.newaxis] * before
-                                                     + np.sin(angles)[:, np.newaxis] * towards)
+            foldPoints = outer + (np.clip(self.heights[p] - t[ids], 0.0, self.heights[p]) / self.heights[p])[:, np.newaxis] * (inner - outer)
+            result[ids] = (foldPoints + radii[:, np.newaxis] * (np.cos(angles) * before + np.sin(angles) * towards)
+                           + r * np.sin(theta[ids])[:, np.newaxis] * self.foldDirections[p])
         return result
+
+    def bendPoints(self, w: np.ndarray, tolerance: float) -> np.ndarray:
+        """Chart points along the bends of the cut surface, for placing cap points there.
+
+        These are the folds of the sheet (zero kerf), the creases of the offset surfaces, and
+        lines across their rounded corners spaced so that the chords stay within tolerance.
+
+        :param w: (L,) chart coordinates w at which to place points along each bend.
+        :param tolerance: allowed distance (mm) of a chord across a rounded corner from it.
+        :return: (M, 2) chart coordinates.
+        """
+        folded = np.flatnonzero(self.foldAngles > 0)
+        w = np.asarray(w, dtype=float)
+        if len(folded) == 0 or len(w) == 0:
+            return np.zeros((0, 2))
+        quadCount = len(self.quadTriangles)
+        theta, _t = self._latitudes(w)
+        offsets = self._offsets(theta) if self.halfKerf > 0 else np.zeros(len(w))
+        layout = self._layout(offsets)
+        result = []
+        for row, level in enumerate(w):
+            radius = abs(offsets[row])
+            for p in folded:
+                arc = layout["arcs"][row, p]
+                if arc > 0:
+                    chord = np.sqrt(8.0 * radius * tolerance)  # sagitta of a chord on the radius
+                    steps = max(1, int(np.ceil(arc / chord)))
+                    values = layout["arcStarts"][row, p] + arc * np.arange(steps + 1) / steps
+                else:
+                    values = [self.quadStarts[p] + layout["shifts"][row, p % quadCount] + layout["trims"][row, p]]
+                result.extend((value, level) for value in values)
+        return np.array(result, dtype=float).reshape(-1, 2)
+
+    def floorLevels(self, tolerance: float) -> np.ndarray:
+        """Chart coordinates w of lines across the rounded floor (around the inner edge), spaced
+        so that chords between them stay within tolerance; empty for a zero-kerf cut."""
+        r = self.halfKerf
+        if not r > 0:
+            return np.zeros(0)
+        steps = max(2, int(np.ceil(np.pi * r / np.sqrt(8.0 * r * tolerance))))
+        return r * np.pi * np.arange(1, steps) / steps
 
     @staticmethod
     def _barycentric3D(points: np.ndarray, corners: np.ndarray) -> np.ndarray:
@@ -731,6 +823,10 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
     MAX_FLIP_ROUNDS = 1000
     # Largest spacing (mm) of cap points placed along a bend of the cut surface
     CAP_MAX_BEND_SPACING = 2.0
+    # Points filling a cap are spaced at most this far apart (mm); the distance raster used to
+    # place them has at most MAX_FILL_PIXELS pixels
+    CAP_MAX_FILL_SPACING = 8.0
+    MAX_FILL_PIXELS = 4_000_000
     # Rim edges shorter than this fraction of the model's bounding-box diagonal are collapsed
     RIM_COLLAPSE_FRACTION = 1e-4
     # Fragment normals are not smoothed across edges sharper than this (degrees), so that cut
@@ -1144,33 +1240,34 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         arrays = {name: (values[used], dataType) for name, (values, dataType) in arrays.items()}
         return self._buildTriangleMesh(points[used], newIds[triangles], arrays, normalsName, scalarsName), True
 
-    def capCutFaces(self, mesh: vtk.vtkPolyData, sheetMap: SheetParameterisation, halfKerf: float,
-                    side: Optional[int] = None, arrayName: str = "SheetDistance") -> tuple[vtk.vtkPolyData, int]:
+    def capCutFaces(self, mesh: vtk.vtkPolyData, sheetMap: SheetParameterisation,
+                    arrayName: str = "SheetDistance") -> tuple[vtk.vtkPolyData, int]:
         """Close the open cut faces a sheet left in a mesh, so that the pieces are watertight.
 
         The cut face boundary is the set of open edges whose ends lie on the cut surface
-        (|d| = halfKerf); rim edges too short to tell apart are collapsed first. The loops are
-        mapped to plane coordinates that unroll the cut surface, folds, creases and rounded
-        corners included (SheetParameterisation), and triangulated there with
-        vtkContourTriangulator (nested loops, e.g. an inferior alveolar canal, become holes).
-        The cap reuses the loop vertices, so it shares its edges with the mesh. Points are
-        added on the cut surface along its bends, the triangulation is made Delaunay by edge
-        flips (no fans of slivers), and cap edges whose midpoint still strays more than
-        CAP_TOLERANCE from the cut surface are split.
+        (|d| = kerf / 2); rim edges too short to tell apart are collapsed first. The loops are
+        mapped to the chart of the cut surface (SheetParameterisation), which unrolls both of
+        its sides, the rounded floor of a groove, folds, creases and rounded corners into one
+        plane, and triangulated there with vtkContourTriangulator (nested loops, e.g. an
+        inferior alveolar canal, become holes). A groove (depth-limited cut) is thus lined
+        with one cap along its walls and floor. The cap reuses the loop vertices, so it shares
+        its edges with the mesh. Points are added on the cut surface along its bends and across
+        a groove floor, the triangulation is made Delaunay by edge flips (no fans of slivers),
+        and cap edges whose midpoint still strays more than CAP_TOLERANCE from the cut surface
+        are split.
 
-        :param mesh: triangle mesh with the signed distance array (after splitByDistance or
-            removeKerf).
-        :param sheetMap: parameterisation of the sheet that made the cut.
-        :param halfKerf: half the kerf width (0 for a zero-kerf cut).
-        :param side: +1 / -1 if the mesh lies on one side of the sheet (zero-kerf cut); None to
-            cap both sides separately, found from the distance sign.
+        :param mesh: triangle mesh with the signed distance array (after splitByDistance, one
+            side only, or removeKerf).
+        :param sheetMap: chart of the cut surface of the sheet that made the cut (its halfKerf
+            is the offset of the cut surface).
         :param arrayName: name of the signed distance array.
-        :return: (mesh with caps, number of cut faces that could not be capped).
+        :return: (mesh with caps, 1 if the cut faces could not be capped, else 0).
         """
         triangles = numpy_support.vtk_to_numpy(mesh.GetPolys().GetConnectivityArray()).reshape(-1, 3).astype(np.int64)
         points = numpy_support.vtk_to_numpy(mesh.GetPoints().GetData()).astype(float)
         arrays, normalsName, scalarsName = self._pointArrays(mesh)
         distances = arrays[arrayName][0]
+        halfKerf = sheetMap.halfKerf
 
         # Open edges, in the direction of the triangle that uses them
         directed = np.vstack([triangles[:, [0, 1]], triangles[:, [1, 2]], triangles[:, [2, 0]]])
@@ -1215,76 +1312,60 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
             openEdges = directed[counts[inverse.ravel()] == 1]
             cutEdges = openEdges[onCut[openEdges[:, 0]] & onCut[openEdges[:, 1]]]
 
-        if side is None:
-            edgeSides = np.where(distances[cutEdges[:, 0]] >= 0, 1, -1)
-        else:
-            edgeSides = np.full(len(cutEdges), side)
-
-        failed = 0
-        newPoints, newTriangles = [], []
-        pointCount = len(points)
-        for groupSide in (1, -1):
-            edges = cutEdges[edgeSides == groupSide]
-            if len(edges) == 0:
-                continue
-            result = self._capLoops(edges, points, sheetMap, halfKerf, arrays, arrayName,
-                                    groupSide * halfKerf, pointCount)
-            if result is None:
-                failed += 1
-                continue
-            capPoints, capTriangles, capArrays = result
-            newPoints.append(capPoints)
-            newTriangles.append(capTriangles)
-            for name in arrays:
-                values, dataType = arrays[name]
-                arrays[name] = (np.concatenate([values, capArrays[name].astype(values.dtype)]), dataType)
-            pointCount += len(capPoints)
-
-        if not newTriangles:
-            return mesh, failed
-        points = np.vstack([points] + newPoints)
-        triangles = np.vstack([triangles] + newTriangles)
-        return self._buildTriangleMesh(points, triangles, arrays, normalsName, scalarsName), failed
+        result = self._capLoops(cutEdges, points, sheetMap, arrays, arrayName)
+        if result is None:
+            return mesh, 1
+        capPoints, capTriangles, capArrays = result
+        for name in arrays:
+            values, dataType = arrays[name]
+            arrays[name] = (np.concatenate([values, capArrays[name].astype(values.dtype)]), dataType)
+        return self._buildTriangleMesh(np.vstack([points, capPoints]), np.vstack([triangles, capTriangles]),
+                                       arrays, normalsName, scalarsName), 0
 
     def _capLoops(self, edges: np.ndarray, points: np.ndarray, sheetMap: SheetParameterisation,
-                  halfKerf: float, arrays: dict, arrayName: str, distanceValue: float,
-                  firstNewId: int) -> Optional[tuple[np.ndarray, np.ndarray, dict]]:
-        """Triangulate the cut face bounded by the given open edges (one side of one sheet).
+                  arrays: dict, arrayName: str) -> Optional[tuple[np.ndarray, np.ndarray, dict]]:
+        """Triangulate the cut face bounded by the given open edges (one sheet).
 
         :param edges: (E, 2) open edges on the cut surface, directed as in the mesh.
         :param points: (N, 3) mesh points.
-        :param sheetMap: parameterisation of the cutting sheet.
-        :param halfKerf: half the kerf width.
+        :param sheetMap: chart of the cut surface.
         :param arrays: mesh point data {name: (values, VTK type)}.
         :param arrayName: name of the signed distance array.
-        :param distanceValue: signed distance written for added points.
-        :param firstNewId: mesh id the first added point will get.
-        :return: (added points (K, 3), cap triangles in mesh ids (C, 3), point data of added
-            points {name: values}), or None if the loops could not be triangulated.
+        :return: (added points (K, 3), cap triangles in mesh ids (C, 3), with added points
+            numbered from N, point data of added points {name: values}), or None if the loops
+            could not be triangulated.
         """
+        firstNewId = len(points)
         loopIds, localEdges = np.unique(edges, return_inverse=True)
         localEdges = localEdges.reshape(-1, 2)
         loopPoints = points[loopIds]
-        uv, offsetSide = sheetMap.planarCoordinates(loopPoints, halfKerf)
-        radius = sheetMap.periodFor(offsetSide, halfKerf) / (2.0 * np.pi)
+        chart = sheetMap.chartCoordinates(loopPoints)
+        wMin, wMax = float(chart[:, 1].min()), float(chart[:, 1].max())
+        # A closed sheet is unrolled to an annulus, so loops around it stay closed loops; the
+        # innermost loop point lies where the annulus is true to length
+        baseRadius = float(sheetMap.periods(chart[:, 1]).max()) / (2.0 * np.pi)
 
         def toPlane(coordinates: np.ndarray) -> np.ndarray:
             if not sheetMap.closed:
                 return coordinates.copy()
-            # A closed sheet is unrolled to an annulus, so loops around it stay closed loops
-            angle = coordinates[:, 0] / radius
-            return (radius + coordinates[:, 1])[:, np.newaxis] * np.column_stack([np.cos(angle), np.sin(angle)])
+            angle = 2.0 * np.pi * coordinates[:, 0] / sheetMap.periods(coordinates[:, 1])
+            radius = baseRadius + coordinates[:, 1] - wMin
+            return radius[:, np.newaxis] * np.column_stack([np.cos(angle), np.sin(angle)])
 
         def fromPlane(planar: np.ndarray) -> np.ndarray:
             if not sheetMap.closed:
                 return planar
+            w = np.linalg.norm(planar, axis=1) - baseRadius + wMin
             angle = np.mod(np.arctan2(planar[:, 1], planar[:, 0]), 2.0 * np.pi)
-            return np.column_stack([angle * radius, np.linalg.norm(planar, axis=1) - radius])
+            return np.column_stack([angle / (2.0 * np.pi) * sheetMap.periods(w), w])
 
         def surfacePoints(planar: np.ndarray) -> np.ndarray:
-            return sheetMap.surfacePoints(fromPlane(planar), offsetSide, halfKerf)
+            return sheetMap.surfacePoints(fromPlane(planar))
 
-        planar = toPlane(uv)
+        def signedDistances(planar: np.ndarray) -> np.ndarray:
+            return sheetMap.signedDistances(fromPlane(planar)[:, 1])
+
+        planar = toPlane(chart)
         positions = loopPoints.copy()
 
         def edgeDeviation(first: np.ndarray, second: np.ndarray) -> np.ndarray:
@@ -1292,41 +1373,64 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
             onSurface = surfacePoints((planar[first] + planar[second]) / 2.0)
             return np.linalg.norm(onSurface - (positions[first] + positions[second]) / 2.0, axis=1)
 
-        triangles = self._triangulatePlanarLoops(planar, localEdges)
-        if triangles is None:
-            return None
         localArrays = {name: values[loopIds] for name, (values, _dataType) in arrays.items()}
+        loopCount = len(loopIds)
 
-        # Points along the bends of the cut surface, so that no triangle spans a bend
-        bends = sheetMap.bendCoordinates(offsetSide, halfKerf, self.CAP_TOLERANCE)
-        if len(bends) > 0:
-            loopLengths = np.linalg.norm(positions[localEdges[:, 0]] - positions[localEdges[:, 1]], axis=1)
-            spacing = float(np.clip(np.median(loopLengths), self.CAP_MIN_EDGE_LENGTH, self.CAP_MAX_BEND_SPACING))
-            heights = np.arange(uv[:, 1].min() + spacing / 2.0, uv[:, 1].max(), spacing)
-            candidates = np.column_stack([np.repeat(bends, len(heights)), np.tile(heights, len(bends))])
-            candidatePlanar = toPlane(candidates)
-            inside = self._insideLoops(candidatePlanar, planar[localEdges[:, 0]], planar[localEdges[:, 1]])
-            candidatePlanar = candidatePlanar[inside]
-            clearance = self._distanceToSegments(candidatePlanar, planar[localEdges[:, 0]], planar[localEdges[:, 1]])
+        # Points along the bends of the cut surface and across a groove floor, so that no
+        # triangle spans a bend
+        loopLengths = np.linalg.norm(positions[localEdges[:, 0]] - positions[localEdges[:, 1]], axis=1)
+        spacing = float(np.clip(np.median(loopLengths), self.CAP_MIN_EDGE_LENGTH, self.CAP_MAX_BEND_SPACING))
+        candidates = [sheetMap.bendPoints(np.arange(wMin + spacing / 2.0, wMax, spacing), self.CAP_TOLERANCE)]
+        floorLevels = sheetMap.floorLevels(self.CAP_TOLERANCE)
+        for level in floorLevels[(floorLevels > wMin) & (floorLevels < wMax)]:
+            if sheetMap.closed:
+                uValues = np.arange(0.0, float(sheetMap.periods(np.array([level]))[0]), spacing)
+            else:
+                uValues = np.arange(chart[:, 0].min() + spacing / 2.0, chart[:, 0].max(), spacing)
+            candidates.append(np.column_stack([uValues, np.full(len(uValues), level)]))
+        candidatePlanar = toPlane(np.vstack(candidates))
+        loopStarts, loopEnds = planar[localEdges[:, 0]], planar[localEdges[:, 1]]
+        if len(candidatePlanar) > 0:
+            candidatePlanar = candidatePlanar[self._insideLoops(candidatePlanar, loopStarts, loopEnds)]
+            clearance = self._distanceToSegments(candidatePlanar, loopStarts, loopEnds)
             candidatePlanar = candidatePlanar[clearance > spacing / 2.0]
-            if len(candidatePlanar) > 0:
-                firstInserted = len(planar)
-                planar = np.vstack([planar, candidatePlanar])
-                positions = np.vstack([positions, surfacePoints(candidatePlanar)])
-                triangles, hosts = self._insertPoints(planar, triangles, np.arange(firstInserted, len(planar)))
-                hosts = np.maximum(hosts, 0)
-                while np.any(hosts >= firstInserted):  # a corner inserted earlier: follow it back
-                    later = hosts >= firstInserted
-                    hosts[later] = hosts[hosts[later] - firstInserted]
-                for name, values in localArrays.items():
-                    if name == arrayName:
-                        newValues = np.full(len(hosts), distanceValue)
-                    else:
-                        newValues = values[hosts]  # from a corner of the enclosing triangle
-                    localArrays[name] = np.concatenate([values, newValues.astype(values.dtype)])
+        # Points filling the rest of the face, coarser away from the rim and the bends: a cap
+        # of long slivers would be shredded by the refinement of a later cut through it
+        candidatePlanar = np.vstack([candidatePlanar, self._gradedFillPoints(loopStarts, loopEnds,
+                                                                             candidatePlanar, spacing)])
+        # A loop edge whose diametral circle holds no other point is a Delaunay edge
+        loopLengths2D = np.linalg.norm(loopEnds - loopStarts, axis=1)
+        long = loopLengths2D > spacing  # shorter edges: the points keep spacing / 2 off them
+        if np.any(long) and len(candidatePlanar) > 0:
+            centres, radii = (loopStarts[long] + loopEnds[long]) / 2.0, 0.55 * loopLengths2D[long]
+            clear = np.ones(len(candidatePlanar), dtype=bool)
+            for chunk in range(0, len(candidatePlanar), 512):
+                offsets = candidatePlanar[chunk:chunk + 512, np.newaxis, :] - centres[np.newaxis]
+                clear[chunk:chunk + 512] = np.all(np.linalg.norm(offsets, axis=2) > radii, axis=1)
+            candidatePlanar = candidatePlanar[clear]
 
-        # Ear clipping leaves fans of slivers across the face; later sheets cutting through
-        # them would give a needlessly dense, near-degenerate rim
+        # Delaunay triangulation of all the points, kept inside the loops; if it does not keep
+        # every loop edge, the loops are triangulated alone and the points inserted
+        allPlanar = np.vstack([planar, candidatePlanar])
+        triangles = self._delaunayInLoops(allPlanar, localEdges)
+        if triangles is None:
+            triangles = self._triangulatePlanarLoops(planar, localEdges)
+            if triangles is None:
+                return None
+            triangles, _hosts = self._insertPoints(allPlanar, triangles, np.arange(loopCount, len(allPlanar)))
+        planar = allPlanar
+        if len(candidatePlanar) > 0:
+            positions = np.vstack([positions, surfacePoints(candidatePlanar)])
+            hosts = self._nearestPoints(candidatePlanar, planar[:loopCount])
+            for name, values in localArrays.items():
+                if name == arrayName:
+                    newValues = signedDistances(candidatePlanar)
+                else:
+                    newValues = values[hosts]  # from the nearest rim point
+                localArrays[name] = np.concatenate([values, newValues.astype(values.dtype)])
+
+        # The fallback's ear clipping leaves fans of slivers across the face; later sheets
+        # cutting through them would give a needlessly dense, near-degenerate rim
         triangles = self._delaunayFlips(planar, triangles, edgeDeviation)
 
         # Split cap edges that still stray from the cut surface; the loop edges are never split
@@ -1352,7 +1456,7 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
             positions = np.vstack([positions, midPoints[split]])
             for name, values in localArrays.items():
                 if name == arrayName:
-                    newValues = np.full(splitCount, distanceValue)
+                    newValues = signedDistances(midPlanar[split])
                 elif np.issubdtype(values.dtype, np.floating):
                     newValues = (values[splitStart] + values[splitEnd]) / 2.0
                 else:
@@ -1382,6 +1486,87 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         meshIds = np.concatenate([loopIds, firstNewId + np.arange(len(positions) - loopCount)])
         addedArrays = {name: values[loopCount:] for name, values in localArrays.items()}
         return positions[loopCount:], meshIds[triangles], addedArrays
+
+    def _delaunayInLoops(self, planar: np.ndarray, edges: np.ndarray) -> Optional[np.ndarray]:
+        """Delaunay triangulation of 2D points, restricted to the region bounded by loops.
+
+        The loop points come first in planar. The triangulation (scipy / Qhull, robust to
+        collinear points) is not constrained, so it is accepted only if its triangles inside
+        the loops are bounded by exactly the loop edges; with points spaced along the loops more
+        closely than the other points keep off them, this is the usual case.
+
+        :param planar: (K, 2) loop points followed by the points inside the loops.
+        :param edges: (E, 2) directed edges forming closed loops.
+        :return: (C, 3) counter-clockwise triangles, or None (scipy missing or a loop edge is
+            not an edge of the triangulation).
+        """
+        try:
+            from scipy.sparse import coo_matrix
+            from scipy.sparse.csgraph import connected_components
+            from scipy.spatial import Delaunay
+        except ImportError:
+            return None
+        # Four frame points keep the loops off the convex hull, where Qhull joins collinear
+        # points with flat triangles
+        lower, upper = planar.min(axis=0), planar.max(axis=0)
+        margin = 0.1 * (upper - lower) + 1.0
+        frame = np.array([[lower[0] - margin[0], lower[1] - margin[1]], [upper[0] + margin[0], lower[1] - margin[1]],
+                          [upper[0] + margin[0], upper[1] + margin[1]], [lower[0] - margin[0], upper[1] + margin[1]]])
+        framed = np.vstack([planar, frame])
+        try:
+            triangulation = Delaunay(framed)
+        except Exception:  # Qhull errors (e.g. all points collinear)
+            return None
+        triangles = triangulation.simplices.astype(np.int64)
+        neighbours = triangulation.neighbors.astype(np.int64)
+        count = len(framed)
+        if len(np.unique(triangles)) != count:
+            return None  # a point was dropped (coincident points)
+
+        # Split the triangles into regions separated by loop edges and keep the inside regions
+        loopKeys = np.unique(np.minimum(edges[:, 0], edges[:, 1]) * count + np.maximum(edges[:, 0], edges[:, 1]))
+        rows, columns = [], []
+        for corner in range(3):  # the neighbour opposite each corner shares the other two
+            a, b = triangles[:, (corner + 1) % 3], triangles[:, (corner + 2) % 3]
+            keys = np.minimum(a, b) * count + np.maximum(a, b)
+            isLoopEdge = np.isin(keys, loopKeys)
+            joined = (neighbours[:, corner] >= 0) & ~isLoopEdge
+            rows.append(np.flatnonzero(joined))
+            columns.append(neighbours[joined, corner])
+        rows, columns = np.concatenate(rows), np.concatenate(columns)
+        graph = coo_matrix((np.ones(len(rows)), (rows, columns)), shape=(len(triangles), len(triangles)))
+        regionCount, regions = connected_components(graph, directed=False)
+        representatives = np.unique(regions, return_index=True)[1]
+        centroids = framed[triangles[representatives]].mean(axis=1)
+        insideRegions = self._insideLoops(centroids, planar[edges[:, 0]], planar[edges[:, 1]])
+        triangles = triangles[insideRegions[regions]]
+        if len(triangles) == 0 or triangles.max() >= len(planar):
+            return None
+
+        # The kept triangles must be bounded by exactly the loop edges
+        sortedEdges = np.sort(np.vstack([triangles[:, [0, 1]], triangles[:, [1, 2]], triangles[:, [2, 0]]]), axis=1)
+        keys, uses = np.unique(sortedEdges[:, 0] * count + sortedEdges[:, 1], return_counts=True)
+        if not np.array_equal(keys[uses == 1], loopKeys):
+            return None
+        corners = planar[triangles]
+        area = ((corners[:, 1, 0] - corners[:, 0, 0]) * (corners[:, 2, 1] - corners[:, 0, 1])
+                - (corners[:, 1, 1] - corners[:, 0, 1]) * (corners[:, 2, 0] - corners[:, 0, 0]))
+        clockwise = area < 0
+        triangles[clockwise] = triangles[clockwise][:, [0, 2, 1]]
+        return triangles
+
+    @staticmethod
+    def _nearestPoints(queries: np.ndarray, points: np.ndarray) -> np.ndarray:
+        """Index of the nearest of the given points for each query point (2D or 3D)."""
+        try:
+            from scipy.spatial import cKDTree
+            return cKDTree(points).query(queries)[1].astype(np.int64)
+        except ImportError:
+            nearest = np.empty(len(queries), dtype=np.int64)
+            for chunk in range(0, len(queries), 256):
+                differences = queries[chunk:chunk + 256, np.newaxis, :] - points[np.newaxis, :, :]
+                nearest[chunk:chunk + 256] = np.argmin(np.sum(differences * differences, axis=2), axis=1)
+            return nearest
 
     @staticmethod
     def _triangulatePlanarLoops(planar: np.ndarray, edges: np.ndarray) -> Optional[np.ndarray]:
@@ -1440,6 +1625,67 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
             nearest = starts + t[..., np.newaxis] * direction
             result[chunk:chunk + 512] = np.linalg.norm(p - nearest, axis=2).min(axis=1)
         return result
+
+    def _gradedFillPoints(self, starts: np.ndarray, ends: np.ndarray, features: np.ndarray,
+                          spacing: float) -> np.ndarray:
+        """Points filling the 2D region bounded by loops, spaced more widely away from them.
+
+        A point is placed on a square grid of spacing h * 2^k where its distance to the nearest
+        loop edge or feature point is between h * 2^k and h * 2^(k + 1) (h = spacing, and
+        h * 2^k at most CAP_MAX_FILL_SPACING), so the spacing grows with the distance and no
+        point comes closer than h to the loops or the features. Distances come from a Euclidean
+        distance transform on a raster of pixel h / 2 (coarser for very large faces).
+
+        :param starts: (E, 2) loop edge starts.
+        :param ends: (E, 2) loop edge ends.
+        :param features: (F, 2) points already placed inside the loops (along bends).
+        :param spacing: point spacing h next to the loops (> 0).
+        :return: (K, 2) points inside the loops; none if scipy is not available.
+        """
+        try:
+            from scipy import ndimage  # bundled with Slicer
+        except ImportError:
+            return np.zeros((0, 2))  # the cap is still closed, only less regular
+        lower = np.minimum(starts, ends).min(axis=0)
+        extent = np.maximum(starts, ends).max(axis=0) - lower
+        pixel = spacing / 2.0
+        pixelCount = float(np.prod(np.floor(extent / pixel) + 1))
+        if pixelCount > self.MAX_FILL_PIXELS:
+            pixel *= np.sqrt(pixelCount / self.MAX_FILL_PIXELS)
+        baseStep = max(1, int(round(spacing / pixel)))  # grid step (pixels) next to the loops
+        nx, ny = (np.floor(extent / pixel).astype(int) + 1).tolist()
+        xs, ys = lower[0] + pixel * np.arange(nx), lower[1] + pixel * np.arange(ny)
+
+        # Distance of each pixel centre to the loops (sampled at half a pixel) and features
+        lengths = np.linalg.norm(ends - starts, axis=1)
+        counts = np.ceil(lengths / (pixel / 2.0)).astype(int) + 1
+        edgeIds = np.repeat(np.arange(len(starts)), counts)
+        within = np.arange(len(edgeIds)) - np.repeat(np.cumsum(counts) - counts, counts)
+        t = within / np.maximum(np.repeat(counts, counts) - 1, 1)
+        samples = np.vstack([starts[edgeIds] + t[:, np.newaxis] * (ends - starts)[edgeIds], features])
+        cells = np.rint((samples - lower) / pixel).astype(int)
+        free = np.ones((nx, ny), dtype=bool)
+        free[np.clip(cells[:, 0], 0, nx - 1), np.clip(cells[:, 1], 0, ny - 1)] = False
+        # Less a pixel for the rounding of the samples to pixel centres
+        clearance = (ndimage.distance_transform_edt(free) - 1.0) / baseStep
+
+        # Even-odd inside test of the pixel centres along rows of constant y (as _insideLoops)
+        rowStarts = np.searchsorted(ys, np.minimum(starts[:, 1], ends[:, 1]), "left")
+        rowCounts = np.searchsorted(ys, np.maximum(starts[:, 1], ends[:, 1]), "left") - rowStarts
+        edgeIds = np.repeat(np.arange(len(starts)), rowCounts)
+        rows = rowStarts[edgeIds] + np.arange(len(edgeIds)) - np.repeat(np.cumsum(rowCounts) - rowCounts, rowCounts)
+        s, e = starts[edgeIds], ends[edgeIds]
+        crossings = s[:, 0] + (ys[rows] - s[:, 1]) * (e[:, 0] - s[:, 0]) / (e[:, 1] - s[:, 1])
+        toggles = np.zeros((nx + 1, ny), dtype=np.int32)
+        np.add.at(toggles, (np.searchsorted(xs, crossings, "left"), rows), 1)
+        inside = np.cumsum(toggles[:nx], axis=0) % 2 == 1
+
+        maxLevel = max(0, int(np.floor(np.log2(max(self.CAP_MAX_FILL_SPACING / spacing, 1.0)))))
+        levels = np.clip(np.floor(np.log2(np.maximum(clearance, 1.0))), 0, maxLevel).astype(int)
+        steps = baseStep * 2 ** levels
+        i, j = np.meshgrid(np.arange(nx), np.arange(ny), indexing="ij")
+        keep = inside & (clearance >= 1.0) & (i % steps == 0) & (j % steps == 0)
+        return lower + pixel * np.column_stack([i[keep], j[keep]]).astype(float)
 
     @staticmethod
     def _insertPoints(planar: np.ndarray, triangles: np.ndarray, pointIds: np.ndarray
@@ -1881,10 +2127,10 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         kerf, material within kerfWidth / 2 of the sheet is removed (removeKerf) and the sides
         are found afterwards from the signed distance kept per sheet.
 
-        With capCutFaces, the cut faces a through-sheet leaves are capped (capCutFaces) right
+        With capCutFaces, the cut faces a sheet leaves are capped (capCutFaces) right
         after that sheet, so later sheets cut closed meshes and the fragments are watertight.
+        A groove left by a depth-limited cut is lined the same way, walls and rounded floor.
         Fragments then get display normals split at sharp edges (computeDisplayNormals).
-        Depth-limited cuts (grooves) are not capped yet.
 
         :param polyData: model mesh in world coordinates.
         :param sheets: cutting sheets from buildSheetPolyData.
@@ -1902,7 +2148,7 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         triangles = self.mergeCoincidentPoints(self._ensureTriangles(polyData))
         if triangles.GetNumberOfCells() == 0:
             raise ValueError(_("The model has no surface polygons to cut."))
-        cap = options.capCutFaces and not options.depth > 0
+        cap = options.capCutFaces
         halfKerf = options.kerfWidth / 2.0
         uncapped = 0
 
@@ -1913,7 +2159,7 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
             report(15 + int(60 * sheetIndex / len(sheets)), _("Cutting..."))
             nextSides = []
             removedAny = False
-            sheetMap = SheetParameterisation(sheet) if cap else None
+            sheetMap = SheetParameterisation(sheet, halfKerf) if cap else None
             for mesh, signature in sides:
                 withDistance = self.computeSheetDistance(mesh, sheet)
                 maxEdgeLength = self.effectiveRefineEdgeLength(options)
@@ -1928,7 +2174,7 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
                     remaining, removed = self.removeKerf(withDistance, sheet, options.kerfWidth)
                     removedAny = removedAny or removed
                     if cap and removed:
-                        remaining, failed = self.capCutFaces(remaining, sheetMap, halfKerf)
+                        remaining, failed = self.capCutFaces(remaining, sheetMap)
                         uncapped += failed
                     if remaining.GetNumberOfCells() > 0:
                         nextSides.append((remaining, signature))
@@ -1937,7 +2183,7 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
                 for part, side in ((positive, 1), (negative, -1)):
                     if part.GetNumberOfCells() > 0:
                         if cap:
-                            part, failed = self.capCutFaces(part, sheetMap, 0.0, side)
+                            part, failed = self.capCutFaces(part, sheetMap)
                             uncapped += failed
                         nextSides.append((part, signature + (side,)))
             if options.kerfWidth > 0 and not removedAny:
@@ -2727,12 +2973,18 @@ class OsteotomyCutsTest(ScriptedLoadableModuleTest):
 
     def _cut(self, polyData, paths, direction, closed=False, options=None):
         """Cut with one sheet per path, all extruded along the same direction (and options.depth)."""
+        depth = options.depth if options is not None and options.depth > 0 else None
+        sheets = self._sheets(polyData, paths, direction, closed, [depth] * len(paths))
+        return OsteotomyCutsLogic().cutPolyData(polyData, sheets, options or CutOptions())
+
+    @staticmethod
+    def _sheets(polyData, paths, direction, closed=False, depths=None) -> list:
+        """One sheet per path, extruded along the direction; depths: one per path (None = through)."""
         logic = OsteotomyCutsLogic()
         extent = logic.computeAutoExtent(polyData)
-        depth = options.depth if options is not None and options.depth > 0 else None
-        sheets = [logic.buildSheetPolyData(np.array(path, dtype=float), np.array(direction, dtype=float),
-                                           extent, closed, depth=depth) for path in paths]
-        return logic.cutPolyData(polyData, sheets, options or CutOptions())
+        return [logic.buildSheetPolyData(np.array(path, dtype=float), np.array(direction, dtype=float),
+                                         extent, closed, depth=depth)
+                for path, depth in zip(paths, depths or [None] * len(paths))]
 
     def _radii(self, polyData, centre=(0.0, 0.0, 0.0)) -> np.ndarray:
         return np.linalg.norm(self._points(polyData) - np.array(centre), axis=1)
@@ -3503,14 +3755,16 @@ class OsteotomyCutsTest(ScriptedLoadableModuleTest):
     def test_kerf_groove(self):
         """A depth-limited kerf cut removes a groove with a rounded bottom and leaves one piece."""
         x, kerf, depth = 1.3, 2.0, 10.0
-        fragments = self._cut(self._box(), [self.X_CUT_PATH], self.DOWN, options=self._kerfOptions(kerf, depth))
+        options = self._kerfOptions(kerf, depth)
+        options.capCutFaces = False
+        fragments = self._cut(self._box(), [self.X_CUT_PATH], self.DOWN, options=options)
 
         self.assertEqual(len(fragments), 1)
         points = self._points(fragments[0])
         bottom = 50.0 - depth  # inner edge of the sheet
         # 0.01 mm: the groove floor is curved, the mesh between rim points is not
         self.assertFalse(np.any((np.abs(points[:, 0] - x) < kerf / 2.0 - 0.01) & (points[:, 2] > bottom)))
-        # The groove is open (capping is step 4); the deepest point of its rounded floor, on the
+        # Without capping the groove is open; the deepest point of its rounded floor, on the
         # open boundary, is half the kerf below the sheet edge
         edges = vtk.vtkFeatureEdges()
         edges.SetInputData(fragments[0])
@@ -3692,12 +3946,159 @@ class OsteotomyCutsTest(ScriptedLoadableModuleTest):
             self._assertWatertight(piece)
         self.assertAlmostEqual(sum(self._volume(piece) for piece in pieces), self._volume(half), places=3)
 
-    def test_cap_disabledAndGroove(self):
-        """Without capping, and for a groove (not capped yet), the cut faces stay open."""
+    def test_cap_disabled(self):
+        """Without capping, the cut faces stay open."""
         options = CutOptions()
         options.capCutFaces = False
         for fragment in self._cut(self._box(), [self.X_CUT_PATH], self.DOWN, options=options):
             self.assertGreater(self._openEdgeCount(fragment), 0)
-        groove = self._cut(self._box(), [self.X_CUT_PATH], self.DOWN, options=self._kerfOptions(1.0, 10.0))
+        options = self._kerfOptions(1.0, 10.0)
+        options.capCutFaces = False
+        groove = self._cut(self._box(), [self.X_CUT_PATH], self.DOWN, options=options)
         self.assertEqual(len(groove), 1)
         self.assertGreater(self._openEdgeCount(groove[0]), 0)
+
+    #
+    # Phase 2 step 5: capping grooves and combined cuts
+    #
+
+    def _assertOnCutSurfaces(self, fragment, sheets, kerf, modelSurface, tolerance=None) -> None:
+        """No bone is left inside any kerf, and every point off the model surface (cap points)
+        lies on the cut surface of one of the sheets.
+
+        :param modelSurface: function (points) -> bool array, True for points on the uncut model.
+        """
+        tolerance = OsteotomyCutsLogic.CAP_TOLERANCE if tolerance is None else tolerance
+        logic = OsteotomyCutsLogic()
+        points = self._points(fragment)
+        excess = np.stack([np.abs(numpy_support.vtk_to_numpy(logic.computeSheetDistance(fragment, sheet)
+                                                             .GetPointData().GetArray("SheetDistance")))
+                           - kerf / 2.0 for sheet in sheets])
+        self.assertGreater(excess.min(), -tolerance, "bone left inside the kerf")
+        offModel = ~modelSurface(points)
+        self.assertTrue(np.any(offModel))
+        self.assertLess(np.abs(excess[:, offModel]).min(axis=0).max(), tolerance, "cap point off the cut surface")
+
+    @staticmethod
+    def _onBoxFaces(points: np.ndarray, halfSize: float = 50.0) -> np.ndarray:
+        return np.abs(points).max(axis=1) > halfSize - 1e-6
+
+    def _removedVolume(self, fragments, model) -> float:
+        return self._volume(model) - sum(self._volume(fragment) for fragment in fragments)
+
+    def test_cap_groove(self):
+        """A straight groove is lined along its walls and rounded floor: one watertight solid
+        with exactly the groove removed."""
+        x, kerf, depth = 1.3, 2.0, 10.0
+        r = kerf / 2.0
+        box = self._box()
+        fragments = self._cut(box, [self.X_CUT_PATH], self.DOWN, options=self._kerfOptions(kerf, depth))
+
+        self.assertEqual(len(fragments), 1)
+        self._assertWatertight(fragments[0])
+        sheets = self._sheets(box, [self.X_CUT_PATH], self.DOWN, depths=[depth])
+        self._assertOnCutSurfaces(fragments[0], sheets, kerf, self._onBoxFaces)
+        # Slot of the kerf width down to the sheet edge, and a half cylinder below it, 100 mm long
+        expected = 100.0 * (kerf * depth + np.pi * r ** 2 / 2.0)
+        self.assertAlmostEqual(self._removedVolume(fragments, box), expected, delta=0.002 * expected)
+        # The floor reaches half the kerf below the sheet edge
+        points = self._points(fragments[0])
+        inGroove = (np.abs(points[:, 0] - x) < r - 1e-3) & ~self._onBoxFaces(points)
+        self.assertAlmostEqual(points[inGroove, 2].min(), 50.0 - depth - r, delta=OsteotomyCutsLogic.CAP_TOLERANCE)
+
+    def test_cap_grooveLshape(self):
+        """A folded groove: rounded outer corner (a quarter sphere on the floor) and sharp inner
+        corner, lined watertight, with the removed volume of the swept kerf."""
+        c, kerf, depth = 20.3, 1.0, 10.0
+        r = kerf / 2.0
+        box = self._box()
+        path = [[c, -40.0, 50.0], [c, c, 50.0], [40.0, c, 50.0]]
+        fragments = self._cut(box, [path], self.DOWN, options=self._kerfOptions(kerf, depth))
+
+        self.assertEqual(len(fragments), 1)
+        self._assertWatertight(fragments[0])
+        self._assertOnCutSurfaces(fragments[0], self._sheets(box, [path], self.DOWN, depths=[depth]), kerf,
+                                  self._onBoxFaces)
+        # Plan view: strips of width 2r along 100 mm of path, plus the rounded outer corner, less
+        # the overlap at the inner corner. Floor: half a tube around the bent sheet edge.
+        length = 100.0
+        slot = depth * (2.0 * r * length + r ** 2 * (np.pi / 4.0 - 1.0))
+        floor = (np.pi * r ** 2 * length + np.pi * r ** 3 / 3.0 - 4.0 * r ** 3 / 3.0) / 2.0
+        self.assertAlmostEqual(self._removedVolume(fragments, box), slot + floor, delta=0.002 * (slot + floor))
+
+    def test_cap_grooveSphere(self):
+        """A groove into a curved surface: its rim is one loop over both walls and the floor."""
+        kerf, depth = 1.0, 5.0
+        sphere = self._sphere(30.0)
+        path = [[1.3, -40.0, 29.0], [1.3, 40.0, 29.0]]
+        fragments = self._cut(sphere, [path], self.DOWN, options=self._kerfOptions(kerf, depth))
+
+        self.assertEqual(len(fragments), 1)
+        self._assertWatertight(fragments[0])
+        onSphere = lambda points: np.abs(np.linalg.norm(points, axis=1) - 30.0) < 0.1  # tessellated sphere
+        self._assertOnCutSurfaces(fragments[0], self._sheets(sphere, [path], self.DOWN, depths=[depth]), kerf,
+                                  onSphere)
+        self.assertGreater(self._removedVolume(fragments, sphere), 0.0)
+
+    def test_cap_grooveClosedCurve(self):
+        """A ring groove from a closed curve: the cut surface is unrolled to an annulus whose
+        inner and outer walls have different lengths."""
+        radius, circleRadius, kerf, depth = 30.0, 10.0, 1.0, 5.0
+        angles = np.linspace(0.0, 2.0 * np.pi, 24, endpoint=False)
+        z = np.sqrt(radius ** 2 - circleRadius ** 2)
+        circle = np.column_stack([circleRadius * np.cos(angles), circleRadius * np.sin(angles),
+                                  np.full_like(angles, z)])
+        sphere = self._sphere(radius)
+        fragments = self._cut(sphere, [circle], self.DOWN, closed=True, options=self._kerfOptions(kerf, depth))
+
+        self.assertEqual(len(fragments), 1)
+        self._assertWatertight(fragments[0])
+        onSphere = lambda points: np.abs(np.linalg.norm(points, axis=1) - radius) < 0.1
+        sheets = self._sheets(sphere, [circle], self.DOWN, closed=True, depths=[depth])
+        self._assertOnCutSurfaces(fragments[0], sheets, kerf, onSphere)
+
+    def test_cap_crossingGrooves(self):
+        """Two crossing grooves of different depths: the second is lined across the lining of
+        the first."""
+        x, y, kerf = 1.3, 2.7, 1.0
+        paths = [[[x, -40.0, 50.0], [x, 40.0, 50.0]], [[-40.0, y, 50.0], [40.0, y, 50.0]]]
+        depths = [10.0, 6.0]
+        box = self._box()
+        sheets = self._sheets(box, paths, self.DOWN, depths=depths)
+        fragments = OsteotomyCutsLogic().cutPolyData(box, sheets, self._kerfOptions(kerf))
+
+        self.assertEqual(len(fragments), 1)
+        self._assertWatertight(fragments[0])
+        self._assertOnCutSurfaces(fragments[0], sheets, kerf, self._onBoxFaces)
+        r = kerf / 2.0
+        single = [100.0 * (kerf * depth + np.pi * r ** 2 / 2.0) for depth in depths]
+        removed = self._removedVolume(fragments, box)
+        self.assertGreater(removed, max(single))
+        self.assertLess(removed, sum(single))
+
+    def test_cap_fallbackTriangulation(self):
+        """Without the Delaunay triangulation (e.g. no scipy), caps are still closed: the loops
+        are triangulated alone and the interior points inserted."""
+        kerf, depth = 1.0, 10.0
+        box = self._box()
+        logic = OsteotomyCutsLogic()
+        logic._delaunayInLoops = lambda planar, edges: None
+        sheets = self._sheets(box, [self.X_CUT_PATH], self.DOWN, depths=[depth])
+        fragments = logic.cutPolyData(box, sheets, self._kerfOptions(kerf, depth))
+
+        self.assertEqual(len(fragments), 1)
+        self._assertWatertight(fragments[0])
+        self._assertOnCutSurfaces(fragments[0], sheets, kerf, self._onBoxFaces)
+
+    def test_cap_grooveAndThroughCut(self):
+        """A groove, then a through-cut across it: two watertight fragments, each lined."""
+        x, y, kerf = 1.3, 2.7, 1.0
+        paths = [[[-40.0, y, 50.0], [40.0, y, 50.0]], [[x, -40.0, 50.0], [x, 40.0, 50.0]]]
+        box = self._box()
+        sheets = self._sheets(box, paths, self.DOWN, depths=[10.0, None])
+        fragments = OsteotomyCutsLogic().cutPolyData(box, sheets, self._kerfOptions(kerf))
+
+        self.assertEqual(len(fragments), 2)
+        for fragment in fragments:
+            self._assertWatertight(fragment)
+            self._assertOnCutSurfaces(fragment, sheets, kerf, self._onBoxFaces)

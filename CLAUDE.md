@@ -60,6 +60,9 @@ Phase 2 notes (agreed during Phase 1 planning):
 - NEVER read, open or copy any patient data folder or DICOM directory.
 - Headless test run (PowerShell); exit code 0 = all passed, 1 = failure:
   & "C:\ProgramData\slicer.org\3D Slicer 5.13.0-2026-06-30\Slicer.exe" --no-splash --no-main-window --python-script "C:\Dev\OsteotomyCuts\OsteotomyCuts\Testing\Python\run_headless_tests.py" | Out-Host; $LASTEXITCODE
+- Benchmark of the cutting core (~200k-triangle synthetic mesh; timings per
+  stage; exit code 0 = all capped cuts watertight):
+  & "C:\ProgramData\slicer.org\3D Slicer 5.13.0-2026-06-30\Slicer.exe" --no-splash --no-main-window --python-script "C:\Dev\OsteotomyCuts\OsteotomyCuts\Testing\Python\run_benchmark.py" | Out-Host; $LASTEXITCODE
 - Do not use slicer.util.selectModule() headlessly: it needs a main window,
   raises, and Slicer then never exits.
 
