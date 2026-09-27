@@ -16,12 +16,34 @@ sagittal + vertical buccal, connected), Le Fort I, genioplasty, segmental cuts.
 - Phase 4: interactive editing handles, fragment naming, STL export
 Build one phase at a time. Design each so later phases need no rewrite.
 
-Phase 2 notes (agreed during Phase 1 planning):
-- Prefer UNSIGNED distance to the sheet interior for kerf removal: remove
-  material where |d| < kerf/2, then separate with connectivity. This avoids
-  sign problems and allows finite, depth-limited sheets.
-- Locally subdivide the mesh near the sheet so edge length < kerf/2.
-- The zero-kerf path stays signed, as in Phase 1.
+## Current status (updated 2026-09-27)
+- Phase 1: complete.
+- Phase 2: complete in code (steps 1-5, last commit "Phase 2 step 5: cap
+  grooves and cuts across earlier caps; benchmark"). Step 5 still awaits the
+  user's manual check in Slicer: groove (kerf 1, depth ~8) gives one closed
+  fragment; folded and closed-curve grooves; a through-cut across a groove;
+  a real segmented bone (watch the console for "could not be capped").
+- NEXT: once step 5 is confirmed, plan Phase 3 (BSSO / Le Fort I /
+  genioplasty templates). Propose the plan and wait for approval first.
+- Workflow: implement one plan step at a time; run the headless tests,
+  commit, then stop so the user can test in Slicer before the next step.
+
+## How the cut works (Phase 1-2, in OsteotomyCutsLogic.cutPolyData)
+- Sheets from buildSheetPolyData (ruled; per-point directions and depths
+  already supported for Phase 3 templates). Sheets are applied in turn.
+- Zero kerf: signed distance, clip at 0 (splitByDistance).
+- Kerf: refineNearSheet (edges < kerf/2 near the sheet), then removeKerf
+  (UNSIGNED distance |d| < kerf/2, exact root-finding clip). Sides are
+  recovered afterwards from the per-sheet "SheetSide<i>" array.
+- Capping (capCutFaces, per sheet, right after it): SheetParameterisation
+  is one 2D chart (u, w) of the whole cut surface: + side, rounded groove
+  floor, - side, with fold arcs/creases. Rim loops are triangulated there:
+  scipy Delaunay of rim + graded fill points (accepted only if bounded by
+  exactly the rim), fallback vtkContourTriangulator + point insertion;
+  then Delaunay flips and edge splitting to CAP_TOLERANCE.
+- Fragments: connectivity, enclosed shells merged into their host,
+  display normals split at sharp edges.
+- scipy (bundled with Slicer) is used with guarded imports.
 
 ## Environment
 - Windows 11. Project: C:\Dev\OsteotomyCuts
