@@ -18,13 +18,11 @@ Build one phase at a time. Design each so later phases need no rewrite.
 
 ## Current status (updated 2026-09-27)
 - Phase 1: complete.
-- Phase 2: complete in code (steps 1-5, last commit "Phase 2 step 5: cap
-  grooves and cuts across earlier caps; benchmark"). Step 5 still awaits the
-  user's manual check in Slicer: groove (kerf 1, depth ~8) gives one closed
-  fragment; folded and closed-curve grooves; a through-cut across a groove;
-  a real segmented bone (watch the console for "could not be capped").
-- NEXT: once step 5 is confirmed, plan Phase 3 (BSSO / Le Fort I /
-  genioplasty templates). Propose the plan and wait for approval first.
+- Phase 2: complete (steps 1-5) and confirmed by the user in Slicer on
+  2026-09-27 (grooves, folded/closed grooves, through-cut across a groove,
+  real bone).
+- NEXT: plan Phase 3 (BSSO / Le Fort I / genioplasty templates driven by
+  landmarks). Propose the plan and wait for approval before coding.
 - Workflow: implement one plan step at a time; run the headless tests,
   commit, then stop so the user can test in Slicer before the next step.
 
