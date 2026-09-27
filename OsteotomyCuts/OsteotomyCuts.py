@@ -74,6 +74,10 @@ FRAGMENT_REFERENCE_ROLE = "OsteotomyCuts.Fragment"  # curve -> fragments (severa
 INPUT_REFERENCE_ROLE = "OsteotomyCuts.Input"  # curve / fragment -> model that was cut
 CURVE_REFERENCE_ROLE = "OsteotomyCuts.Curve"  # fragment -> curve that produced it
 
+# Prefix of the temporary point arrays holding the signed distance to each kerf sheet, from
+# which the side of each piece is found after the kerf is removed
+SHEET_SIDE_PREFIX = "SheetSide"
+
 # Okabe-Ito colour-blind-safe palette followed by further distinct colours
 FRAGMENT_COLOURS = (
     (0.90, 0.62, 0.00), (0.34, 0.71, 0.91), (0.00, 0.62, 0.45), (0.94, 0.89, 0.26),
@@ -719,17 +723,17 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
                         arrayName: str = "SheetDistance") -> tuple[vtk.vtkPolyData, vtk.vtkPolyData]:
         """Split a mesh into the positive and the negative side of the cutting sheet.
 
-        Phase 1 clips at distance 0 (no kerf). Phase 2 kerf removal replaces this, preferably
-        with unsigned distance to the sheet interior (see CLAUDE.md).
+        This is the zero-kerf cut: the mesh is clipped at signed distance 0. A cut with a kerf
+        uses removeKerf instead.
 
         :param polyWithDistance: mesh with the distance point array (computeSheetDistance).
-        :param options: cut options; kerf removal (kerfWidth > 0) is added in Phase 2 step 3.
+        :param options: cut options; must have kerfWidth = 0.
         :param arrayName: name of the distance array.
         :return: (positive side, negative side), both triangulated; either may be empty.
-        :raises ValueError: for kerfWidth > 0, until kerf removal is implemented.
+        :raises ValueError: for kerfWidth > 0 (use removeKerf).
         """
         if options.kerfWidth > 0:
-            raise ValueError(_("Cutting with a kerf width is not available yet. Set the kerf width to 0."))
+            raise ValueError(_("A cut with a kerf width removes material; use removeKerf."))
         polyWithDistance.GetPointData().SetActiveScalars(arrayName)
         clipper = vtk.vtkClipPolyData()
         clipper.SetInputData(polyWithDistance)
@@ -738,6 +742,51 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         clipper.Update()
         return (self._ensureTriangles(clipper.GetOutput()),
                 self._ensureTriangles(clipper.GetClippedOutput()))
+
+    def removeKerf(self, polyWithDistance: vtk.vtkPolyData, kerfWidth: float,
+                   arrayName: str = "SheetDistance") -> tuple[vtk.vtkPolyData, bool]:
+        """Remove the material the saw blade takes away: everything closer than kerfWidth / 2 to
+        the sheet (unsigned distance).
+
+        The unsigned distance is to the sheet itself, so a depth-limited sheet removes a groove
+        with a rounded bottom and no sign problems arise past the sheet's edges. The mesh is
+        clipped at |d| = kerfWidth / 2 with linear interpolation along edges; this is exact for
+        a flat sheet when edges near the sheet are shorter than kerfWidth / 2 (refineNearSheet),
+        as such an edge cannot cross the sheet. The result is not separated into pieces (a
+        groove leaves one piece) and the cut faces are left open.
+
+        :param polyWithDistance: mesh with the signed distance point array (computeSheetDistance).
+        :param kerfWidth: saw blade width (mm), > 0.
+        :param arrayName: name of the signed distance array; it is kept in the output.
+        :return: (remaining triangle mesh, whether any material was removed).
+        :raises ValueError: for a non-positive kerf width.
+        """
+        if not kerfWidth > 0:
+            raise ValueError(_("The kerf width must be positive."))
+        halfKerf = kerfWidth / 2.0
+        signed = numpy_support.vtk_to_numpy(polyWithDistance.GetPointData().GetArray(arrayName))
+        if not np.any(np.abs(signed) < halfKerf):
+            return self._ensureTriangles(polyWithDistance), False
+
+        # Work on a shallow copy so that the unsigned array is not added to the caller's mesh
+        mesh = vtk.vtkPolyData()
+        mesh.CopyStructure(polyWithDistance)
+        mesh.GetPointData().PassData(polyWithDistance.GetPointData())
+        mesh.GetCellData().PassData(polyWithDistance.GetCellData())
+        unsignedName = arrayName + "Unsigned"
+        unsigned = numpy_support.numpy_to_vtk(np.abs(signed).astype(float), deep=True)
+        unsigned.SetName(unsignedName)
+        mesh.GetPointData().AddArray(unsigned)
+        mesh.GetPointData().SetActiveScalars(unsignedName)
+
+        clipper = vtk.vtkClipPolyData()
+        clipper.SetInputData(mesh)
+        clipper.SetValue(halfKerf)  # keeps |d| >= kerf / 2
+        clipper.Update()
+        result = self._ensureTriangles(clipper.GetOutput())
+        result.GetPointData().RemoveArray(unsignedName)
+        result.GetPointData().SetActiveScalars(arrayName)
+        return result, True
 
     @staticmethod
     def effectiveRefineEdgeLength(options: CutOptions) -> float:
@@ -899,22 +948,39 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         """Split a mesh into its connected pieces.
 
         :param polyData: triangulated mesh with "ComponentId" and "HostComponentId" point arrays.
-        :param sideSignature: side of each sheet this mesh lies on, copied to every piece.
-        :return: one FragmentPiece per connected region.
+            Sheets cut with a kerf leave a signed distance array "SheetSide<i>" (i = sheet
+            index) instead of a split into sides.
+        :param sideSignature: side of each zero-kerf sheet this mesh lies on, copied to every
+            piece.
+        :return: one FragmentPiece per connected region. For each kerf sheet, the side the
+            piece mostly lies on (+1 / -1) is appended to its signature, in sheet order.
         """
         if polyData.GetNumberOfCells() == 0:
             return []
         regions, _pointRegions, cellRegions, _regionCount = self._connectedRegions(polyData)
         pieces = []
         for piece in self._splitByCellLabel(regions, cellRegions).values():
-            componentIds = numpy_support.vtk_to_numpy(piece.GetPointData().GetArray("ComponentId"))
-            hostIds = numpy_support.vtk_to_numpy(piece.GetPointData().GetArray("HostComponentId"))
+            pointData = piece.GetPointData()
+            componentIds = numpy_support.vtk_to_numpy(pointData.GetArray("ComponentId"))
+            hostIds = numpy_support.vtk_to_numpy(pointData.GetArray("HostComponentId"))
             # A connected piece comes from one component; the mode guards against interpolation noise
             componentId = int(np.bincount(componentIds).argmax())
             hostComponentId = int(hostIds[np.argmax(componentIds == componentId)])
-            pieces.append(FragmentPiece(piece, componentId, hostComponentId, tuple(sideSignature),
+            signature = tuple(sideSignature)
+            for sheetIndex in sorted(self._sheetSideIndices(piece)):
+                sides = numpy_support.vtk_to_numpy(pointData.GetArray(f"{SHEET_SIDE_PREFIX}{sheetIndex}"))
+                signature += (1 if np.count_nonzero(sides > 0) >= np.count_nonzero(sides < 0) else -1,)
+            pieces.append(FragmentPiece(piece, componentId, hostComponentId, signature,
                                         piece.GetNumberOfPoints()))
         return pieces
+
+    @staticmethod
+    def _sheetSideIndices(polyData: vtk.vtkPolyData) -> list[int]:
+        """Sheet indices of the "SheetSide<i>" point arrays of a mesh."""
+        pointData = polyData.GetPointData()
+        names = (pointData.GetArrayName(i) or "" for i in range(pointData.GetNumberOfArrays()))
+        return [int(name[len(SHEET_SIDE_PREFIX):]) for name in names
+                if name.startswith(SHEET_SIDE_PREFIX) and name[len(SHEET_SIDE_PREFIX):].isdigit()]
 
     def mergeEnclosedPieces(self, pieces: list[FragmentPiece],
                             minPointCount: float) -> list[vtk.vtkPolyData]:
@@ -975,12 +1041,18 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         connected fragments and enclosed pieces are merged into their host. Several sheets let
         Phase 3 cut several osteotomies at once. The input mesh is not modified.
 
+        With kerfWidth = 0 each piece is split at signed distance 0 into its two sides. With a
+        kerf, material within kerfWidth / 2 of the sheet is removed (removeKerf) and the sides
+        are found afterwards from the signed distance kept per sheet.
+
         :param polyData: model mesh in world coordinates.
         :param sheets: cutting sheets from buildSheetPolyData.
         :param options: cut options.
         :param progressCallback: called with (percent, message) between stages.
-        :return: fragment meshes, largest first.
-        :raises ValueError: if there is no sheet or the mesh has no polygons.
+        :return: fragment meshes, largest first. A depth-limited kerf cut may leave one
+            fragment (a groove).
+        :raises ValueError: if there is no sheet, the mesh has no polygons, or a kerf sheet
+            does not reach the model.
         """
         report = progressCallback or (lambda percent, message: None)
         if not sheets:
@@ -995,16 +1067,30 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         for sheetIndex, sheet in enumerate(sheets):
             report(15 + int(60 * sheetIndex / len(sheets)), _("Cutting..."))
             nextSides = []
+            removedAny = False
             for mesh, signature in sides:
                 withDistance = self.computeSheetDistance(mesh, sheet)
                 maxEdgeLength = self.effectiveRefineEdgeLength(options)
                 if maxEdgeLength > 0:
                     withDistance = self.refineNearSheet(withDistance, sheet, maxEdgeLength,
                                                         options.kerfWidth / 2.0 + maxEdgeLength)
+                if options.kerfWidth > 0:
+                    sideArray = vtk.vtkDoubleArray()
+                    sideArray.DeepCopy(withDistance.GetPointData().GetArray("SheetDistance"))
+                    sideArray.SetName(f"{SHEET_SIDE_PREFIX}{sheetIndex}")
+                    withDistance.GetPointData().AddArray(sideArray)
+                    remaining, removed = self.removeKerf(withDistance, options.kerfWidth)
+                    removedAny = removedAny or removed
+                    if remaining.GetNumberOfCells() > 0:
+                        nextSides.append((remaining, signature))
+                    continue
                 positive, negative = self.splitByDistance(withDistance, options)
                 for part, side in ((positive, 1), (negative, -1)):
                     if part.GetNumberOfCells() > 0:
                         nextSides.append((part, signature + (side,)))
+            if options.kerfWidth > 0 and not removedAny:
+                raise ValueError(_("Cutting sheet {index} does not reach the model. Check the cut path, "
+                                   "direction and depth.").format(index=sheetIndex + 1))
             sides = nextSides
 
         report(75, _("Separating fragments..."))
@@ -1014,7 +1100,8 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         fragments = self.mergeEnclosedPieces(pieces, options.minFragmentFraction * labelled.GetNumberOfPoints())
 
         for fragment in fragments:
-            for arrayName in ("ComponentId", "HostComponentId", "SheetDistance"):
+            sideArrays = [f"{SHEET_SIDE_PREFIX}{i}" for i in self._sheetSideIndices(fragment)]
+            for arrayName in ["ComponentId", "HostComponentId", "SheetDistance"] + sideArrays:
                 fragment.GetPointData().RemoveArray(arrayName)
         return fragments
 
@@ -1282,7 +1369,8 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
 
         :param parameterNode: module parameters (input model, cut path, direction, options).
         :param progressCallback: called with (percent, message) between stages.
-        :return: the new fragment model nodes, largest first.
+        :return: the new fragment model nodes, largest first (a single node for a groove, a
+            depth-limited cut that does not separate the model).
         :raises ValueError: if inputs are invalid, the sheet does not cut the model, or later
             cuts depend on the previous result of this curve.
         """
@@ -1297,7 +1385,9 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         polyData = self.getWorldPolyData(inputModel)
         sheet = self.buildSheetForParameters(parameterNode)
         fragments = self.cutPolyData(polyData, [sheet], parameterNode.options, progressCallback)
-        if len(fragments) < 2:
+        # A depth-limited cut may only cut a groove (cutPolyData has checked that it removed bone)
+        isGroove = parameterNode.options.depth > 0 and parameterNode.options.kerfWidth > 0
+        if len(fragments) < (1 if isGroove else 2):
             raise ValueError(_("The cutting sheet does not divide the model. Check the cut path and direction."))
 
         report(90, _("Creating fragment models..."))
@@ -1779,11 +1869,12 @@ class OsteotomyCutsTest(ScriptedLoadableModuleTest):
         return append.GetOutput()
 
     def _cut(self, polyData, paths, direction, closed=False, options=None):
-        """Cut with one sheet per path, all extruded along the same direction."""
+        """Cut with one sheet per path, all extruded along the same direction (and options.depth)."""
         logic = OsteotomyCutsLogic()
         extent = logic.computeAutoExtent(polyData)
+        depth = options.depth if options is not None and options.depth > 0 else None
         sheets = [logic.buildSheetPolyData(np.array(path, dtype=float), np.array(direction, dtype=float),
-                                           extent, closed) for path in paths]
+                                           extent, closed, depth=depth) for path in paths]
         return logic.cutPolyData(polyData, sheets, options or CutOptions())
 
     def _radii(self, polyData, centre=(0.0, 0.0, 0.0)) -> np.ndarray:
@@ -2343,7 +2434,7 @@ class OsteotomyCutsTest(ScriptedLoadableModuleTest):
                 logic.buildSheetPolyData(path, down, 50.0, depth=depth)
 
     def test_depthOptions(self):
-        """Depth needs a kerf; the preview sheet follows the depth; kerf cutting is not available yet."""
+        """Depth needs a kerf; the preview sheet follows the depth; a groove gives one fragment."""
         logic = OsteotomyCutsLogic()
         model = self._addModel(self._box(), "Box")
         curve = self._addCurve(self.X_CUT_PATH, "CutA")
@@ -2358,10 +2449,13 @@ class OsteotomyCutsTest(ScriptedLoadableModuleTest):
         sheetNode = logic.updateSheetModel(parameterNode)
         self.assertAlmostEqual(sheetNode.GetPolyData().GetBounds()[4], 50.0 - 12.0, places=6)
 
-        with self.assertRaises(ValueError):  # until Phase 2 step 3
-            logic.applyCut(parameterNode)
-        self.assertEqual(logic.getCurveResult(curve), [])
-        self.assertTrue(self._isVisible(model))
+        nodes = logic.applyCut(parameterNode)  # a groove: nothing is separated
+        self.assertEqual(len(nodes), 1)
+        self.assertEqual(nodes[0].GetName(), "Box_CutA_1")
+        self.assertFalse(self._isVisible(model))
+        points = self._points(nodes[0].GetPolyData())
+        inGroove = (np.abs(points[:, 0] - 1.3) < 0.5 - 0.01) & (points[:, 2] > 50.0 - 12.0)
+        self.assertFalse(np.any(inGroove))
 
     def test_oldSceneUpgrade(self):
         """A scene saved before newer options existed loads, keeps its values and gets defaults."""
@@ -2506,3 +2600,100 @@ class OsteotomyCutsTest(ScriptedLoadableModuleTest):
             atCut = (np.abs(points[start, 0] - x) < 1e-6) & (np.abs(points[end, 0] - x) < 1e-6)
             lengths = np.linalg.norm(points[start] - points[end], axis=1)
             self.assertLessEqual(lengths[atCut].max(), 1.0 + 1e-6)
+
+    #
+    # Phase 2 step 3: kerf removal
+    #
+
+    @staticmethod
+    def _kerfOptions(kerfWidth: float, depth: float = 0.0) -> CutOptions:
+        options = CutOptions()
+        options.kerfWidth = kerfWidth
+        options.depth = depth
+        return options
+
+    def test_kerf_throughCut(self):
+        """A through-cut with a kerf removes a slot of exactly the kerf width."""
+        x, kerf = 1.3, 2.0
+        box = self._box()
+        fragments = self._cut(box, [self.X_CUT_PATH], self.DOWN, options=self._kerfOptions(kerf))
+
+        self.assertEqual(len(fragments), 2)
+        boundsList = sorted((fragment.GetBounds() for fragment in fragments), key=lambda b: b[0])
+        self.assertAlmostEqual(boundsList[0][1], x - kerf / 2.0, places=6)
+        self.assertAlmostEqual(boundsList[1][0], x + kerf / 2.0, places=6)
+        for bounds in boundsList:
+            np.testing.assert_allclose(bounds[2:], (-50.0, 50.0, -50.0, 50.0), atol=1e-6)
+        for fragment in fragments:
+            names = {fragment.GetPointData().GetArrayName(i)
+                     for i in range(fragment.GetPointData().GetNumberOfArrays())}
+            self.assertFalse(any(name.startswith(SHEET_SIDE_PREFIX) for name in names))
+            self.assertNotIn("SheetDistance", names)
+        self.assertIsNone(box.GetPointData().GetArray("SheetDistance"))
+
+    def test_kerf_groove(self):
+        """A depth-limited kerf cut removes a groove with a rounded bottom and leaves one piece."""
+        x, kerf, depth = 1.3, 2.0, 10.0
+        fragments = self._cut(self._box(), [self.X_CUT_PATH], self.DOWN, options=self._kerfOptions(kerf, depth))
+
+        self.assertEqual(len(fragments), 1)
+        points = self._points(fragments[0])
+        bottom = 50.0 - depth  # inner edge of the sheet
+        # 0.01 mm: the clip is linear along edges, the distance near the sheet edge is not
+        self.assertFalse(np.any((np.abs(points[:, 0] - x) < kerf / 2.0 - 0.01) & (points[:, 2] > bottom)))
+        # The groove is open (capping is step 4); the deepest point of its rounded floor, on the
+        # open boundary, is half the kerf below the sheet edge
+        edges = vtk.vtkFeatureEdges()
+        edges.SetInputData(fragments[0])
+        edges.BoundaryEdgesOn()
+        edges.NonManifoldEdgesOff()
+        edges.FeatureEdgesOff()
+        edges.ManifoldEdgesOff()
+        edges.Update()
+        floorDepth = self._points(edges.GetOutput())[:, 2].min()
+        self.assertGreater(floorDepth, bottom - kerf / 2.0 - 0.01)
+        self.assertAlmostEqual(floorDepth, bottom - kerf / 2.0, delta=0.2)
+        # Groove walls reach the top face on both sides
+        top = points[:, 2] > 50.0 - 1e-6
+        self.assertAlmostEqual(points[top & (points[:, 0] < x), 0].max(), x - kerf / 2.0, places=6)
+        self.assertAlmostEqual(points[top & (points[:, 0] > x), 0].min(), x + kerf / 2.0, places=6)
+
+    def test_kerf_enclosedShell(self):
+        """With a kerf, each half of an inner shell stays with its side's fragment."""
+        x, kerf = 1.3, 1.0
+        mesh = self._append(self._sphere(30.0), self._sphere(10.0))
+        fragments = self._cut(mesh, [[[x, -20.0, 29.0], [x, 20.0, 29.0]]], self.DOWN,
+                              options=self._kerfOptions(kerf))
+
+        self.assertEqual(len(fragments), 2)
+        for fragment in fragments:
+            radii = self._radii(fragment)
+            self.assertTrue(np.any(np.abs(radii - 30.0) < 0.5), "outer shell part missing")
+            self.assertTrue(np.any(np.abs(radii - 10.0) < 0.5), "inner shell part missing")
+            xs = self._points(fragment)[:, 0]
+            self.assertTrue(np.all(xs <= x - kerf / 2.0 + 1e-3) or np.all(xs >= x + kerf / 2.0 - 1e-3))
+
+    def test_kerf_multipleSheets(self):
+        """Two crossing kerf sheets cut a box into four quadrants."""
+        x, y, kerf = 1.3, 2.7, 1.0
+        fragments = self._cut(self._box(), [[[x, -40.0, 50.0], [x, 40.0, 50.0]],
+                                            [[-40.0, y, 50.0], [40.0, y, 50.0]]], self.DOWN,
+                              options=self._kerfOptions(kerf))
+
+        self.assertEqual(len(fragments), 4)
+        quadrants = set()
+        for fragment in fragments:
+            points = self._points(fragment)
+            self.assertTrue(np.all(np.abs(points[:, 0] - x) >= kerf / 2.0 - 1e-6))
+            self.assertTrue(np.all(np.abs(points[:, 1] - y) >= kerf / 2.0 - 1e-6))
+            centre = points.mean(axis=0)
+            quadrants.add((bool(centre[0] > x), bool(centre[1] > y)))
+        self.assertEqual(len(quadrants), 4)
+
+    def test_kerf_missesModel(self):
+        """A kerf cut whose sheet does not reach the model raises ValueError."""
+        path = [[1.3, -40.0, 70.0], [1.3, 40.0, 70.0]]  # 20 mm above the box, 10 mm deep
+        with self.assertRaises(ValueError):
+            self._cut(self._box(), [path], self.DOWN, options=self._kerfOptions(1.0, 10.0))
+        with self.assertRaises(ValueError):
+            OsteotomyCutsLogic().removeKerf(self._box(), 0.0)
