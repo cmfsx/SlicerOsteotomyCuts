@@ -1,6 +1,6 @@
 # Osteotomy Cuts — release notes
 
-## 1.0.0
+## 1.0.0 (2026-09-28)
 
 First public release: virtual osteotomies for orthognathic and craniofacial surgical planning in 3D Slicer.
 
@@ -24,7 +24,8 @@ First public release: virtual osteotomies for orthognathic and craniofacial surg
 
 ### Requirements
 
-- 3D Slicer 5.8 or later (developed and tested on 5.13.0 preview, 2026-06-30, Windows 11). No extra Python packages: VTK, NumPy and SciPy ship with Slicer.
+- Tested on 3D Slicer 5.12.4 (stable, revision 34645, built 2026-09-09) and 3D Slicer 5.13.0 (preview, revision 34833, built 2026-06-30), Windows 11. Not yet tested on macOS or Linux.
+- No extra Python packages: VTK, NumPy and SciPy ship with 3D Slicer.
 
 ### Known limitations
 
@@ -35,8 +36,8 @@ First public release: virtual osteotomies for orthognathic and craniofacial surg
 
 ### Verification
 
-- 87 headless tests on synthetic geometry, all passing (about 90 s).
-- Benchmark of the cutting core, all capped cuts watertight (including a 1.1 million triangle synthetic jaw, 4.6 s).
+- 87 headless tests on synthetic geometry, all passing on 3D Slicer 5.13.0 (92 s) and 5.12.4 (74 s).
+- Benchmark of the cutting core, all capped cuts watertight (including a 1.1 million triangle synthetic jaw, 4.7 s).
 - Checks on de-identified mandible, canal and teeth models: all bone segments closed; the canal correctly reported as entered by a body cut; a left body cut mirrored to the right side gives closed segments.
 - Licence scan (ScanCode Toolkit 32.5.0): only GPL-3.0 licensing, no third-party code.
 

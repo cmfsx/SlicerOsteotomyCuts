@@ -87,18 +87,41 @@ exit, for example in a gap between bones.</li>
 segments</i>.</li>
 </ul>
 
-<p><b>Example: Le Fort I on a skull model</b></p>
+<p><b>Several lines in one osteotomy</b><br>
+Tick other osteotomy lines under <i>Further osteotomy lines</i> to cut
+them together with the selected one in one step. They are cut in order,
+and each later line stops where it meets an earlier one. Each line keeps
+its own saw direction and cut limits: select it as the osteotomy line to
+see or change them.</p>
+
+<p><b>Example: Le Fort I on a skull model (two lines)</b></p>
 <ol>
-<li>Place the osteotomy line from one zygomatic buttress, round the
-anterior maxilla, to the other, about 5 mm above the tooth apices.</li>
+<li>Horizontal line: place the osteotomy line from one zygomatic buttress,
+round the anterior maxilla, to the other, about 5 mm above the tooth
+apices.</li>
 <li>View the skull from the front and press <i>Set saw direction from
 view</i> (the saw runs backwards).</li>
 <li>Set <b>Cut depth</b> to about 45–55 mm (to the pterygoid plates),
 <b>Cut reach beyond the line</b> to 5–10 mm, and <b>Saw blade
 thickness</b> to 0.5–1.0 mm.</li>
+<li>Pterygomaxillary line: create a second osteotomy line on the side of
+the maxilla behind the tuberosity, from the horizontal line downwards.
+View the skull from the side and press <i>Set saw direction from view</i>
+(it cuts both sides). Leave the cut depth and the reach at 0: it stops at
+the horizontal cut, so the bone above is not cut.</li>
+<li>Select the horizontal line again and tick the second line under
+<i>Further osteotomy lines</i>.</li>
 <li>Check that the red lines stay on the maxilla, then press
 <i>Make cut</i>.</li>
 </ol>
+
+<p><b>Symmetrical cuts</b><br>
+Press <i>Create midline plane</i> and move it with its handles onto the
+true midline. <i>Mirror osteotomy to other side</i> copies the selected
+osteotomy (e.g. the left BSSO) to the other side with mirrored saw
+directions and the same settings, on that side's own bone surface.
+<i>Make line symmetric</i> completes a line drawn from the midline to one
+side (e.g. a genioplasty) with its mirror image.</p>
 
 <p><b>Structures to protect</b><br>
 Add the nerve canal, tooth roots or other structures with a safe
@@ -147,12 +170,16 @@ MODULE_VERSION = "1.0.0"
 # Terms shown on first use of each module version, the same as DISCLAIMER.md (one paragraph per item)
 DISCLAIMER_PARAGRAPHS = (
     "OsteotomyCuts is research and surgical planning software. It is not a medical device and has not been "
-    "cleared or approved by any regulatory authority. It is not intended for diagnosis, or for clinical decisions "
-    "made without the independent judgement of a qualified clinician.",
+    "cleared or approved by any regulatory authority. It is intended for use only by qualified clinicians, who "
+    "remain solely responsible for every clinical decision and for the care of their patients. It is not intended "
+    "for diagnosis.",
+    "Users are responsible for complying with the laws, regulations and professional licensing requirements that "
+    "apply where they work, including those on medical software, data protection and patient consent.",
     "Use is entirely at the user's own risk. The software is provided \"as is\", without warranty of any kind, "
     "express or implied, including any warranty of fitness for a particular purpose, to the extent permitted by "
-    "law (see sections 15 and 16 of the GNU General Public License, version 3). The author and contributors "
-    "accept no liability for any loss or harm arising from its use.",
+    "law (see sections 15 and 16 of the GNU General Public License, version 3). Neither the author, Dr Manjula "
+    "Herath, nor any contributor accepts liability for any injury or harm to any person, or for any other loss or "
+    "damage, arising from its use.",
     "Results depend on the input models (segmentation accuracy, mesh quality, registration) and on the settings "
     "chosen. Virtual cuts, bone segments, volumes and measured distances are approximations. Every plan must be "
     "checked by the responsible surgeon before it is used, including for printed guides or navigation.",
@@ -7206,7 +7233,9 @@ class OsteotomyCutsTest(ScriptedLoadableModuleTest):
     # Controls the help text names, exactly as labelled in the module
     HELP_CONTROLS = ("Bone to cut", "Osteotomy line", "Create solid bone model", "Treat bone as solid",
                      "Set saw direction from view", "Make cut", "Undo this cut", "Cut depth",
-                     "Cut reach beyond the line", "Rejoin selected bone segments", "Saw blade thickness")
+                     "Cut reach beyond the line", "Rejoin selected bone segments", "Saw blade thickness",
+                     "Further osteotomy lines", "Create midline plane", "Mirror osteotomy to other side",
+                     "Make line symmetric")
     # Technical words kept out of labels and messages (allowed in tooltips and in brackets)
     TECHNICAL_WORDS = re.compile(r"\b(kerf|extrusions?|extrude[ds]?|sheets?|fragments?|cut paths?)\b", re.IGNORECASE)
 
@@ -7330,6 +7359,12 @@ class OsteotomyCutsTest(ScriptedLoadableModuleTest):
                               if block.strip() and not block.startswith("#")]
             self.assertEqual(paragraphs, list(DISCLAIMER_PARAGRAPHS))
         self.assertIn(SAFETY_NOTE, DISCLAIMER_PARAGRAPHS)
+        terms = " ".join(DISCLAIMER_PARAGRAPHS)
+        for clause in ("only by qualified clinicians", "solely responsible",
+                       "laws, regulations and professional licensing", "Dr Manjula Herath",
+                       "injury or harm to any person", "sections 15 and 16 of the GNU General Public License",
+                       "Only de-identified data"):
+            self.assertIn(clause, terms)
         dialog = slicer.util.loadUI(self._moduleFile("Resources", "UI", "Disclaimer.ui"))
         try:
             dialogUi = slicer.util.childWidgetVariables(dialog)

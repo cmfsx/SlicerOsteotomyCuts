@@ -1,0 +1,27 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "Osteotomy Cuts: a 3D Slicer extension for multi-segment osteotomy planning in orthognathic and craniofacial surgery"
+type: software
+version: 1.0.0
+date-released: "2026-09-28"
+license: GPL-3.0-or-later
+repository-code: "https://github.com/cmfsx/SlicerOsteotomyCuts"
+url: "https://github.com/cmfsx/SlicerOsteotomyCuts"
+abstract: >-
+  A 3D Slicer extension for virtual osteotomies in orthognathic and
+  craniofacial surgical planning: osteotomy lines drawn on a bone model are
+  cut along a saw direction with a set blade thickness and depth, several
+  lines can form one osteotomy, cuts can be mirrored across a midline plane,
+  and the bone is divided into closed bone segments, with checks of model
+  quality and of the distance to the nerve canal and tooth roots. Research
+  and planning software, not a medical device.
+keywords:
+  - 3D Slicer
+  - osteotomy
+  - virtual surgical planning
+  - oral and maxillofacial surgery
+  - orthognathic surgery
+authors:
+  - family-names: Herath
+    given-names: Manjula
+    affiliation: "Ministry of Health, Sri Lanka; FaceLab, Colombo, Sri Lanka; Malmö University, Malmö, Sweden"

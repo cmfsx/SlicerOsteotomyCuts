@@ -1,6 +1,6 @@
 # Compatibility report (v1.0.0)
 
-Osteotomy Cuts 1.0.0 was developed and tested on **3D Slicer 5.13.0 (preview build, 2026-06-30)** on Windows 11. Before submitting it to the Extensions Index, verify it on the **current stable release** of 3D Slicer (Windows, and if possible macOS and Linux). Minimum expected: Slicer 5.8 (Python 3.12, VTK 9, Qt 5).
+Osteotomy Cuts 1.0.0 was developed on **3D Slicer 5.13.0 (preview, revision 34833, built 2026-06-30)** and verified on **3D Slicer 5.12.4 (stable, revision 34645, built 2026-09-09)**, both on Windows 11: all 87 headless tests pass on both. Not yet tested on macOS or Linux. Minimum expected: Slicer 5.8 (Python 3.12, VTK 9, Qt 5). Re-check the items below on each new stable release and on other platforms.
 
 ## APIs to verify
 

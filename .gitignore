@@ -22,3 +22,8 @@ Thumbs.db
 *.vtp
 *.ply
 *.obj
+*.mha
+*.mhd
+*.nhdr
+*.raw
+*.3mf

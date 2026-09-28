@@ -6,7 +6,7 @@
 
 A [3D Slicer](https://www.slicer.org) extension for virtual osteotomies in orthognathic and craniofacial surgical planning. Draw an osteotomy line on the bone, set the saw direction, and the bone is divided into separate, closed bone segments — with multi-segment cuts such as a Le Fort I, not only a single flat plane. The original bone model is kept unchanged and hidden.
 
-![Osteotomy Cuts in 3D Slicer](Screenshots/1.png)
+![Osteotomy Cuts in 3D Slicer: the module panel, a midline plane and a genioplasty line with its preview](Screenshots/1.png)
 
 ## Features
 
@@ -21,12 +21,18 @@ A [3D Slicer](https://www.slicer.org) extension for virtual osteotomies in ortho
 - **Provenance:** every bone segment records how it was made (lines, saw direction, blade, depth, solid settings, time, module version).
 - **Undo and rejoin:** undo a whole osteotomy, or rejoin bone segments of the same cut.
 
+## Requirements
+
+Tested on 3D Slicer 5.12.4 (stable, revision 34645, built 2026-09-09) and 3D Slicer 5.13.0 (preview, revision 34833, built 2026-06-30), Windows 11. Not yet tested on macOS or Linux.
+
+No other software is needed: VTK, NumPy and SciPy ship with 3D Slicer.
+
 ## Installation
 
 - **From the Extensions Manager** (once published): in 3D Slicer, open *View → Extensions Manager*, search for **OsteotomyCuts**, install and restart Slicer.
 - **From source:** clone this repository, then in Slicer open *Edit → Application Settings → Modules* and add the `OsteotomyCuts` folder of the repository to *Additional module paths*; restart Slicer.
 
-The module appears under **Surgical Planning → Osteotomy Cuts**. It needs only what ships with 3D Slicer (VTK, NumPy, SciPy). On first use you are asked to accept the terms of use.
+The module appears under **Surgical Planning → Osteotomy Cuts**. On first use you are asked to accept the terms of use.
 
 ## Quick start
 
@@ -44,7 +50,7 @@ If red lines appear where bone must stay intact (for example the skull base behi
 2. **Pterygomaxillary line:** create a second osteotomy line on the side of the maxilla behind the tuberosity, from the horizontal line downwards. View the skull from the side and set the saw direction (it cuts both sides). Leave the cut depth at *Through* and the reach at *Automatic*: it stops at the horizontal cut.
 3. Select the horizontal line again and tick the second one under **Further osteotomy lines**. Check that the red lines stay on the maxilla, then press *Make cut*. Small loose pieces between the cuts are joined to the neighbouring bone segment.
 
-![Le Fort I](Screenshots/2.png)
+![Le Fort I made of two osteotomy lines, mirrored to the other side, with a genioplasty](Screenshots/2.png)
 
 ## Symmetrical cuts
 
@@ -52,11 +58,11 @@ If red lines appear where bone must stay intact (for example the skull base behi
 2. **Mirror osteotomy to other side:** plan one side (e.g. the left BSSO, all its lines), then press the button. A mirrored copy with mirrored saw directions and the same blade and cut limits is created and selected; its points are put on the other side's bone surface, so it follows that side's own anatomy. Check it in the preview, then make the cut.
 3. **Make line symmetric:** for a cut across the midline such as a genioplasty, draw the line from the midline to one side, then press the button: its mirror image is added on the other side and the saw direction is turned into the midline plane.
 
+![A symmetric genioplasty: two closed bone segments](Screenshots/3.png)
+
 ## Structures to protect
 
 In **4. Structures to protect**, choose the nerve canal or tooth model (or a curve traced along a nerve, with its radius) and press *Add*. The type and usual safe distance (nerve 2 mm, tooth root 1 mm) come from the name and can be changed. The table shows the distance from the cut to each structure and its status (*Safe*, *Too close*, *Cut enters structure*); it is updated during the preview and checked again before every cut.
-
-![Structures to protect](Screenshots/3.png)
 
 ## Limitations
 
@@ -82,6 +88,38 @@ The tests use synthetic geometry only. The exit code is 0 when all tests pass.
 
 This software was developed with the assistance of Claude Code (Anthropic), under the clinical direction and review of the author.
 
+## Conflict of interest
+
+The author is the copyright holder of this software and may offer it under a commercial licence (see [Licence](#licence)). No other conflicts of interest are declared.
+
+## How to cite
+
+If you use Osteotomy Cuts in your work, please cite it as:
+
+> Herath M. *Osteotomy Cuts: a 3D Slicer extension for multi-segment osteotomy planning in orthognathic and craniofacial surgery*, version 1.0.0. 2026. https://github.com/cmfsx/SlicerOsteotomyCuts. DOI: *to be added after the Zenodo release*.
+
+Citation metadata for reference managers is in [CITATION.cff](CITATION.cff).
+
+## Glossary
+
+| Term | Meaning |
+|---|---|
+| Osteotomy line | The points you place on the bone where the cut is marked; the cut follows it along the saw direction. |
+| Saw direction | The direction the saw travels into the bone (technical: extrusion direction of the cutting surface). |
+| Saw blade thickness | The width of bone the blade removes (technical: kerf width). *Ideal cut* removes none. |
+| Cut depth | How far the saw goes into the bone from the osteotomy line; *Through* cuts right through. |
+| Cut reach beyond the line | How far the cut continues past the first and last points of the line. |
+| Bone segment | A separate piece of bone after the cut (technical: fragment). |
+| Closed (watertight) | A bone segment whose surface has no holes, as needed for 3D printing and volumes. |
+| Solid bone model | A copy of the bone with holes sealed and internal surfaces (marrow, canals) filled. |
+| Further osteotomy lines | Other lines cut together with the selected one in one step; each later line stops at the earlier ones. |
+| Midline plane | The plane of symmetry used to mirror osteotomies and make lines symmetric. |
+| Structures to protect | Nerve canal, tooth roots or other structures whose distance from the cut is checked. |
+| Safe distance | The least distance the cut should keep from a structure to protect. |
+| BSSO | Bilateral sagittal split osteotomy of the mandible. |
+| Le Fort I | Horizontal osteotomy of the maxilla above the tooth apices, with separation from the pterygoid plates. |
+| Genioplasty | Osteotomy of the chin. |
+
 ## Contributing
 
 Contributions are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md). All contributors must sign the [Contributor Licence Agreement](CLA.md). Never share patient data.
@@ -90,4 +128,4 @@ Contributions are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md). All contribut
 
 Osteotomy Cuts is free software, licensed under the **GNU General Public License, version 3 or later (GPL-3.0-or-later)** — see [LICENSE](LICENSE). It comes with no warranty; see [DISCLAIMER.md](DISCLAIMER.md).
 
-A commercial licence (for use under other terms) is available on request from the author.
+**Dual licensing:** besides the GPL, a commercial licence (for use under other terms, e.g. in closed-source products) is available on request from the author. Contributions are accepted under the [Contributor Licence Agreement](CLA.md) so that both licences remain possible.
