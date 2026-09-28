@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Manjula Herath
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Part of OsteotomyCuts, a 3D Slicer extension. See LICENSE and DISCLAIMER.md.
+
 """Checks on your own STL bone models, read in place (never copied).
 
 Run with Slicer's --python-script option (as run_headless_tests.py), with the environment

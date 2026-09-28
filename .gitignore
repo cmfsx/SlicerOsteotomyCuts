@@ -18,3 +18,7 @@ Thumbs.db
 *.nii.gz
 *.mrb
 *.stl
+*.vtk
+*.vtp
+*.ply
+*.obj

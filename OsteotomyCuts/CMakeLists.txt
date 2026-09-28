@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Manjula Herath
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Part of OsteotomyCuts, a 3D Slicer extension. See LICENSE and DISCLAIMER.md.
+
 #-----------------------------------------------------------------------------
 set(MODULE_NAME OsteotomyCuts)
 
@@ -9,6 +13,7 @@ set(MODULE_PYTHON_SCRIPTS
 set(MODULE_PYTHON_RESOURCES
   Resources/Icons/${MODULE_NAME}.png
   Resources/UI/${MODULE_NAME}.ui
+  Resources/UI/Disclaimer.ui
   Resources/requirements.txt
   )
 

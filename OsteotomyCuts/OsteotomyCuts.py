@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Manjula Herath
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Part of OsteotomyCuts, a 3D Slicer extension. See LICENSE and DISCLAIMER.md.
+
 import enum
 import json
 import logging
@@ -139,6 +143,25 @@ NOT_CAPTURED = (0.0, 0.0, 0.0)
 
 # Version of the module, recorded on every bone segment (provenance)
 MODULE_VERSION = "1.0.0"
+# Terms shown on first use of each module version, the same as DISCLAIMER.md (one paragraph per item)
+DISCLAIMER_PARAGRAPHS = (
+    "OsteotomyCuts is research and surgical planning software. It is not a medical device and has not been "
+    "cleared or approved by any regulatory authority. It is not intended for diagnosis, or for clinical decisions "
+    "made without the independent judgement of a qualified clinician.",
+    "Use is entirely at the user's own risk. The software is provided \"as is\", without warranty of any kind, "
+    "express or implied, including any warranty of fitness for a particular purpose, to the extent permitted by "
+    "law (see sections 15 and 16 of the GNU General Public License, version 3). The author and contributors "
+    "accept no liability for any loss or harm arising from its use.",
+    "Results depend on the input models (segmentation accuracy, mesh quality, registration) and on the settings "
+    "chosen. Virtual cuts, bone segments, volumes and measured distances are approximations. Every plan must be "
+    "checked by the responsible surgeon before it is used, including for printed guides or navigation.",
+    "Safety checks are an aid only: they depend on the accuracy of the segmented or traced structures, do not "
+    "guarantee the absence of risk, and do not replace the surgeon's own verification.",
+    "Only de-identified data may be used for testing, examples and bug reports. Never share patient data.",
+)
+# Application setting holding the module version whose terms the user accepted
+DISCLAIMER_SETTINGS_KEY = "OsteotomyCuts/DisclaimerAcceptedVersion"
+
 # The only contributor entry, as in the extension's CMakeLists.txt (EXTENSION_CONTRIBUTORS)
 MODULE_CONTRIBUTOR = ("Manjula Herath (Ministry of Health, Sri Lanka; FaceLab, Colombo, "
                       "Sri Lanka; Malmö University, Sweden)")
@@ -771,6 +794,7 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         self.ui.cutCurveSelector.connect("nodeAddedByUser(vtkMRMLNode*)", self.onCutCurveAdded)
         self.ui.captureViewDirectionButton.connect("clicked(bool)", self.onCaptureViewDirection)
+        self.ui.showTermsButton.connect("clicked(bool)", self.onShowTerms)
         self.ui.createSolidButton.connect("clicked(bool)", self.onCreateSolidButton)
         if importNdimage() is None:
             for widget in (self.ui.createSolidButton, self.ui.treatBoneAsSolidCheckBox):
@@ -819,8 +843,44 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._observedMarkupsNodes = []
 
     def enter(self) -> None:
-        """Called each time the user opens this module."""
+        """Called each time the user opens this module (asking for the terms of use first, once
+        per module version)."""
         self.initializeParameterNode()
+        if not self._termsAccepted():
+            self.onShowTerms()
+        self._applyTermsState()
+
+    # Sections that stay disabled until the terms of use are accepted
+    TERMS_LOCKED_WIDGETS = ("inputsCollapsibleButton", "directionCollapsibleButton", "sawCollapsibleButton",
+                            "structuresCollapsibleButton", "previewCollapsibleButton", "advancedCollapsibleButton",
+                            "applyButton", "undoButton", "mergeCollapsibleButton")
+
+    def _termsAccepted(self) -> bool:
+        """True once the terms of this module version were accepted (always in tests and headless)."""
+        if not self._isInteractive():
+            return True
+        return str(qt.QSettings().value(DISCLAIMER_SETTINGS_KEY, "")) == MODULE_VERSION
+
+    def _applyTermsState(self) -> None:
+        """Lock the module's controls until the terms of use are accepted."""
+        accepted = self._termsAccepted()
+        self.ui.showTermsButton.visible = not accepted
+        for name in self.TERMS_LOCKED_WIDGETS:
+            getattr(self.ui, name).enabled = accepted
+        if accepted:
+            self._updateActionState()
+
+    def onShowTerms(self) -> None:
+        """Show the terms of use (DISCLAIMER.md); accepting them unlocks the module."""
+        dialog = slicer.util.loadUI(self.resourcePath("UI/Disclaimer.ui"))
+        dialogUi = slicer.util.childWidgetVariables(dialog)
+        dialogUi.disclaimerTextBrowser.setHtml("<h3>{}</h3>{}".format(
+            _("Osteotomy Cuts {version}: terms of use").format(version=MODULE_VERSION),
+            "".join(f"<p>{paragraph}</p>" for paragraph in DISCLAIMER_PARAGRAPHS)))
+        if dialog.exec_() == qt.QDialog.Accepted and dialogUi.acceptCheckBox.checked:
+            qt.QSettings().setValue(DISCLAIMER_SETTINGS_KEY, MODULE_VERSION)
+        dialog.deleteLater()
+        self._applyTermsState()
 
     def exit(self) -> None:
         """Called each time the user opens a different module."""
@@ -1243,9 +1303,9 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.ui.treatBoneAsSolidCheckBox.enabled = haveScipy
         self.ui.createSolidButton.enabled = (haveScipy and inputModel is not None
                                              and not self.logic.isSolidModel(inputModel))
-        self.ui.applyButton.enabled = reason is None
+        self.ui.applyButton.enabled = reason is None and self._termsAccepted()
         self.ui.applyButton.toolTip = reason or _("Cut the bone along the osteotomy line(s) and create the bone segments.")
-        self.ui.undoButton.enabled = bool(self.logic.getCurveResult(
+        self.ui.undoButton.enabled = self._termsAccepted() and bool(self.logic.getCurveResult(
             self.logic.findFirstLine(self._parameterNode.cutCurve)))
         self.ui.statusLabel.text = reason or self._resultMessage or _("Ready to cut.")
         self._updateMergeButton()
@@ -6990,6 +7050,25 @@ class OsteotomyCutsTest(ScriptedLoadableModuleTest):
         self.assertIn("Quick start", helpText)
         self.assertIn(SAFETY_NOTE, helpText)
         self.assertIn("Structures to protect", " ".join(labels))
+
+    def test_disclaimer(self):
+        """The terms shown on first use are those of DISCLAIMER.md; the dialog has its controls."""
+        disclaimerPath = self._moduleFile("..", "DISCLAIMER.md")
+        if os.path.exists(disclaimerPath):  # the source tree (not an installed extension)
+            with open(disclaimerPath, encoding="utf-8") as disclaimerFile:
+                paragraphs = [" ".join(block.split()) for block in disclaimerFile.read().split("\n\n")
+                              if block.strip() and not block.startswith("#")]
+            self.assertEqual(paragraphs, list(DISCLAIMER_PARAGRAPHS))
+        self.assertIn(SAFETY_NOTE, DISCLAIMER_PARAGRAPHS)
+        dialog = slicer.util.loadUI(self._moduleFile("Resources", "UI", "Disclaimer.ui"))
+        try:
+            dialogUi = slicer.util.childWidgetVariables(dialog)
+            self.assertFalse(dialogUi.acceptButton.enabled)
+            dialogUi.acceptCheckBox.checked = True
+            self.assertTrue(dialogUi.acceptButton.enabled)  # accepting needs the tick
+        finally:
+            dialog.deleteLater()
+            slicer.app.sendPostedEvents(None, qt.QEvent.DeferredDelete)
 
     def test_acknowledgementAndContributors(self):
         """The acknowledgement names all three affiliations; the contributors match CMakeLists.txt."""

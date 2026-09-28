@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Manjula Herath
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Part of OsteotomyCuts, a 3D Slicer extension. See LICENSE and DISCLAIMER.md.
+
 cmake_minimum_required(VERSION 3.28.0...3.28.0 FATAL_ERROR)
 
 project(OsteotomyCuts)

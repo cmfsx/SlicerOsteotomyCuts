@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Manjula Herath
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Part of OsteotomyCuts, a 3D Slicer extension. See LICENSE and DISCLAIMER.md.
+
 """Headless test runner for the Osteotomy Cuts module.
 
 Run with Slicer's --python-script option. Always exits: 0 when all tests pass, 1 otherwise.
