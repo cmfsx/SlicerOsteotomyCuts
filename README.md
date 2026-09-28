@@ -103,7 +103,7 @@ Citation metadata for reference managers is in [CITATION.cff](CITATION.cff).
 ## Glossary
 
 | Term | Meaning |
-|---|---|
+|--|--|
 | Osteotomy line | The points you place on the bone where the cut is marked; the cut follows it along the saw direction. |
 | Saw direction | The direction the saw travels into the bone (technical: extrusion direction of the cutting surface). |
 | Saw blade thickness | The width of bone the blade removes (technical: kerf width). *Ideal cut* removes none. |
