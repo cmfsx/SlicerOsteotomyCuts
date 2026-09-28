@@ -47,7 +47,16 @@ Build one phase at a time. Design each so later phases need no rewrite.
   first line's depth -> fixed: new lines start with depth/reach/direction
   reset). Release 1 must have (user, 2026-09-28): solid bone, multi-line
   osteotomy, capping check + warning, surgeon wording, nerve/teeth warnings.
-  NEXT: Part 2 (model quality warnings), then Parts 3-10 in order. The full
+  Also done: small loose pieces joined to a neighbouring segment
+  (minSegmentPercent, default 1%); Part 2 (assessModel / assessSegments,
+  pre-cut dialog, not-closed warnings); Part 3 (structures to protect:
+  settings as attribute OsteotomyCuts.ProtectedStructure on the model/curve
+  node instead of a parameter-node list; checkClearances samples each
+  line's sheet inside the bone, 1 mm then 0.1 mm near the minimum; table,
+  closest-point markups, sheet colour, pre-cut confirm, SafetyResults /
+  SafetyOverride on segments). SAFETY_NOTE wording is a placeholder: ask
+  the user for their exact required sentence (Part 5/6).
+  NEXT: Part 4 (provenance), then Part 5 (surgeon wording), 6-10. The full
   approved plan (Parts 0-10, with details per part) is in the user's
   Claude plans folder: twinkly-brewing-phoenix.md.
 - To resume in a new session: check `git branch --show-current` is

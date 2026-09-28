@@ -104,6 +104,28 @@ try:
     if len(segments) != 2 or any(openEdges):
         failures.append("Solid mandible midline split: expected 2 closed bone segments")
 
+    # Structures to protect (release Part 3): a vertical cut through the left body crosses the
+    # mandibular canal; the teeth are checked too. Uses the solid mandible for the inside test.
+    from OsteotomyCuts import ClearanceStatus, OsteotomyLine
+    canalPath = os.path.join(FOLDER, "Mandibular canal.stl")
+    if os.path.exists(canalPath):
+        structures = []
+        for name in ("Mandibular canal.stl", "Lower Teeth.stl"):
+            if os.path.exists(os.path.join(FOLDER, name)):
+                structures.append(logic.addProtectedStructure(slicer.util.loadModel(os.path.join(FOLDER, name))))
+        bodyLine = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsCurveNode", "LeftBody")
+        bodySheet = logic.buildSheetPolyData(np.array([[-27.0, 60.0, 50.0], [-27.0, 20.0, 50.0]]), down,
+                                             logic.computeAutoExtent(solid))
+        start = time.perf_counter()
+        results = logic.checkClearances([OsteotomyLine(bodyLine, bodySheet, options, [])], solid, structures)
+        elapsed = time.perf_counter() - start
+        for result in results:
+            print(f"Clearance {result.structure.node.GetName()}: {result.clearance:.2f} mm, {result.status.value}")
+        print(f"Clearance check: {elapsed:.2f} s")
+        canal = next(r for r in results if r.structure.node.GetName().startswith("Mandibular canal"))
+        if canal.status != ClearanceStatus.ENTERS or elapsed > 10.0:
+            failures.append("Clearance: expected the body cut to enter the canal, within 10 s")
+
     # Cut outline for the live preview: must be quick on a real bone
     locator = vtk.vtkStaticCellLocator()
     locator.SetDataSet(bone)

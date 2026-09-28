@@ -1,6 +1,8 @@
 import enum
 import json
 import logging
+import re
+import time
 from dataclasses import dataclass
 from typing import Annotated, Callable, Optional
 
@@ -22,6 +24,7 @@ from slicer.parameterNodeWrapper import (
 
 from slicer import (
     vtkMRMLMarkupsCurveNode,
+    vtkMRMLMarkupsFiducialNode,
     vtkMRMLMarkupsLineNode,
     vtkMRMLModelNode,
 )
@@ -218,6 +221,56 @@ class SegmentQuality:
     name: str
     isClosed: bool
     volume: float  # mm3; only meaningful for a closed segment
+
+
+class StructureCategory(enum.Enum):
+    """Kind of structure to protect from the cut."""
+
+    NERVE = "nerve"
+    TOOTH = "tooth"
+    OTHER = "other"
+
+
+# Default safe distances (mm) from the cut, and default radius (mm) of a structure traced as a curve
+DEFAULT_SAFE_DISTANCES = {StructureCategory.NERVE: 2.0, StructureCategory.TOOTH: 1.0, StructureCategory.OTHER: 1.0}
+DEFAULT_STRUCTURE_RADIUS = 1.5
+
+# Model or curve attribute (JSON) marking a structure to protect, with its settings
+STRUCTURE_ATTRIBUTE = "OsteotomyCuts.ProtectedStructure"
+
+# Ends every message about structures to protect
+SAFETY_NOTE = ("Distances are computed from the 3D models and depend on their accuracy; they are an aid to "
+               "planning only. The surgeon remains responsible for checking them.")
+
+
+@dataclass
+class ProtectedStructure:
+    """A model or curve (centreline) that cuts must keep clear of."""
+
+    node: vtk.vtkObject  # vtkMRMLModelNode or vtkMRMLMarkupsCurveNode
+    category: StructureCategory
+    safeDistance: float  # mm
+    radius: float  # mm, for a curve: the structure is a tube of this radius round it
+    enabled: bool = True
+
+
+class ClearanceStatus(enum.Enum):
+    """How close the cut comes to a structure."""
+
+    SAFE = "safe"  # at least the safe distance away
+    TOO_CLOSE = "too close"  # closer than the safe distance
+    ENTERS = "enters"  # the cut (with the blade width) enters the structure
+
+
+@dataclass
+class ClearanceResult:
+    """Smallest distance between the cut (inside the bone) and one structure."""
+
+    structure: ProtectedStructure
+    clearance: float  # mm, minus half the blade width; inf if the cut does not reach bone
+    closestPoint: Optional[np.ndarray]  # on the cut surface
+    lineName: str  # the osteotomy line that comes closest
+    status: ClearanceStatus
 
 
 class SheetParameterisation:
@@ -583,6 +636,7 @@ class OsteotomyCutsParameterNode:
     solidVoxelSize - Detail (voxel size, mm) of solid bone models.
     solidGapSeal - Holes and gaps up to about twice this (mm) are sealed in solid bone models.
     minSegmentPercent - Smaller pieces are joined to a neighbouring bone segment after a cut.
+    clearanceMarkups - Points marking where the cut comes closest to each structure to protect.
     """
 
     inputModel: vtkMRMLModelNode
@@ -603,6 +657,7 @@ class OsteotomyCutsParameterNode:
     # Pieces with less surface area than this percentage of the largest bone segment are joined
     # to the segment they touch most (joinSmallSegments); 0 keeps every piece
     minSegmentPercent: Annotated[float, WithinRange(0.0, 50.0)] = 1.0
+    clearanceMarkups: vtkMRMLMarkupsFiducialNode
 
 
 #
@@ -615,8 +670,12 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     https://github.com/Slicer/Slicer/blob/main/Base/Python/slicer/ScriptedLoadableModule.py
     """
 
-    # Delay after the last point edit before the sheet preview is rebuilt
+    # Delay after the last point edit before the sheet preview is rebuilt, and before the
+    # distances to structures to protect are checked again (live preview)
     PREVIEW_DELAY_MS = 80
+    CLEARANCE_DELAY_MS = 1000
+    # A live distance check slower than this (s) turns live checking off for the session
+    MAX_LIVE_CLEARANCE_SECONDS = 3.0
 
     def __init__(self, parent=None) -> None:
         """Called when the user opens the module the first time and the widget is initialised."""
@@ -631,6 +690,10 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._snapping = False  # guards against reacting to our own snapping edits
         self._reconnectAfterImport = False  # GUI was connected when a scene import started
         self._currentLineId = None  # cut path whose settings the GUI shows (saved to it on edits)
+        self._clearanceTimer = None  # throttles the live distance check to structures to protect
+        self._clearanceResults = {}  # structure node ID -> last ClearanceResult (display only)
+        self._structuresSignature = None  # structures shown in the table (rebuilt when it changes)
+        self._liveClearance = True  # turned off for the session if the live check is slow
 
     def setup(self) -> None:
         """Called when the user opens the module the first time and the widget is initialised."""
@@ -672,6 +735,20 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._previewTimer.setInterval(self.PREVIEW_DELAY_MS)
         self._previewTimer.connect("timeout()", self._updatePreview)
 
+        self.ui.addStructureButton.connect("clicked(bool)", self.onAddStructure)
+        self.ui.removeStructureButton.connect("clicked(bool)", self.onRemoveStructure)
+        self.ui.checkDistancesButton.connect("clicked(bool)", self.onCheckDistances)
+        self.ui.structuresTable.connect("itemSelectionChanged()", self._updateStructureEditor)
+        self.ui.structureCategoryComboBox.connect("activated(int)", self._onStructureCategoryChosen)
+        self.ui.structureSafeDistanceSpinBox.connect("valueChanged(double)", self._onStructureEditorChanged)
+        self.ui.structureRadiusSpinBox.connect("valueChanged(double)", self._onStructureEditorChanged)
+        self.ui.structureEnabledCheckBox.connect("toggled(bool)", self._onStructureEditorChanged)
+        self.ui.structuresTable.horizontalHeader().setSectionResizeMode(qt.QHeaderView.ResizeToContents)
+        self._clearanceTimer = qt.QTimer()
+        self._clearanceTimer.setSingleShot(True)
+        self._clearanceTimer.setInterval(self.CLEARANCE_DELAY_MS)
+        self._clearanceTimer.connect("timeout()", lambda: self._runClearanceCheck(buildSolid=False, live=True))
+
         # Make sure parameter node is initialised (needed for module reload)
         self.initializeParameterNode()
 
@@ -679,6 +756,8 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         """Called when the application closes and the module widget is destroyed."""
         if self._previewTimer:
             self._previewTimer.stop()
+        if self._clearanceTimer:
+            self._clearanceTimer.stop()
         self.removeObservers()
         self._observedMarkupsNodes = []
 
@@ -778,6 +857,7 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         self._observeMarkupsNodes(self.logic.getOsteotomyLines(self._parameterNode.cutCurve)
                                   + [self._parameterNode.directionLine])
+        self._refreshStructuresTable()
         self._updateActionState()
         self._schedulePreview()
 
@@ -855,9 +935,209 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self._snapping = False
 
     def _schedulePreview(self) -> None:
-        """Rebuild the sheet preview shortly, once point edits pause."""
+        """Rebuild the sheet preview shortly, once point edits pause (and check the distances to
+        structures to protect a little later, if there are any)."""
         if self._previewTimer:
             self._previewTimer.start()
+        if (self._clearanceTimer and self._liveClearance and self._parameterNode
+                and self._parameterNode.livePreview and self.logic.getProtectedStructures()):
+            self._clearanceTimer.start()
+
+    #
+    # Structures to protect
+    #
+
+    CATEGORY_ORDER = (StructureCategory.NERVE, StructureCategory.TOOTH, StructureCategory.OTHER)
+
+    @staticmethod
+    def _categoryText(category: StructureCategory) -> str:
+        return {StructureCategory.NERVE: _("Nerve"), StructureCategory.TOOTH: _("Tooth root"),
+                StructureCategory.OTHER: _("Other")}[category]
+
+    @staticmethod
+    def _statusText(result: ClearanceResult) -> str:
+        if not np.isfinite(result.clearance):
+            return _("Safe (the cut does not reach the bone)")
+        return {ClearanceStatus.SAFE: _("Safe"), ClearanceStatus.TOO_CLOSE: _("Too close"),
+                ClearanceStatus.ENTERS: _("Cut enters structure")}[result.status]
+
+    def _selectedStructure(self) -> Optional[ProtectedStructure]:
+        rows = self.ui.structuresTable.selectionModel().selectedRows()
+        if not rows:
+            return None
+        item = self.ui.structuresTable.item(rows[0].row(), 0)
+        node = slicer.mrmlScene.GetNodeByID(item.data(qt.Qt.UserRole)) if item is not None else None
+        return self.logic.getProtectedStructure(node)
+
+    def _refreshStructuresTable(self, force: bool = False) -> None:
+        """Show the structures to protect with their last distances (rebuilt only when they change)."""
+        structures = self.logic.getProtectedStructures()
+        signature = tuple((s.node.GetID(), s.node.GetName(), s.node.GetAttribute(STRUCTURE_ATTRIBUTE))
+                          for s in structures) + tuple(sorted(
+            (nodeId, round(r.clearance, 2) if np.isfinite(r.clearance) else None, r.status.value)
+            for nodeId, r in self._clearanceResults.items()))
+        if signature == self._structuresSignature and not force:
+            return
+        self._structuresSignature = signature
+        selected = self._selectedStructure()
+        selectedId = selected.node.GetID() if selected is not None else None
+        table = self.ui.structuresTable
+        wasBlocked = table.blockSignals(True)
+        table.setRowCount(len(structures))
+        for row, structure in enumerate(structures):
+            result = self._clearanceResults.get(structure.node.GetID())
+            if not structure.enabled:
+                distance, status = "", _("Not checked")
+            elif result is None:
+                distance, status = "", ""
+            else:
+                distance = f"{result.clearance:.1f} mm" if np.isfinite(result.clearance) else "-"
+                status = self._statusText(result)
+            texts = (structure.node.GetName(), self._categoryText(structure.category),
+                     f"{structure.safeDistance:.1f} mm", distance, status)
+            for column, text in enumerate(texts):
+                item = qt.QTableWidgetItem(text)
+                if column == 0:
+                    item.setData(qt.Qt.UserRole, structure.node.GetID())
+                if result is not None and structure.enabled and column >= 3:
+                    item.setForeground(qt.QBrush(qt.QColor.fromRgbF(*self.logic.STATUS_COLOURS[result.status])))
+                table.setItem(row, column, item)
+            if structure.node.GetID() == selectedId:
+                table.selectRow(row)
+        table.blockSignals(wasBlocked)
+        self._updateStructureEditor()
+
+    def _updateStructureEditor(self) -> None:
+        """Show the settings of the selected structure in the editor."""
+        structure = self._selectedStructure()
+        editors = (self.ui.structureCategoryComboBox, self.ui.structureSafeDistanceSpinBox,
+                   self.ui.structureRadiusSpinBox, self.ui.structureEnabledCheckBox, self.ui.removeStructureButton)
+        for editor in editors:
+            editor.enabled = structure is not None
+        if structure is None:
+            return
+        for editor in editors[:4]:
+            editor.blockSignals(True)
+        self.ui.structureCategoryComboBox.currentIndex = self.CATEGORY_ORDER.index(structure.category)
+        self.ui.structureSafeDistanceSpinBox.value = structure.safeDistance
+        self.ui.structureRadiusSpinBox.value = structure.radius
+        self.ui.structureRadiusSpinBox.enabled = structure.node.IsA("vtkMRMLMarkupsCurveNode")
+        self.ui.structureEnabledCheckBox.checked = structure.enabled
+        for editor in editors[:4]:
+            editor.blockSignals(False)
+
+    def _onStructureCategoryChosen(self, index: int) -> None:
+        """A chosen type also sets its usual safe distance."""
+        category = self.CATEGORY_ORDER[index]
+        self.ui.structureSafeDistanceSpinBox.blockSignals(True)
+        self.ui.structureSafeDistanceSpinBox.value = DEFAULT_SAFE_DISTANCES[category]
+        self.ui.structureSafeDistanceSpinBox.blockSignals(False)
+        self._onStructureEditorChanged()
+
+    def _onStructureEditorChanged(self, *args) -> None:
+        """Store the editor's settings on the selected structure."""
+        structure = self._selectedStructure()
+        if structure is None:
+            return
+        structure.category = self.CATEGORY_ORDER[self.ui.structureCategoryComboBox.currentIndex]
+        structure.safeDistance = self.ui.structureSafeDistanceSpinBox.value
+        structure.radius = self.ui.structureRadiusSpinBox.value
+        structure.enabled = self.ui.structureEnabledCheckBox.checked
+        self.logic.setProtectedStructure(structure)
+        self._clearanceResults.pop(structure.node.GetID(), None)
+        self._refreshStructuresTable()
+        self._schedulePreview()
+
+    def onAddStructure(self) -> None:
+        """Protect the model or curve chosen in the selector."""
+        with slicer.util.tryWithErrorDisplay(_("Failed to add the structure."), waitCursor=True):
+            node = self.ui.structureNodeSelector.currentNode()
+            if node is None:
+                raise ValueError(_("Choose a model or curve to protect first."))
+            if self._parameterNode and self._parameterNode.inputModel is not None \
+                    and node.GetID() == self._parameterNode.inputModel.GetID():
+                raise ValueError(_("This is the bone being cut. Choose the nerve canal, teeth or another structure."))
+            self.logic.addProtectedStructure(node)
+            self._refreshStructuresTable(force=True)
+            for row in range(self.ui.structuresTable.rowCount):
+                if self.ui.structuresTable.item(row, 0).data(qt.Qt.UserRole) == node.GetID():
+                    self.ui.structuresTable.selectRow(row)
+            self._schedulePreview()
+
+    def onRemoveStructure(self) -> None:
+        """Stop protecting the selected structure."""
+        structure = self._selectedStructure()
+        if structure is not None:
+            self.logic.removeProtectedStructure(structure.node)
+            self._clearanceResults.pop(structure.node.GetID(), None)
+            if not self.logic.getProtectedStructures() and self._parameterNode:
+                self._clearanceResults = {}
+                self.logic.updateClearanceDisplay(self._parameterNode, [])
+                self.ui.structuresStatusLabel.text = ""
+            self._refreshStructuresTable(force=True)
+            self._schedulePreview()
+
+    def onCheckDistances(self) -> None:
+        """Measure the distances from the cut to the structures now (building the solid bone
+        model if needed)."""
+        self._runClearanceCheck(buildSolid=True, live=False)
+
+    def _runClearanceCheck(self, buildSolid: bool, live: bool) -> Optional[list[ClearanceResult]]:
+        """Check the distances to the structures to protect and show them (table, closest points,
+        sheet colour). Live checks (preview) never build the solid model and are silent.
+
+        :return: the results, or None if the check could not run.
+        """
+        parameterNode = self._parameterNode
+        if not parameterNode or self.logic.validateInputs(parameterNode):
+            return None
+        start = time.perf_counter()
+        results = None
+        try:
+            with slicer.util.tryWithErrorDisplay(_("Failed to check the distances."), waitCursor=True,
+                                                 show=not live):
+                results = self.logic.checkClearancesForParameters(parameterNode, buildSolid=buildSolid)
+        except Exception:
+            return None  # shown (or logged, when live) by tryWithErrorDisplay
+        if results is None:
+            return None
+        elapsed = time.perf_counter() - start
+        self._clearanceResults = {result.structure.node.GetID(): result for result in results}
+        self.logic.updateClearanceDisplay(parameterNode, results)
+        self._refreshStructuresTable()
+        problems = [result for result in results if result.status != ClearanceStatus.SAFE]
+        text = (_("Too close: {names}.").format(names=", ".join(r.structure.node.GetName() for r in problems))
+                if problems else _("All checked structures are at a safe distance.") if results else "")
+        if live and elapsed > self.MAX_LIVE_CLEARANCE_SECONDS:
+            self._liveClearance = False
+            text += " " + _("The distance check is slow on this model, so it is no longer repeated while points "
+                            "move: press \"Check distances\" (it is always done before a cut).")
+        self.ui.structuresStatusLabel.text = (text + " " + _(SAFETY_NOTE)).strip() if results else ""
+        return results
+
+    def _confirmClearances(self, parameterNode: OsteotomyCutsParameterNode) -> tuple[bool, list, bool]:
+        """Before a cut, check the distances to the structures to protect and ask the surgeon to
+        confirm if any is too close.
+
+        :return: (go on, results, whether the surgeon overrode a warning).
+        """
+        if not [s for s in self.logic.getProtectedStructures() if s.enabled]:
+            return True, [], False
+        results = self._runClearanceCheck(buildSolid=True, live=False)
+        if results is None:
+            return False, [], False
+        problems = [result for result in results if result.status != ClearanceStatus.SAFE]
+        if not problems:
+            return True, results, False
+        lines = [_("{name} ({type}): {status}, {distance:.1f} mm from the cut (safe distance {safe:.1f} mm, "
+                   "osteotomy line {line}).").format(
+            name=r.structure.node.GetName(), type=self._categoryText(r.structure.category),
+            status=self._statusText(r), distance=r.clearance, safe=r.structure.safeDistance, line=r.lineName)
+            for r in problems]
+        text = "\n".join(lines) + "\n\n" + _(SAFETY_NOTE)
+        choice = self._askUser(_("Structures too close to the cut"), text, [_("Proceed anyway"), _("Cancel")],
+                               default=1)
+        return choice == 0, results, choice == 0
 
     def _updatePreview(self) -> None:
         """Show, update or hide the cutting sheet preview."""
@@ -1010,6 +1290,10 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if not self._confirmModelQuality(parameterNode):
             self._updateActionState()
             return
+        proceed, clearances, override = self._confirmClearances(parameterNode)
+        if not proceed:
+            self._updateActionState()
+            return
         progress = slicer.util.createProgressDialog(labelText=_("Cutting..."), maximum=100)
 
         def reportProgress(percent: int, message: str) -> None:
@@ -1021,6 +1305,8 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         try:
             with slicer.util.tryWithErrorDisplay(_("Failed to cut the model."), waitCursor=True):
                 segments = self.logic.applyCut(parameterNode, reportProgress)
+                if clearances:
+                    self.logic.recordSafetyResults(segments, clearances, override)
                 if len(segments) == 1:
                     message = _("The cut made a groove: the bone was not separated (1 bone segment).")
                 else:
@@ -3234,11 +3520,21 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
                            voxelSize: float) -> None:
         """Set the voxels (mask in (z, y, x) order, voxel centres at origin + index * voxelSize)
         that the triangles pass through, sampling each triangle at most half a voxel apart."""
+        limit = np.array(mask.shape[::-1]) - 1
+        for samples in OsteotomyCutsLogic._triangleSamples(triangles, 0.5 * voxelSize):
+            ijk = np.clip(np.rint((samples - origin) / voxelSize).astype(np.int64), 0, limit)
+            mask[ijk[:, 2], ijk[:, 1], ijk[:, 0]] = True
+
+    @staticmethod
+    def _triangleSamples(triangles: vtk.vtkPolyData, spacing: float):
+        """Yield (K, 3) arrays of points covering a triangle mesh, at most spacing apart (a
+        barycentric grid per triangle, corners included), in chunks of bounded size."""
+        if triangles.GetNumberOfPolys() == 0:
+            return
         points = numpy_support.vtk_to_numpy(triangles.GetPoints().GetData()).astype(float)
         corners = points[numpy_support.vtk_to_numpy(triangles.GetPolys().GetConnectivityArray()).reshape(-1, 3)]
         edgeLengths = np.linalg.norm(corners - np.roll(corners, 1, axis=1), axis=2).max(axis=1)
-        steps = np.maximum(np.ceil(edgeLengths / (0.5 * voxelSize)), 1).astype(np.int64)
-        limit = np.array(mask.shape[::-1]) - 1
+        steps = np.maximum(np.ceil(edgeLengths / spacing), 1).astype(np.int64)
         for n in np.unique(steps):
             i, j = np.meshgrid(np.arange(n + 1), np.arange(n + 1), indexing="ij")
             inside = i + j <= n
@@ -3247,9 +3543,7 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
             group = corners[steps == n]
             chunk = max(1, 4_000_000 // len(weights))
             for start in range(0, len(group), chunk):
-                samples = np.einsum("mc,kcx->kmx", weights, group[start:start + chunk]).reshape(-1, 3)
-                ijk = np.clip(np.rint((samples - origin) / voxelSize).astype(np.int64), 0, limit)
-                mask[ijk[:, 2], ijk[:, 1], ijk[:, 0]] = True
+                yield np.einsum("mc,kcx->kmx", weights, group[start:start + chunk]).reshape(-1, 3)
 
     def _dilateMask(self, mask: np.ndarray, radius: float, voxelSize: float, ndimage) -> np.ndarray:
         """Dilate a (z, y, x) mask with an exact ball of the given radius (mm).
@@ -4029,6 +4323,303 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
     #
     # Mesh helpers
     #
+
+    #
+    # Structures to protect (nerve canal, tooth roots)
+    #
+
+    # Cut surface samples: coarse over the whole cut, then fine near the closest point
+    CLEARANCE_COARSE_SPACING = 1.0
+    CLEARANCE_FINE_SPACING = 0.1
+    CLEARANCE_MAX_FINE_SAMPLES = 400_000
+    # Structure centrelines (curves) are resampled this finely (mm)
+    CENTRELINE_SPACING = 0.1
+    # Status colours of the sheet preview and the closest-point markers
+    STATUS_COLOURS = {ClearanceStatus.SAFE: (0.2, 0.75, 0.3), ClearanceStatus.TOO_CLOSE: (1.0, 0.6, 0.0),
+                      ClearanceStatus.ENTERS: (0.9, 0.1, 0.1)}
+
+    @staticmethod
+    def guessStructureCategory(name: str) -> StructureCategory:
+        """Category from a node name: nerve / canal / IAN -> nerve; tooth / teeth / root -> tooth."""
+        words = re.findall(r"[a-z]+", name.lower())
+        if any(word in ("ian", "nerve", "canal", "alveolar", "mental", "infraorbital") for word in words):
+            return StructureCategory.NERVE
+        if any(word.startswith(("tooth", "teeth", "root", "dental")) for word in words):
+            return StructureCategory.TOOTH
+        return StructureCategory.OTHER
+
+    def getProtectedStructure(self, node) -> Optional[ProtectedStructure]:
+        """The settings of a structure to protect stored on a node, or None if it is not one."""
+        text = node.GetAttribute(STRUCTURE_ATTRIBUTE) if node is not None else None
+        if not text:
+            return None
+        try:
+            stored = json.loads(text)
+            category = StructureCategory(stored.get("category", StructureCategory.OTHER.value))
+            return ProtectedStructure(node, category, float(stored.get("safeDistance", DEFAULT_SAFE_DISTANCES[category])),
+                                      float(stored.get("radius", DEFAULT_STRUCTURE_RADIUS)),
+                                      bool(stored.get("enabled", True)))
+        except (ValueError, TypeError) as error:
+            logging.warning(f"OsteotomyCuts: ignoring unreadable structure settings of {node.GetName()}: {error}")
+            return None
+
+    def setProtectedStructure(self, structure: ProtectedStructure) -> None:
+        """Store a structure's settings on its node (saved with the scene)."""
+        structure.node.SetAttribute(STRUCTURE_ATTRIBUTE, json.dumps(
+            {"category": structure.category.value, "safeDistance": float(structure.safeDistance),
+             "radius": float(structure.radius), "enabled": bool(structure.enabled)}, sort_keys=True))
+
+    def addProtectedStructure(self, node) -> ProtectedStructure:
+        """Mark a model or curve as a structure to protect (keeping existing settings), with the
+        category guessed from its name and its default safe distance.
+
+        :raises ValueError: for other node types.
+        """
+        if node is None or not (node.IsA("vtkMRMLModelNode") or node.IsA("vtkMRMLMarkupsCurveNode")):
+            raise ValueError(_("A structure to protect must be a model or a curve."))
+        structure = self.getProtectedStructure(node)
+        if structure is None:
+            category = self.guessStructureCategory(node.GetName())
+            structure = ProtectedStructure(node, category, DEFAULT_SAFE_DISTANCES[category], DEFAULT_STRUCTURE_RADIUS)
+            self.setProtectedStructure(structure)
+        return structure
+
+    @staticmethod
+    def removeProtectedStructure(node) -> None:
+        """Stop protecting a structure (the node itself is kept)."""
+        node.RemoveAttribute(STRUCTURE_ATTRIBUTE)
+
+    def getProtectedStructures(self) -> list[ProtectedStructure]:
+        """All structures to protect in the scene, in scene order."""
+        structures = []
+        for className in ("vtkMRMLModelNode", "vtkMRMLMarkupsCurveNode"):
+            for node in slicer.util.getNodesByClass(className):
+                structure = self.getProtectedStructure(node)
+                if structure is not None:
+                    structures.append(structure)
+        return structures
+
+    def sampleCutInBone(self, sheet: vtk.vtkPolyData, bone: vtk.vtkPolyData, spacing: float,
+                        stops: Optional[list] = None, bounds: Optional[np.ndarray] = None) -> np.ndarray:
+        """Points covering the part of a cutting sheet that lies inside the bone.
+
+        Only this part cuts bone, so parts in air are ignored, as are parts beyond earlier
+        lines of the osteotomy that this line stops at.
+
+        :param sheet: cutting sheet.
+        :param bone: closed bone mesh (inside test).
+        :param spacing: largest distance between samples (mm).
+        :param stops: (earlier sheet, side) pairs of a later osteotomy line.
+        :param bounds: optional region (xmin, xmax, ...) to sample; default the bone's bounds.
+        :return: (K, 3) points.
+        """
+        region = np.array(bone.GetBounds() if bounds is None else bounds, dtype=float)
+        region += np.array([-1.0, 1.0] * 3) * spacing
+        # Clip to the region by its six planes in turn: a plane's value is linear, so each clip is
+        # exact (a box function is only evaluated at the corners of the large sheet triangles)
+        clipped = sheet
+        for axis in range(3):
+            for side, value in ((1.0, region[2 * axis]), (-1.0, region[2 * axis + 1])):
+                plane = vtk.vtkPlane()
+                origin, normal = [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]
+                origin[axis], normal[axis] = value, side
+                plane.SetOrigin(origin)
+                plane.SetNormal(normal)
+                clip = vtk.vtkClipPolyData()
+                clip.SetInputData(clipped)
+                clip.SetClipFunction(plane)
+                clip.Update()
+                clipped = clip.GetOutput()
+        pieces = list(self._triangleSamples(self._ensureTriangles(clipped), spacing))
+        points = np.vstack(pieces) if pieces else np.zeros((0, 3))
+        if len(points) and stops:
+            points = points[~self.protectedByStops(points, stops)]
+        if len(points) == 0:
+            return points
+        cloud = vtk.vtkPolyData()
+        cloudPoints = vtk.vtkPoints()
+        cloudPoints.SetData(numpy_support.numpy_to_vtk(np.ascontiguousarray(points), deep=True))
+        cloud.SetPoints(cloudPoints)
+        enclosed = vtk.vtkSelectEnclosedPoints()
+        enclosed.SetInputData(cloud)
+        enclosed.SetSurfaceData(bone)
+        enclosed.CheckSurfaceOff()
+        enclosed.Update()
+        inside = numpy_support.vtk_to_numpy(enclosed.GetOutput().GetPointData().GetArray("SelectedPoints")) > 0
+        return points[inside]
+
+    def _structureDistanceFunction(self, structure: ProtectedStructure) -> Callable[[np.ndarray], np.ndarray]:
+        """Function giving the distance (mm) of points to the structure's surface: negative
+        inside a closed model; for a curve, distance to the centreline minus the radius."""
+        node = structure.node
+        if node.IsA("vtkMRMLMarkupsCurveNode"):
+            centre = np.array(slicer.util.arrayFromMarkupsCurvePoints(node, world=True), dtype=float)
+            if len(centre) == 0:
+                return lambda points: np.full(len(points), np.inf)
+            dense = [centre[:1]]
+            for start, end in zip(centre[:-1], centre[1:]):
+                count = max(1, int(np.ceil(np.linalg.norm(end - start) / self.CENTRELINE_SPACING)))
+                dense.append(start + np.outer(np.arange(1, count + 1) / count, end - start))
+            dense = np.vstack(dense)
+            try:
+                from scipy.spatial import cKDTree
+                tree = cKDTree(dense)
+                return lambda points: tree.query(points)[0] - structure.radius
+            except ImportError:
+                locator = vtk.vtkStaticPointLocator()
+                data = vtk.vtkPolyData()
+                densePoints = vtk.vtkPoints()
+                densePoints.SetData(numpy_support.numpy_to_vtk(dense, deep=True))
+                data.SetPoints(densePoints)
+                locator.SetDataSet(data)
+                locator.BuildLocator()
+                return lambda points: np.array([np.linalg.norm(dense[locator.FindClosestPoint(p)] - p)
+                                                for p in points]) - structure.radius
+        surface = self.mergeCoincidentPoints(self._ensureTriangles(self.getWorldPolyData(node)))
+        closed = self.countOpenEdges(surface) == (0, 0)
+        if closed:  # consistent outward normals give the sign
+            normals = vtk.vtkPolyDataNormals()
+            normals.SetInputData(surface)
+            normals.ConsistencyOn()
+            normals.AutoOrientNormalsOn()
+            normals.SplittingOff()
+            normals.ComputeCellNormalsOn()
+            normals.Update()
+            surface = normals.GetOutput()
+        implicitDistance = vtk.vtkImplicitPolyDataDistance()
+        implicitDistance.SetInput(surface)
+
+        def distances(points: np.ndarray) -> np.ndarray:
+            values = vtk.vtkDoubleArray()
+            implicitDistance.FunctionValue(numpy_support.numpy_to_vtk(np.ascontiguousarray(points), deep=True), values)
+            result = numpy_support.vtk_to_numpy(values).copy()
+            return result if closed else np.abs(result)
+
+        return distances
+
+    def checkClearances(self, lines: list[OsteotomyLine], bone: vtk.vtkPolyData,
+                        structures: list[ProtectedStructure]) -> list[ClearanceResult]:
+        """Smallest distance between the cut and each enabled structure to protect (headless).
+
+        The cut is each line's sheet where it lies inside the bone (sampleCutInBone), minus
+        half the blade width. It is sampled every CLEARANCE_COARSE_SPACING, then every
+        CLEARANCE_FINE_SPACING near the closest samples.
+
+        :param lines: the osteotomy's lines (sheet, options, stops).
+        :param bone: closed bone mesh the cut uses (world coordinates).
+        :param structures: structures to check; disabled ones are skipped.
+        :return: one result per enabled structure: Safe (at least its safe distance), Too close,
+            or Cut enters structure (clearance below 0).
+        """
+        coarse = []
+        for line in lines:
+            halfKerf = self.effectiveKerfWidth(line.options, bool(line.stops)) / 2.0
+            coarse.append((line, halfKerf, self.sampleCutInBone(line.sheet, bone, self.CLEARANCE_COARSE_SPACING,
+                                                                  line.stops)))
+        boneBounds = np.array(bone.GetBounds())
+        results = []
+        for structure in (s for s in structures if s.enabled):
+            distanceTo = self._structureDistanceFunction(structure)
+            best, bestPoint, bestLine = np.inf, None, ""
+            for line, halfKerf, samples in coarse:
+                if len(samples) == 0:
+                    continue
+                values = distanceTo(samples)
+                near = samples[values <= values.min() + 2.0 * self.CLEARANCE_COARSE_SPACING]
+                region = np.empty(6)
+                region[0::2] = np.maximum(near.min(axis=0) - self.CLEARANCE_COARSE_SPACING, boneBounds[0::2])
+                region[1::2] = np.minimum(near.max(axis=0) + self.CLEARANCE_COARSE_SPACING, boneBounds[1::2])
+                extents = np.sort(np.maximum(region[1::2] - region[0::2], 0.0))
+                spacing = max(self.CLEARANCE_FINE_SPACING,
+                              float(np.sqrt(extents[1] * extents[2] / self.CLEARANCE_MAX_FINE_SAMPLES)))
+                fine = self.sampleCutInBone(line.sheet, bone, spacing, line.stops, region)
+                candidates = np.vstack([fine, near]) if len(fine) else near
+                values = distanceTo(candidates) - halfKerf
+                index = int(np.argmin(values))
+                if values[index] < best:
+                    best, bestPoint, bestLine = float(values[index]), candidates[index], line.curve.GetName()
+            if best < 0:
+                status = ClearanceStatus.ENTERS
+            elif best < structure.safeDistance:
+                status = ClearanceStatus.TOO_CLOSE
+            else:
+                status = ClearanceStatus.SAFE
+            results.append(ClearanceResult(structure, best, bestPoint, bestLine, status))
+        return results
+
+    def getBoneForChecks(self, parameterNode: OsteotomyCutsParameterNode, buildSolid: bool) -> vtk.vtkPolyData:
+        """The bone mesh for clearance checks: the one the cut uses (the solid copy with "Treat
+        bone as solid"), or the model itself if the solid copy is not built yet and buildSolid
+        is False (live preview)."""
+        inputModel = parameterNode.inputModel
+        if (parameterNode.treatBoneAsSolid and not self.isSolidModel(inputModel) and importNdimage() is not None
+                and (buildSolid or inputModel.GetID() in self._solidCache)):
+            return self.getModelToCut(parameterNode)[0]
+        return self.getWorldPolyData(inputModel)
+
+    def checkClearancesForParameters(self, parameterNode: OsteotomyCutsParameterNode,
+                                     buildSolid: bool = True) -> list[ClearanceResult]:
+        """checkClearances for the selected osteotomy and all structures in the scene (the
+        structure being cut itself is skipped). Empty if there are no structures.
+
+        :raises ValueError: if the inputs are invalid.
+        """
+        structures = [s for s in self.getProtectedStructures() if s.enabled
+                      and s.node.GetID() != parameterNode.inputModel.GetID()]
+        if not structures:
+            return []
+        lines = self.buildOsteotomy(parameterNode)
+        return self.checkClearances(lines, self.getBoneForChecks(parameterNode, buildSolid), structures)
+
+    def updateClearanceDisplay(self, parameterNode: OsteotomyCutsParameterNode,
+                               results: list[ClearanceResult]) -> None:
+        """Mark the closest point of the cut to each structure ("ClosestToCut" points, locked,
+        labelled with the distance) and colour the sheet preview by the worst status."""
+        markups = parameterNode.clearanceMarkups
+        if markups is None:
+            markups = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsFiducialNode", "ClosestToCut")
+            markups.SetHideFromEditors(True)
+            markups.SetLocked(True)
+            markups.CreateDefaultDisplayNodes()
+            markups.GetDisplayNode().SetPointLabelsVisibility(True)
+            parameterNode.clearanceMarkups = markups
+        wasModifying = markups.StartModify()
+        markups.RemoveAllControlPoints()
+        worst = None
+        order = [ClearanceStatus.SAFE, ClearanceStatus.TOO_CLOSE, ClearanceStatus.ENTERS]
+        for result in results:
+            if result.closestPoint is None:
+                continue
+            index = markups.AddControlPointWorld(vtk.vtkVector3d(*result.closestPoint))
+            markups.SetNthControlPointLabel(index, f"{result.structure.node.GetName()}: {result.clearance:.1f} mm")
+            markups.SetNthControlPointLocked(index, True)
+            if worst is None or order.index(result.status) > order.index(worst):
+                worst = result.status
+        markups.EndModify(wasModifying)
+        colour = self.STATUS_COLOURS[worst] if worst is not None else (0.9, 0.2, 0.2)
+        markups.GetDisplayNode().SetSelectedColor(colour)
+        markups.GetDisplayNode().SetVisibility(bool(results))
+        sheetNode = parameterNode.sheetModel
+        if sheetNode is not None and sheetNode.GetDisplayNode() is not None:
+            sheetNode.GetDisplayNode().SetColor(colour)
+
+    @staticmethod
+    def clearanceSummary(results: list[ClearanceResult]) -> list[dict]:
+        """Clearance results as plain values (for the SafetyResults attribute of segments)."""
+        return [{"structure": result.structure.node.GetName(), "category": result.structure.category.value,
+                 "safeDistance_mm": result.structure.safeDistance,
+                 "clearance_mm": None if not np.isfinite(result.clearance) else round(result.clearance, 2),
+                 "status": result.status.value, "line": result.lineName} for result in results]
+
+    def recordSafetyResults(self, nodes: list[vtkMRMLModelNode], results: list[ClearanceResult],
+                            override: bool) -> None:
+        """Store the clearance results on the bone segments (OsteotomyCuts.SafetyResults, JSON)
+        and, if the surgeon cut despite a warning, OsteotomyCuts.SafetyOverride = "true"."""
+        text = json.dumps(self.clearanceSummary(results))
+        for node in nodes:
+            node.SetAttribute("OsteotomyCuts.SafetyResults", text)
+            if override:
+                node.SetAttribute("OsteotomyCuts.SafetyOverride", "true")
 
     @staticmethod
     def _ensureTriangles(polyData: vtk.vtkPolyData) -> vtk.vtkPolyData:
@@ -6031,3 +6622,133 @@ class OsteotomyCutsTest(ScriptedLoadableModuleTest):
         self.assertIsNone(logic.assessModelToCut(parameterNode))
         parameterNode.treatBoneAsSolid = False
         self.assertTrue(logic.assessModelToCut(parameterNode).isClosed)
+
+    #
+    # Release Part 3: structures to protect
+    #
+
+    @staticmethod
+    def _canal(x: float, z: float = 0.0, radius: float = 1.5) -> vtk.vtkPolyData:
+        """Closed cylinder along y (a canal model) through (x, 0, z)."""
+        cylinder = vtk.vtkCylinderSource()  # along y
+        cylinder.SetRadius(radius)
+        cylinder.SetHeight(80.0)
+        cylinder.SetResolution(96)
+        cylinder.SetCenter(x, 0.0, z)
+        cylinder.CappingOn()
+        triangles = vtk.vtkTriangleFilter()
+        triangles.SetInputConnection(cylinder.GetOutputPort())
+        triangles.Update()
+        return triangles.GetOutput()
+
+    def _planarLines(self, kerfWidth: float = 0.0, depth: float = 0.0) -> list:
+        """One osteotomy line: the plane x = 1.3 through the test box, cut from the top."""
+        logic = OsteotomyCutsLogic()
+        box = self._box()
+        options = CutOptions()
+        options.kerfWidth = kerfWidth
+        options.depth = depth
+        sheet = logic.buildSheetPolyData(np.array(self.X_CUT_PATH), np.array(self.DOWN),
+                                         logic.computeAutoExtent(box), depth=depth if depth > 0 else None)
+        curve = self._addCurve(self.X_CUT_PATH, "Line")
+        return [OsteotomyLine(curve, sheet, options, [])]
+
+    def _structure(self, polyData_or_points, name: str, safeDistance: float = 2.0,
+                   radius: float = 1.5) -> ProtectedStructure:
+        logic = OsteotomyCutsLogic()
+        if isinstance(polyData_or_points, vtk.vtkPolyData):
+            node = self._addModel(polyData_or_points, name)
+        else:
+            node = self._addCurve(polyData_or_points, name)
+        structure = logic.addProtectedStructure(node)
+        structure.safeDistance, structure.radius = safeDistance, radius
+        logic.setProtectedStructure(structure)
+        return structure
+
+    def test_clearance_canal(self):
+        """A canal 5 mm from a planar cut (surface 3.5 mm away): the clearance is exact to 0.1 mm,
+        with the ideal blade and with a 1 mm blade; a centreline curve with a radius gives the same."""
+        logic = OsteotomyCutsLogic()
+        box = self._box()
+        canal = self._structure(self._canal(6.3), "Mandibular canal")
+        self.assertEqual(canal.category, StructureCategory.NERVE)
+        nerve = self._structure([[6.3, -40.0, 0.0], [6.3, 40.0, 0.0]], "IAN")
+        for kerfWidth, expected in ((0.0, 3.5), (1.0, 3.0)):
+            results = logic.checkClearances(self._planarLines(kerfWidth), box, [canal, nerve])
+            for result in results:
+                self.assertAlmostEqual(result.clearance, expected, delta=0.1,
+                                       msg=f"{result.structure.node.GetName()}, kerf {kerfWidth}")
+                self.assertEqual(result.status, ClearanceStatus.SAFE)
+                self.assertAlmostEqual(result.closestPoint[0], 1.3, delta=0.01)
+
+    def test_clearance_statuses(self):
+        """Too close, cut entering the structure, a cut stopping short of it, and parts of the
+        cut in air ignored; each structure with its own safe distance."""
+        logic = OsteotomyCutsLogic()
+        box = self._box()
+        near = self._structure(self._canal(6.3), "Near canal", safeDistance=4.0)
+        tooth = self._structure(self._sphere(2.0, centre=(-10.0, 0.0, 10.0), resolution=32), "Tooth root",
+                                safeDistance=1.0)
+        self.assertEqual(tooth.category, StructureCategory.TOOTH)
+        through = self._structure(self._canal(1.3, z=-20.0), "Canal in the cut", safeDistance=2.0)
+        inAir = self._structure(self._sphere(2.0, centre=(1.3, 0.0, 70.0), resolution=32), "Above the bone")
+        results = {r.structure.node.GetName(): r for r in logic.checkClearances(
+            self._planarLines(), box, [near, tooth, through, inAir])}
+        self.assertEqual(results["Near canal"].status, ClearanceStatus.TOO_CLOSE)
+        self.assertEqual(results["Tooth root"].status, ClearanceStatus.SAFE)
+        self.assertAlmostEqual(results["Tooth root"].clearance, 11.3 - 2.0, delta=0.1)
+        self.assertEqual(results["Canal in the cut"].status, ClearanceStatus.ENTERS)
+        self.assertAlmostEqual(results["Canal in the cut"].clearance, -1.5, delta=0.1)
+        self.assertEqual(results["Above the bone"].status, ClearanceStatus.SAFE)
+        self.assertAlmostEqual(results["Above the bone"].clearance, 70.0 - 50.0 - 2.0, delta=0.15)
+
+        # A cut 30 mm deep from the top (z = 50) ends at z = 20, 40 mm above the canal's axis
+        # (the ideal blade of a limited cut removes 0.1 mm: half is 0.05 mm)
+        stopped = logic.checkClearances(self._planarLines(depth=30.0), box, [through])[0]
+        self.assertEqual(stopped.status, ClearanceStatus.SAFE)
+        self.assertAlmostEqual(stopped.clearance, 40.0 - 1.5 - 0.05, delta=0.1)
+
+        # Disabled structures are not checked
+        through.enabled = False
+        self.assertEqual(logic.checkClearances(self._planarLines(), box, [through]), [])
+
+    def test_clearance_mrml(self):
+        """Structures are found in the scene with their settings, which survive a scene reload;
+        the check uses the osteotomy and records the results on the bone segments."""
+        import os
+        logic = OsteotomyCutsLogic()
+        model = self._addModel(self._box(), "Box")
+        parameterNode = self._configure(model, self._addCurve(self.X_CUT_PATH, "CutA"))
+        teeth = logic.addProtectedStructure(self._addModel(self._canal(6.3), "Lower Teeth"))
+        self.assertEqual((teeth.category, teeth.safeDistance), (StructureCategory.TOOTH, 1.0))
+        with self.assertRaises(ValueError):
+            logic.addProtectedStructure(slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsFiducialNode"))
+
+        results = logic.checkClearancesForParameters(parameterNode)
+        self.assertEqual(len(results), 1)
+        self.assertAlmostEqual(results[0].clearance, 3.5, delta=0.1)
+        logic.updateClearanceDisplay(parameterNode, results)
+        self.assertEqual(parameterNode.clearanceMarkups.GetNumberOfControlPoints(), 1)
+        self.assertIn("3.5 mm", parameterNode.clearanceMarkups.GetNthControlPointLabel(0))
+
+        nodes = logic.applyCut(parameterNode)
+        logic.recordSafetyResults(nodes, results, override=True)
+        stored = json.loads(nodes[0].GetAttribute("OsteotomyCuts.SafetyResults"))
+        self.assertEqual((stored[0]["structure"], stored[0]["status"]), ("Lower Teeth", "safe"))
+        self.assertEqual(nodes[0].GetAttribute("OsteotomyCuts.SafetyOverride"), "true")
+
+        teeth.safeDistance, teeth.enabled = 0.5, False
+        logic.setProtectedStructure(teeth)
+        scenePath = os.path.join(slicer.app.temporaryPath, "OsteotomyCutsStructures.mrb")
+        try:
+            self.assertTrue(slicer.util.saveScene(scenePath))
+            slicer.mrmlScene.Clear()
+            slicer.util.loadScene(scenePath)
+        finally:
+            if os.path.exists(scenePath):
+                os.remove(scenePath)
+        structures = logic.getProtectedStructures()
+        self.assertEqual([(s.node.GetName(), s.category, s.safeDistance, s.enabled) for s in structures],
+                         [("Lower Teeth", StructureCategory.TOOTH, 0.5, False)])
+        logic.removeProtectedStructure(structures[0].node)
+        self.assertEqual(logic.getProtectedStructures(), [])

@@ -383,6 +383,221 @@
     </widget>
    </item>
    <item>
+    <widget class="ctkCollapsibleButton" name="structuresCollapsibleButton">
+     <property name="text">
+      <string>Structures to protect</string>
+     </property>
+     <layout class="QGridLayout" name="structuresGridLayout">
+      <item row="0" column="0" colspan="2">
+       <widget class="qMRMLNodeComboBox" name="structureNodeSelector">
+        <property name="toolTip">
+         <string>Model (e.g. mandibular canal, teeth) or curve along a nerve to keep clear of the cut.</string>
+        </property>
+        <property name="nodeTypes">
+         <stringlist notr="true">
+          <string>vtkMRMLModelNode</string>
+          <string>vtkMRMLMarkupsCurveNode</string>
+         </stringlist>
+        </property>
+        <property name="showChildNodeTypes">
+         <bool>true</bool>
+        </property>
+        <property name="noneEnabled">
+         <bool>true</bool>
+        </property>
+        <property name="addEnabled">
+         <bool>false</bool>
+        </property>
+        <property name="removeEnabled">
+         <bool>false</bool>
+        </property>
+       </widget>
+      </item>
+      <item row="0" column="2">
+       <widget class="QPushButton" name="addStructureButton">
+        <property name="toolTip">
+         <string>Add the selected model or curve to the structures to protect. Its type is guessed from its name (nerve / canal, tooth / teeth) and can be changed below.</string>
+        </property>
+        <property name="text">
+         <string>Add</string>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="0" colspan="3">
+       <widget class="QTableWidget" name="structuresTable">
+        <property name="toolTip">
+         <string>Structures to protect and how close the cut comes to each (inside the bone, allowing for the blade width). Select a row to change its settings.</string>
+        </property>
+        <property name="editTriggers">
+         <set>QAbstractItemView::NoEditTriggers</set>
+        </property>
+        <property name="selectionMode">
+         <enum>QAbstractItemView::SingleSelection</enum>
+        </property>
+        <property name="selectionBehavior">
+         <enum>QAbstractItemView::SelectRows</enum>
+        </property>
+        <property name="columnCount">
+         <number>5</number>
+        </property>
+        <attribute name="horizontalHeaderStretchLastSection">
+         <bool>true</bool>
+        </attribute>
+        <attribute name="verticalHeaderVisible">
+         <bool>false</bool>
+        </attribute>
+        <column>
+         <property name="text">
+          <string>Structure</string>
+         </property>
+        </column>
+        <column>
+         <property name="text">
+          <string>Type</string>
+         </property>
+        </column>
+        <column>
+         <property name="text">
+          <string>Safe distance</string>
+         </property>
+        </column>
+        <column>
+         <property name="text">
+          <string>Distance to cut</string>
+         </property>
+        </column>
+        <column>
+         <property name="text">
+          <string>Status</string>
+         </property>
+        </column>
+       </widget>
+      </item>
+      <item row="2" column="0">
+       <widget class="QLabel" name="structureCategoryLabel">
+        <property name="text">
+         <string>Type:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="2" column="1" colspan="2">
+       <widget class="QComboBox" name="structureCategoryComboBox">
+        <property name="toolTip">
+         <string>Kind of structure. Choosing it sets the usual safe distance (nerve 2 mm, tooth root 1 mm, other 1 mm).</string>
+        </property>
+        <item>
+         <property name="text">
+          <string>Nerve</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>Tooth root</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>Other</string>
+         </property>
+        </item>
+       </widget>
+      </item>
+      <item row="3" column="0">
+       <widget class="QLabel" name="structureSafeDistanceLabel">
+        <property name="text">
+         <string>Safe distance:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="3" column="1" colspan="2">
+       <widget class="ctkDoubleSpinBox" name="structureSafeDistanceSpinBox">
+        <property name="toolTip">
+         <string>The cut should stay at least this far from the structure. Typical: 2 mm from the inferior alveolar nerve, 1 mm from tooth roots. Closer gives "Too close"; into the structure gives "Cut enters structure".</string>
+        </property>
+        <property name="decimals">
+         <number>1</number>
+        </property>
+        <property name="singleStep">
+         <double>0.500000000000000</double>
+        </property>
+        <property name="maximum">
+         <double>20.000000000000000</double>
+        </property>
+        <property name="suffix">
+         <string> mm</string>
+        </property>
+       </widget>
+      </item>
+      <item row="4" column="0">
+       <widget class="QLabel" name="structureRadiusLabel">
+        <property name="text">
+         <string>Radius (curve):</string>
+        </property>
+       </widget>
+      </item>
+      <item row="4" column="1" colspan="2">
+       <widget class="ctkDoubleSpinBox" name="structureRadiusSpinBox">
+        <property name="toolTip">
+         <string>For a structure traced as a curve along its centre (e.g. the nerve): its radius. Typical: 1.5 mm for the inferior alveolar canal.</string>
+        </property>
+        <property name="decimals">
+         <number>1</number>
+        </property>
+        <property name="singleStep">
+         <double>0.100000000000000</double>
+        </property>
+        <property name="maximum">
+         <double>10.000000000000000</double>
+        </property>
+        <property name="suffix">
+         <string> mm</string>
+        </property>
+       </widget>
+      </item>
+      <item row="5" column="0" colspan="3">
+       <widget class="QCheckBox" name="structureEnabledCheckBox">
+        <property name="toolTip">
+         <string>Check the distance from the cut to this structure.</string>
+        </property>
+        <property name="text">
+         <string>Check this structure</string>
+        </property>
+       </widget>
+      </item>
+      <item row="6" column="0" colspan="2">
+       <widget class="QPushButton" name="checkDistancesButton">
+        <property name="toolTip">
+         <string>Measure how close the cut comes to each structure now. This is also done before every cut, and during live preview.</string>
+        </property>
+        <property name="text">
+         <string>Check distances</string>
+        </property>
+       </widget>
+      </item>
+      <item row="6" column="2">
+       <widget class="QPushButton" name="removeStructureButton">
+        <property name="toolTip">
+         <string>Stop protecting the selected structure (its model or curve is kept).</string>
+        </property>
+        <property name="text">
+         <string>Remove</string>
+        </property>
+       </widget>
+      </item>
+      <item row="7" column="0" colspan="3">
+       <widget class="QLabel" name="structuresStatusLabel">
+        <property name="text">
+         <string/>
+        </property>
+        <property name="wordWrap">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+     </layout>
+    </widget>
+   </item>
+   <item>
     <widget class="ctkCollapsibleButton" name="previewCollapsibleButton">
      <property name="text">
       <string>Preview</string>
@@ -799,6 +1014,12 @@
    <sender>OsteotomyCuts</sender>
    <signal>mrmlSceneChanged(vtkMRMLScene*)</signal>
    <receiver>groupLinesSelector</receiver>
+   <slot>setMRMLScene(vtkMRMLScene*)</slot>
+  </connection>
+  <connection>
+   <sender>OsteotomyCuts</sender>
+   <signal>mrmlSceneChanged(vtkMRMLScene*)</signal>
+   <receiver>structureNodeSelector</receiver>
    <slot>setMRMLScene(vtkMRMLScene*)</slot>
   </connection>
   <connection>
