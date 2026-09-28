@@ -1,8 +1,11 @@
 import enum
 import json
 import logging
+import os
 import re
+import subprocess
 import time
+from datetime import datetime
 from dataclasses import dataclass
 from typing import Annotated, Callable, Optional
 
@@ -92,6 +95,9 @@ class DirectionMode(enum.Enum):
 
 
 NOT_CAPTURED = (0.0, 0.0, 0.0)
+
+# Version of the module, recorded on every bone segment (provenance)
+MODULE_VERSION = "1.0.0"
 
 # Called with (percent 0-100, message) to report progress of long operations
 ProgressCallback = Callable[[int, str], None]
@@ -198,6 +204,7 @@ class OsteotomyLine:
     sheet: vtk.vtkPolyData
     options: CutOptions
     stops: list
+    direction: Optional[np.ndarray] = None  # extrusion (saw) direction, world
 
 
 @dataclass
@@ -3973,7 +3980,8 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
                 if skipInvalid:
                     continue
                 raise
-            built.append(OsteotomyLine(curveNode, sheet, settings.options, list(zip(earlier, sides))))
+            built.append(OsteotomyLine(curveNode, sheet, settings.options, list(zip(earlier, sides)),
+                                       self.resolveLineDirection(settings)))
         return built
 
     def updateSheetModel(self, parameterNode: OsteotomyCutsParameterNode) -> Optional[vtkMRMLModelNode]:
@@ -4098,6 +4106,7 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         report(90, _("Creating fragment models..."))
         self.removeCutResult(curveNode)
         nodes = self.createFragmentNodes(fragments, inputModel, curveNode)
+        self.recordProvenance(nodes, parameterNode, lines, isSolid)
         if isSolid and all(line.options.capCutFaces for line in lines):
             for node in nodes:  # closed pieces of a solid: later cuts use them as they are
                 node.SetAttribute(SOLID_ATTRIBUTE, "1")
@@ -4105,6 +4114,60 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         self.lastSegmentQuality = self.assessSegments(nodes)
         report(100, _("Done."))
         return nodes
+
+    _gitHash = None  # cached for the session
+
+    @classmethod
+    def moduleGitHash(cls) -> str:
+        """Short git commit of the module's folder ("unknown" outside a git checkout, e.g. an
+        installed extension). Run once per session, with a time limit."""
+        if cls._gitHash is None:
+            cls._gitHash = "unknown"
+            try:
+                result = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=os.path.dirname(__file__),
+                                        capture_output=True, text=True, timeout=5,
+                                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                if result.returncode == 0 and result.stdout.strip():
+                    cls._gitHash = result.stdout.strip()
+            except (OSError, subprocess.SubprocessError):
+                pass
+        return cls._gitHash
+
+    def recordProvenance(self, nodes: list[vtkMRMLModelNode], parameterNode: OsteotomyCutsParameterNode,
+                         lines: list[OsteotomyLine], isSolid: bool) -> None:
+        """Record on each bone segment how it was made (node attributes, saved with the scene).
+
+        The per-line values are JSON lists with one entry per osteotomy line, in cut order:
+        OsteotomyCuts.LineNames, .LinePoints (world, mm), .SawDirection (unit vectors),
+        .BladeThickness_mm (the setting), .RemovedWidth_mm (bone actually removed, 0.1 for a
+        limited cut with the ideal blade), .CutDepth_mm (0 = through), .PastLineEnds_mm
+        (0 = automatic). Then .SolidBone ("true"/"false"), .SolidDetail_mm, .SolidGapSeal_mm,
+        .Timestamp (ISO 8601), .ModuleVersion and .GitHash.
+        """
+        def rounded(values) -> list:
+            return [round(float(value), 4) for value in values]
+
+        values = {
+            "LineNames": [line.curve.GetName() for line in lines],
+            "LinePoints": [[rounded(point) for point in self.getPathPoints(line.curve)] for line in lines],
+            "SawDirection": [rounded(line.direction) if line.direction is not None else None for line in lines],
+            "BladeThickness_mm": [float(line.options.kerfWidth) for line in lines],
+            "RemovedWidth_mm": [self.effectiveKerfWidth(line.options, bool(line.stops)) for line in lines],
+            "CutDepth_mm": [float(line.options.depth) for line in lines],
+            "PastLineEnds_mm": [float(line.options.endExtension) for line in lines],
+        }
+        attributes = {f"OsteotomyCuts.{name}": json.dumps(value) for name, value in values.items()}
+        attributes.update({
+            "OsteotomyCuts.SolidBone": "true" if isSolid else "false",
+            "OsteotomyCuts.SolidDetail_mm": f"{parameterNode.solidVoxelSize:g}",
+            "OsteotomyCuts.SolidGapSeal_mm": f"{parameterNode.solidGapSeal:g}",
+            "OsteotomyCuts.Timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "OsteotomyCuts.ModuleVersion": MODULE_VERSION,
+            "OsteotomyCuts.GitHash": self.moduleGitHash(),
+        })
+        for node in nodes:
+            for name, value in attributes.items():
+                node.SetAttribute(name, value)
 
     @staticmethod
     def isSolidModel(modelNode: vtkMRMLModelNode) -> bool:
@@ -6753,3 +6816,41 @@ class OsteotomyCutsTest(ScriptedLoadableModuleTest):
                          [("Lower Teeth", StructureCategory.TOOTH, 0.5, False)])
         logic.removeProtectedStructure(structures[0].node)
         self.assertEqual(logic.getProtectedStructures(), [])
+
+    #
+    # Release Part 4: provenance
+    #
+
+    def test_provenance(self):
+        """Each bone segment records how it was made, and keeps it through a scene reload."""
+        logic = OsteotomyCutsLogic()
+        model = self._addModel(self._box(), "Box")
+        parameterNode = self._configure(model, self._addCurve(self.X_CUT_PATH, "CutA"))
+        parameterNode.options.kerfWidth = 1.0
+        parameterNode.options.depth = 0.0
+        names = [node.GetName() for node in logic.applyCut(parameterNode)]
+
+        scenePath = os.path.join(slicer.app.temporaryPath, "OsteotomyCutsProvenance.mrb")
+        try:
+            self.assertTrue(slicer.util.saveScene(scenePath))
+            slicer.mrmlScene.Clear()
+            slicer.util.loadScene(scenePath)
+        finally:
+            if os.path.exists(scenePath):
+                os.remove(scenePath)
+        for name in names:
+            node = slicer.util.getNode(name)
+            attribute = lambda key: node.GetAttribute(f"OsteotomyCuts.{key}")
+            self.assertEqual(json.loads(attribute("LineNames")), ["CutA"])
+            np.testing.assert_allclose(json.loads(attribute("LinePoints"))[0], self.X_CUT_PATH, atol=1e-3)
+            np.testing.assert_allclose(json.loads(attribute("SawDirection"))[0], self.DOWN, atol=1e-6)
+            self.assertEqual(json.loads(attribute("BladeThickness_mm")), [1.0])
+            self.assertEqual(json.loads(attribute("RemovedWidth_mm")), [1.0])
+            self.assertEqual(json.loads(attribute("CutDepth_mm")), [0.0])
+            self.assertEqual(attribute("SolidBone"), "false")
+            self.assertEqual(attribute("SolidDetail_mm"), "0.25")
+            self.assertEqual(attribute("SolidGapSeal_mm"), "1.5")
+            self.assertEqual(attribute("ModuleVersion"), MODULE_VERSION)
+            self.assertTrue(attribute("GitHash"))
+            self.assertLess(abs((datetime.now().astimezone() - datetime.fromisoformat(attribute("Timestamp")))
+                                .total_seconds()), 600)
