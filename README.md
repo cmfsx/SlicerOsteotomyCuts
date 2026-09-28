@@ -1,3 +1,5 @@
+<p align="center"><img src="Docs/Logo/OsteotomyCuts_banner.png" width="256" alt="Osteotomy Cuts logo"></p>
+
 # Osteotomy Cuts
 
 > **Important — research and planning software, not a medical device.** Use is entirely at the user's own risk. Safety checks are an aid only: they depend on the accuracy of the segmented or traced structures, do not guarantee the absence of risk, and do not replace the surgeon's own verification. See [DISCLAIMER.md](DISCLAIMER.md).
