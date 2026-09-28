@@ -44,7 +44,7 @@ The module appears under **Planning → Osteotomy Cuts**. On first use you are a
 
 If red lines appear where bone must stay intact (for example the skull base behind the maxilla), limit the cut with **Cut depth** and **Cut reach beyond the line**.
 
-## Example: Le Fort I on a skull model
+## Example: Le Fort I on a skull model.
 
 1. **Horizontal line:** place the osteotomy line from one zygomatic buttress, round the anterior maxilla, to the other, about 5 mm above the tooth apices. View the skull from the front and press *Set saw direction from view*. Set **Cut depth** to about 45–55 mm (to the pterygoid plates), **Cut reach beyond the line** to 5–10 mm and **Saw blade thickness** to 0.5–1.0 mm.
 2. **Pterygomaxillary line:** create a second osteotomy line on the side of the maxilla behind the tuberosity, from the horizontal line downwards. View the skull from the side and set the saw direction (it cuts both sides). Leave the cut depth at *Through* and the reach at *Automatic*: it stops at the horizontal cut.
