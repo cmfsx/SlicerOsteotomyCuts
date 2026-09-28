@@ -197,6 +197,29 @@ class OsteotomyLine:
     stops: list
 
 
+@dataclass
+class ModelQuality:
+    """Whether a bone surface is closed, and what else may stop a cut from separating it."""
+
+    openEdges: int  # edges with one triangle only: holes and gaps in the surface
+    nonManifoldEdges: int  # edges shared by three or more triangles: surfaces crossing
+    pieceCount: int  # separate connected pieces
+    enclosedShellCount: int  # pieces inside another one (marrow, canals, inner cortex)
+
+    @property
+    def isClosed(self) -> bool:
+        return self.openEdges == 0 and self.nonManifoldEdges == 0
+
+
+@dataclass
+class SegmentQuality:
+    """Closedness and volume of one bone segment after a cut."""
+
+    name: str
+    isClosed: bool
+    volume: float  # mm3; only meaningful for a closed segment
+
+
 class SheetParameterisation:
     """A 2D chart of the cut surface of a sheet from buildSheetPolyData, used to cap cut faces.
 
@@ -904,8 +927,89 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             viewNode = slicer.app.layoutManager().threeDWidget(0).mrmlViewNode()
             self.logic.captureViewDirection(self._requireParameterNode(), viewNode)
 
+    @staticmethod
+    def _isInteractive() -> bool:
+        """False in tests and without a main window: dialogs are then logged, not shown."""
+        return not slicer.app.testingEnabled() and slicer.util.mainWindow() is not None
+
+    def _askUser(self, title: str, text: str, choices: list[str], default: int) -> int:
+        """Ask the user to choose; the last choice is the one taken on Escape (Cancel).
+
+        Headless or in tests, the message is logged and the default is returned.
+
+        :return: index of the chosen button.
+        """
+        if not self._isInteractive():
+            logging.info(f"OsteotomyCuts: {title}: {text} -> {choices[default]}")
+            return default
+        box = qt.QMessageBox(slicer.util.mainWindow())
+        box.setWindowTitle(title)
+        box.setIcon(qt.QMessageBox.Warning)
+        box.setText(text)
+        roles = [qt.QMessageBox.YesRole, qt.QMessageBox.AcceptRole, qt.QMessageBox.ApplyRole][:len(choices) - 1]
+        roles.append(qt.QMessageBox.RejectRole)
+        buttons = [box.addButton(label, role) for label, role in zip(choices, roles)]
+        box.setDefaultButton(buttons[default])
+        box.setEscapeButton(buttons[-1])
+        box.exec_()
+        clicked = box.clickedButton()
+        role = box.buttonRole(clicked) if clicked is not None else qt.QMessageBox.RejectRole
+        return roles.index(role) if role in roles else len(choices) - 1
+
+    def _warnUser(self, title: str, text: str) -> None:
+        """Show a warning (logged headless or in tests)."""
+        if not self._isInteractive():
+            logging.warning(f"OsteotomyCuts: {title}: {text}")
+            return
+        slicer.util.warningDisplay(text, windowTitle=title)
+
+    def _confirmModelQuality(self, parameterNode: OsteotomyCutsParameterNode) -> bool:
+        """Before a cut, check that the model to cut is closed and in one piece; if not, tell
+        the surgeon and offer a solid bone model.
+
+        :return: True to go on with the cut (possibly on a new solid model), False to stop.
+        """
+        quality = None
+        with slicer.util.tryWithErrorDisplay(_("Failed to check the bone model."), waitCursor=True):
+            quality = self.logic.assessModelToCut(parameterNode)
+            if quality is None:
+                return True  # made solid for the cut: closed
+        if quality is None:
+            return False  # the check failed (error shown)
+        problems = []
+        if not quality.isClosed:
+            problems.append(_("its surface is not closed ({open} open edges, {crossing} edges where surfaces "
+                              "cross), so the cut may not separate the bone and the bone segments may not be "
+                              "closed").format(open=quality.openEdges, crossing=quality.nonManifoldEdges))
+        if quality.enclosedShellCount:
+            problems.append(_("it has {count} internal surfaces (e.g. marrow, canals, inner side of the cortex), "
+                              "which are cut too").format(count=quality.enclosedShellCount))
+        if quality.pieceCount - quality.enclosedShellCount > 1:
+            problems.append(_("it is made of {count} separate pieces").format(
+                count=quality.pieceCount - quality.enclosedShellCount))
+        if not problems:
+            return True
+        name = parameterNode.inputModel.GetName()
+        summary = _("The bone model {name} is not a clean solid: {problems}.").format(
+            name=name, problems="; ".join(problems))
+        self.ui.statusLabel.text = summary
+        canMakeSolid = importNdimage() is not None
+        choices = ([_("Create solid bone model")] if canMakeSolid else []) + [_("Proceed anyway"), _("Cancel")]
+        text = summary + "\n\n" + (_("A solid bone model (holes sealed, internal surfaces filled) is recommended; "
+                                     "the original model is kept.") if canMakeSolid else
+                                   _("Solid bone models need scipy, which is missing."))
+        choice = self._askUser(_("Check the bone model"), text, choices, default=len(choices) - 2)
+        if canMakeSolid and choice == 0:
+            self.onCreateSolidButton()
+            return self.logic.isSolidModel(parameterNode.inputModel)
+        return choice == len(choices) - 2
+
     def onApplyButton(self) -> None:
-        """Cut the model, with a progress dialog."""
+        """Check the model, cut it with a progress dialog, then check the bone segments."""
+        parameterNode = self._requireParameterNode()
+        if not self._confirmModelQuality(parameterNode):
+            self._updateActionState()
+            return
         progress = slicer.util.createProgressDialog(labelText=_("Cutting..."), maximum=100)
 
         def reportProgress(percent: int, message: str) -> None:
@@ -913,16 +1017,31 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             progress.value = percent
             slicer.app.processEvents()
 
+        notClosed = []
         try:
             with slicer.util.tryWithErrorDisplay(_("Failed to cut the model."), waitCursor=True):
-                fragments = self.logic.applyCut(self._requireParameterNode(), reportProgress)
-                self._resultMessage = _("{count} fragments created.").format(count=len(fragments))
+                segments = self.logic.applyCut(parameterNode, reportProgress)
+                if len(segments) == 1:
+                    message = _("The cut made a groove: the bone was not separated (1 bone segment).")
+                else:
+                    message = _("{count} bone segments created.").format(count=len(segments))
                 if self.logic.lastJoinedPieces:
-                    self._resultMessage += " " + _("{count} small pieces were joined to a neighbouring segment "
-                                                   "(Advanced).").format(count=self.logic.lastJoinedPieces)
+                    message += " " + _("{count} small pieces were joined to a neighbouring bone segment "
+                                       "(Advanced).").format(count=self.logic.lastJoinedPieces)
+                notClosed = [result.name for result in self.logic.lastSegmentQuality if not result.isClosed]
+                if notClosed:
+                    message += " " + _("WARNING: not closed: {names}.").format(names=", ".join(notClosed))
+                else:
+                    message += " " + _("All bone segments are closed.")
+                self._resultMessage = message
         finally:
             progress.close()
             self._updateActionState()
+        if notClosed:
+            self._warnUser(_("Bone segments not closed"), _(
+                "These bone segments are not closed: {names}.\n\nThey may not print correctly and their volumes "
+                "are not reliable. Keep \"Cap cut faces\" on, and use \"Treat bone as solid\" or \"Create solid "
+                "bone model\" for a model with holes.").format(names=", ".join(notClosed)))
 
     def onCreateSolidButton(self) -> None:
         """Create a solid version of the model to cut and select it, with a progress dialog."""
@@ -976,8 +1095,10 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         self._surfaceLocatorCache = None
         # Model node ID -> (cache key, solid world mesh), most recently used last
         self._solidCache = {}
-        # Small pieces joined to a neighbouring bone segment by the last applyCut
+        # Small pieces joined to a neighbouring bone segment by the last applyCut, and the check
+        # of its bone segments (assessSegments)
         self.lastJoinedPieces = 0
+        self.lastSegmentQuality = []
 
     # A path segment closer than this angle to its extrusion direction is rejected, because the
     # sheet would degenerate to a sliver there.
@@ -2691,6 +2812,73 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         result.DeepCopy(clean.GetOutput())
         return result
 
+    def countOpenEdges(self, polyData: vtk.vtkPolyData) -> tuple[int, int]:
+        """(boundary edges, non-manifold edges) of a mesh, after merging coincident points
+        (fragments have duplicate points along sharp edges for display). (0, 0) means closed."""
+        counts = []
+        merged = self.mergeCoincidentPoints(self._ensureTriangles(polyData))
+        for boundary in (True, False):
+            edges = vtk.vtkFeatureEdges()
+            edges.SetInputData(merged)
+            edges.SetBoundaryEdges(boundary)
+            edges.SetNonManifoldEdges(not boundary)
+            edges.FeatureEdgesOff()
+            edges.ManifoldEdgesOff()
+            edges.Update()
+            counts.append(edges.GetOutput().GetNumberOfCells())
+        return counts[0], counts[1]
+
+    def assessModel(self, polyData: vtk.vtkPolyData) -> ModelQuality:
+        """Check whether a bone model is closed, and count its pieces and internal shells.
+
+        A model that is not closed may not separate, or give bone segments that are not
+        closed; internal shells and loose pieces are cut too (use "Treat bone as solid").
+
+        :param polyData: bone mesh (world coordinates).
+        :return: the counts; ModelQuality.isClosed tells whether it is closed.
+        """
+        triangles = self.mergeCoincidentPoints(self._ensureTriangles(polyData))
+        openEdges, nonManifoldEdges = self.countOpenEdges(triangles)
+        labelled = self.labelEnclosedComponents(triangles, CutOptions().minFragmentFraction)
+        components = numpy_support.vtk_to_numpy(labelled.GetPointData().GetArray("ComponentId"))
+        hosts = numpy_support.vtk_to_numpy(labelled.GetPointData().GetArray("HostComponentId"))
+        pieceCount = len(np.unique(components)) if len(components) else 0
+        enclosed = len(np.unique(components[hosts >= 0])) if len(components) else 0
+        return ModelQuality(openEdges, nonManifoldEdges, pieceCount, enclosed)
+
+    def assessModelToCut(self, parameterNode: OsteotomyCutsParameterNode) -> Optional[ModelQuality]:
+        """Quality of the model a cut would use, or None when it is made solid for the cut
+        (treatBoneAsSolid with scipy and a model not marked solid: the solid copy is closed).
+
+        :raises ValueError: if the model is empty or under a non-linear transform.
+        """
+        inputModel = parameterNode.inputModel
+        if (parameterNode.treatBoneAsSolid and importNdimage() is not None
+                and not self.isSolidModel(inputModel)):
+            return None
+        return self.assessModel(self.getWorldPolyData(inputModel))
+
+    def assessSegments(self, nodes: list[vtkMRMLModelNode]) -> list[SegmentQuality]:
+        """Check each bone segment for being closed and record it on the node: attributes
+        OsteotomyCuts.Watertight ("true" / "false") and OsteotomyCuts.Volume_mm3.
+
+        :param nodes: bone segment model nodes.
+        :return: one result per node, in order.
+        """
+        results = []
+        for node in nodes:
+            polyData = node.GetPolyData()
+            openEdges, nonManifoldEdges = self.countOpenEdges(polyData)
+            closed = openEdges == 0 and nonManifoldEdges == 0
+            massProperties = vtk.vtkMassProperties()
+            massProperties.SetInputData(self._ensureTriangles(polyData))
+            massProperties.Update()
+            volume = float(massProperties.GetVolume())
+            node.SetAttribute("OsteotomyCuts.Watertight", "true" if closed else "false")
+            node.SetAttribute("OsteotomyCuts.Volume_mm3", f"{volume:.1f}")
+            results.append(SegmentQuality(node.GetName(), closed, volume))
+        return results
+
     def joinSmallSegments(self, fragments: list[vtk.vtkPolyData], minFraction: float,
                           contactDistance: float = 1.0) -> tuple[list[vtk.vtkPolyData], int]:
         """Join small pieces left between the lines of an osteotomy to a large bone segment.
@@ -3618,6 +3806,8 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         if isSolid and all(line.options.capCutFaces for line in lines):
             for node in nodes:  # closed pieces of a solid: later cuts use them as they are
                 node.SetAttribute(SOLID_ATTRIBUTE, "1")
+        report(95, _("Checking the bone segments..."))
+        self.lastSegmentQuality = self.assessSegments(nodes)
         report(100, _("Done."))
         return nodes
 
@@ -5783,3 +5973,61 @@ class OsteotomyCutsTest(ScriptedLoadableModuleTest):
         withPiece = next(mesh for mesh in kept if mesh.GetBounds()[1] > 20.0 and mesh.GetBounds()[0] < 0.0)
         self.assertEqual(withPiece.GetNumberOfPoints(), left.GetNumberOfPoints() + piece.GetNumberOfPoints())
         self.assertEqual(logic._connectedRegions(withPiece)[3], 2)
+
+    #
+    # Release Part 2: model quality
+    #
+
+    def test_assessModel(self):
+        """Closed, holed, crossing, several pieces and internal surfaces are told apart."""
+        logic = OsteotomyCutsLogic()
+        box = logic.assessModel(self._box())
+        self.assertTrue(box.isClosed)
+        self.assertEqual((box.pieceCount, box.enclosedShellCount), (1, 0))
+
+        holed = logic.assessModel(self._holedSphere(20.0, 2.0))
+        self.assertFalse(holed.isClosed)
+        self.assertGreater(holed.openEdges, 0)
+
+        marrow = logic.assessModel(self._boxWithMarrow())
+        self.assertTrue(marrow.isClosed)
+        self.assertEqual((marrow.pieceCount, marrow.enclosedShellCount), (2, 1))
+
+        apart = logic.assessModel(self._append(self._sphere(10.0), self._sphere(10.0, centre=(30.0, 0.0, 0.0))))
+        self.assertEqual((apart.pieceCount, apart.enclosedShellCount), (2, 0))
+
+        # Three triangles on one edge: surfaces crossing
+        fan = vtk.vtkPolyData()
+        points = vtk.vtkPoints()
+        for point in ((0, 0, 0), (0, 0, 1), (1, 0, 0), (0, 1, 0), (-1, 0, 0)):
+            points.InsertNextPoint(point)
+        fan.SetPoints(points)
+        cells = vtk.vtkCellArray()
+        for third in (2, 3, 4):
+            cells.InsertNextCell(3, [0, 1, third])
+        fan.SetPolys(cells)
+        self.assertGreater(logic.assessModel(fan).nonManifoldEdges, 0)
+
+    def test_assessSegments(self):
+        """Bone segments are marked closed or not, with their volume."""
+        logic = OsteotomyCutsLogic()
+        model = self._addModel(self._box(), "Box")
+        parameterNode = self._configure(model, self._addCurve(self.X_CUT_PATH, "CutA"))
+        nodes = logic.applyCut(parameterNode)
+        self.assertEqual([result.isClosed for result in logic.lastSegmentQuality], [True, True])
+        self.assertAlmostEqual(sum(result.volume for result in logic.lastSegmentQuality), 1e6, delta=10.0)
+        for node, result in zip(nodes, logic.lastSegmentQuality):
+            self.assertEqual(node.GetAttribute("OsteotomyCuts.Watertight"), "true")
+            self.assertAlmostEqual(float(node.GetAttribute("OsteotomyCuts.Volume_mm3")), result.volume, delta=0.1)
+            self.assertEqual(result.name, node.GetName())
+
+        parameterNode.options.capCutFaces = False
+        nodes = logic.applyCut(parameterNode)
+        self.assertEqual([result.isClosed for result in logic.lastSegmentQuality], [False, False])
+        self.assertEqual({node.GetAttribute("OsteotomyCuts.Watertight") for node in nodes}, {"false"})
+
+        # A model made solid for the cut is not checked (it is closed); a hollow one is
+        parameterNode.treatBoneAsSolid = True
+        self.assertIsNone(logic.assessModelToCut(parameterNode))
+        parameterNode.treatBoneAsSolid = False
+        self.assertTrue(logic.assessModelToCut(parameterNode).isClosed)
