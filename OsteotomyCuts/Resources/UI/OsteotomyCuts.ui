@@ -102,13 +102,45 @@
        </widget>
       </item>
       <item row="3" column="0">
+       <widget class="QLabel" name="groupLinesLabel">
+        <property name="text">
+         <string>Further lines:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="3" column="1">
+       <widget class="qMRMLCheckableNodeComboBox" name="groupLinesSelector">
+        <property name="toolTip">
+         <string>Other cut paths cut together with this one in one step, as one osteotomy (e.g. the pterygomaxillary cuts of a Le Fort I). They are cut in the order they are ticked, after the first line; each later line only cuts on its own side of the earlier lines, so it stops where it meets them. Each line keeps its own direction and saw settings: select it as the cut path to set them.</string>
+        </property>
+        <property name="nodeTypes">
+         <stringlist notr="true">
+          <string>vtkMRMLMarkupsCurveNode</string>
+         </stringlist>
+        </property>
+        <property name="showChildNodeTypes">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item row="4" column="0" colspan="2">
+       <widget class="QLabel" name="groupOrderLabel">
+        <property name="text">
+         <string/>
+        </property>
+        <property name="wordWrap">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item row="5" column="0">
        <widget class="QLabel" name="snapToSurfaceLabel">
         <property name="text">
          <string>Snap to surface:</string>
         </property>
        </widget>
       </item>
-      <item row="3" column="1">
+      <item row="5" column="1">
        <widget class="QCheckBox" name="snapToSurfaceCheckBox">
         <property name="toolTip">
          <string>Keep the cut path points on the surface of the model to cut.</string>
@@ -118,14 +150,14 @@
         </property>
        </widget>
       </item>
-      <item row="4" column="0">
+      <item row="6" column="0">
        <widget class="QLabel" name="treatBoneAsSolidLabel">
         <property name="text">
          <string>Treat bone as solid:</string>
         </property>
        </widget>
       </item>
-      <item row="4" column="1">
+      <item row="6" column="1">
        <widget class="QCheckBox" name="treatBoneAsSolidCheckBox">
         <property name="toolTip">
          <string>Cut a solid version of the bone: holes in the surface are sealed and internal surfaces (marrow, canals, inner side of the cortex) are filled, so that the cut separates the bone cleanly into closed segments. The surface is rebuilt at the solid model detail (Advanced), which moves it by about that much. The first cut of a model takes a few seconds longer. Models made with "Create solid bone model" and segments of a solid cut are used as they are.</string>
@@ -135,7 +167,7 @@
         </property>
        </widget>
       </item>
-      <item row="5" column="1">
+      <item row="7" column="1">
        <widget class="QPushButton" name="createSolidButton">
         <property name="toolTip">
          <string>Create a solid copy of the model to cut (named "..._solid"), seal its holes and fill its internal surfaces, and select it for cutting. The original model is hidden, not changed.</string>
@@ -732,6 +764,12 @@
    <sender>OsteotomyCuts</sender>
    <signal>mrmlSceneChanged(vtkMRMLScene*)</signal>
    <receiver>mergeFragmentsSelector</receiver>
+   <slot>setMRMLScene(vtkMRMLScene*)</slot>
+  </connection>
+  <connection>
+   <sender>OsteotomyCuts</sender>
+   <signal>mrmlSceneChanged(vtkMRMLScene*)</signal>
+   <receiver>groupLinesSelector</receiver>
    <slot>setMRMLScene(vtkMRMLScene*)</slot>
   </connection>
   <connection>

@@ -22,9 +22,10 @@ exitCode = 1
 try:
     from OsteotomyCuts import CutOptions, OsteotomyCutsLogic
 
-    path = os.path.join(FOLDER, "Mandible_solid.stl")
-    if not FOLDER or not os.path.exists(path):
-        print("Set OSTEOTOMYCUTS_MODELS to a folder holding Mandible_solid.stl: skipped.")
+    path = next((os.path.join(FOLDER, name) for name in ("Mandible_solid.stl", "Mandible.stl")
+                 if FOLDER and os.path.exists(os.path.join(FOLDER, name))), "")
+    if not path:
+        print("Set OSTEOTOMYCUTS_MODELS to a folder holding Mandible.stl: skipped.")
         exitCode = 0
         raise SystemExit
 

@@ -38,6 +38,15 @@ Build one phase at a time. Design each so later phases need no rewrite.
   solid bone model", treatBoneAsSolid on by default), AWAITING the user's
   Slicer test. Deviation from the plan: all pieces >= 1% of the largest are
   kept (not only the largest), so separate bones / both canals survive.
+  Part 0d added and done 2026-09-28 (user: needed for release 1): several
+  cut paths cut together as one osteotomy ("Further lines", node refs
+  OsteotomyCuts.GroupLine on the first line); each later line only cuts on
+  its own side of earlier lines (stops at them); per-line settings stored
+  on each curve (attribute OsteotomyCuts.LineSettings + DirectionLine ref).
+  Tried by the user on a skull (Le Fort I works; a new line inherited the
+  first line's depth -> fixed: new lines start with depth/reach/direction
+  reset). Release 1 must have (user, 2026-09-28): solid bone, multi-line
+  osteotomy, capping check + warning, surgeon wording, nerve/teeth warnings.
   NEXT: Part 2 (model quality warnings), then Parts 3-10 in order. The full
   approved plan (Parts 0-10, with details per part) is in the user's
   Claude plans folder: twinkly-brewing-phoenix.md.

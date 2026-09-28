@@ -1,4 +1,5 @@
 import enum
+import json
 import logging
 from dataclasses import dataclass
 from typing import Annotated, Callable, Optional
@@ -52,11 +53,22 @@ where bone must stay intact (e.g. the skull base behind a maxilla), limit the cu
 the first and last points of the cut path, in a gap between bones (the cut must leave the bone
 there).
 
-Example, Le Fort I on a skull model: place the cut path points from one zygomatic buttress
-round the anterior maxilla to the other, above the tooth apices. Look at the skull from the
-front and capture the view direction (the cut runs backwards). Set the cut depth to about
-45-55 mm (to the pterygoid plates), "Past line ends" to 5-10 mm, and a kerf of 0.5-1.0 mm.
-Check that the red lines stay on the maxilla, then apply the cut.
+Several cut paths can be cut together in one step as one osteotomy ("Further lines"). They are
+cut in order; each later line only cuts on its own side of the earlier lines, so it stops where
+it meets them. Each line keeps its own direction and saw settings: select it as the cut path to
+see or change them.
+
+Example, Le Fort I on a skull model (two lines):
+1. Horizontal line: place the cut path points from one zygomatic buttress round the anterior
+maxilla to the other, above the tooth apices. Look at the skull from the front and capture the
+view direction (the cut runs backwards). Set the cut depth to about 45-55 mm (to the pterygoid
+plates), "Past line ends" to 5-10 mm, and a kerf of 0.5-1.0 mm.
+2. Pterygomaxillary line: create a second cut path and place its points on the side of the
+maxilla behind the tuberosity, from the horizontal line downwards. Look at the skull from the
+side and capture the view direction (it cuts both sides). Leave the cut depth and "Past line
+ends" at 0: it stops at the horizontal cut, so the bone above is not cut.
+3. Select the horizontal line again and tick the second line under "Further lines". Check that
+the red lines stay on the maxilla, then apply the cut.
 """)
         self.parent.acknowledgementText = _("""
 Based on the 3D Slicer scripted module template developed by Jean-Christophe Fillion-Robin,
@@ -90,6 +102,21 @@ CURVE_REFERENCE_ROLE = "OsteotomyCuts.Curve"  # fragment -> curve that produced 
 # Model node attribute ("1") marking a solid bone model: made by "Create solid bone model", or a
 # capped bone segment cut from a solid model. Such models are cut as they are.
 SOLID_ATTRIBUTE = "OsteotomyCuts.Solid"
+
+
+class StopConflictError(ValueError):
+    """A later line of an osteotomy meets bone across an earlier line, outside that line's cut."""
+
+
+# Temporary integer point array: points a later osteotomy line must not remove (beyond an
+# earlier line it stops at)
+STOP_PROTECTED_ARRAY = "StopProtected"
+
+# Cut path attribute holding its own settings (JSON: direction and cut options), and node
+# reference roles of a cut path: its direction line, and the further lines of its osteotomy
+LINE_SETTINGS_ATTRIBUTE = "OsteotomyCuts.LineSettings"
+DIRECTION_LINE_REFERENCE_ROLE = "OsteotomyCuts.DirectionLine"
+GROUP_LINE_REFERENCE_ROLE = "OsteotomyCuts.GroupLine"
 
 
 def importNdimage():
@@ -147,6 +174,27 @@ class FragmentPiece:
     hostComponentId: int  # component enclosing that component, or -1 if free-standing
     sideSignature: tuple[int, ...]  # +1 / -1 side of each cutting sheet
     pointCount: int
+
+
+@dataclass
+class LineSettings:
+    """Direction and cut options of one osteotomy line (cut path)."""
+
+    directionMode: DirectionMode
+    viewDirection: tuple[float, float, float]
+    directionLine: Optional[vtkMRMLMarkupsLineNode]
+    options: CutOptions
+
+
+@dataclass
+class OsteotomyLine:
+    """One line of an osteotomy, ready to cut: its sheet, options and the earlier lines it
+    stops at ((earlier sheet, side) pairs)."""
+
+    curve: vtkMRMLMarkupsCurveNode
+    sheet: vtk.vtkPolyData
+    options: CutOptions
+    stops: list
 
 
 class SheetParameterisation:
@@ -555,6 +603,7 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._previewTimer = None  # throttles sheet preview rebuilds while points are dragged
         self._snapping = False  # guards against reacting to our own snapping edits
         self._reconnectAfterImport = False  # GUI was connected when a scene import started
+        self._currentLineId = None  # cut path whose settings the GUI shows (saved to it on edits)
 
     def setup(self) -> None:
         """Called when the user opens the module the first time and the widget is initialised."""
@@ -588,6 +637,7 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.ui.undoButton.connect("clicked(bool)", self.onUndoButton)
         self.ui.mergeButton.connect("clicked(bool)", self.onMergeButton)
         self.ui.mergeFragmentsSelector.connect("checkedNodesChanged()", self._updateMergeButton)
+        self.ui.groupLinesSelector.connect("checkedNodesChanged()", self.onGroupLinesChanged)
         self.ui.sheetOpacitySliderWidget.connect("valueChanged(double)", self._applySheetOpacity)
 
         self._previewTimer = qt.QTimer()
@@ -660,6 +710,7 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                                     self._updateGuiFromParameterNode)
         self._observeMarkupsNodes([])
         self._parameterNode = inputParameterNode
+        self._currentLineId = None
         if self._parameterNode:
             # Widgets with a "SlicerParameterName" property in the .ui file are connected here
             self._parameterNodeGuiTag = self._parameterNode.connectGui(self.ui)
@@ -679,6 +730,7 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         """Update the widgets that are not connected automatically by the parameter node wrapper."""
         if not self._parameterNode:
             return
+        self._syncLineSettings()
 
         isLineMode = self._parameterNode.directionMode == DirectionMode.LINE
         for radioButton, checked in ((self.ui.directionLineRadioButton, isLineMode),
@@ -697,9 +749,63 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         else:
             self.ui.viewDirectionLabel.text = "({:.2f}, {:.2f}, {:.2f})".format(*viewDirection)
 
-        self._observeMarkupsNodes([self._parameterNode.cutCurve, self._parameterNode.directionLine])
+        self._observeMarkupsNodes(self.logic.getOsteotomyLines(self._parameterNode.cutCurve)
+                                  + [self._parameterNode.directionLine])
         self._updateActionState()
         self._schedulePreview()
+
+    def _syncLineSettings(self) -> None:
+        """Each cut path keeps its own direction and saw settings: show them when another path
+        is selected, and save edits to the selected one."""
+        curveNode = self._parameterNode.cutCurve
+        curveId = curveNode.GetID() if curveNode is not None else None
+        if curveId != self._currentLineId:
+            self._currentLineId = curveId
+            if curveNode is not None:
+                self.logic.loadLineSettings(self._parameterNode)  # re-enters with the same path
+            self._updateGroupSelector()
+        elif curveNode is not None:
+            self.logic.storeLineSettings(self._parameterNode)
+
+    def _updateGroupSelector(self) -> None:
+        """Tick the further lines of the selected path's osteotomy and show the order."""
+        curveNode = self._parameterNode.cutCurve if self._parameterNode else None
+        firstLine = self.logic.findFirstLine(curveNode)
+        lines = self.logic.getOsteotomyLines(curveNode)
+        groupIds = {line.GetID() for line in lines[1:]}
+        combo = self.ui.groupLinesSelector
+        wasBlocked = combo.blockSignals(True)
+        for index in range(combo.nodeCount()):
+            node = combo.nodeFromIndex(index)
+            combo.setCheckState(node, qt.Qt.Checked if node.GetID() in groupIds else qt.Qt.Unchecked)
+        combo.blockSignals(wasBlocked)
+        combo.enabled = firstLine is not None
+        if firstLine is None:
+            text = ""
+        elif len(lines) == 1:
+            text = _("Single line. Tick further lines to cut them together with this one in one step.")
+        else:
+            order = ", ".join(f"{index + 1}. {line.GetName()}" for index, line in enumerate(lines))
+            text = _("Cut together, in this order: {order}. Each later line stops where it meets an earlier "
+                     "one. Direction and saw settings below belong to the selected line, {line}.").format(
+                order=order, line=curveNode.GetName())
+        self.ui.groupOrderLabel.text = text
+
+    def onGroupLinesChanged(self) -> None:
+        """Store the ticked further lines of the osteotomy, keeping the order they were ticked in."""
+        parameterNode = self._parameterNode
+        if not parameterNode or parameterNode.cutCurve is None:
+            return
+        firstLine = self.logic.findFirstLine(parameterNode.cutCurve)
+        checked = [node for node in self.ui.groupLinesSelector.checkedNodes() if node.GetID() != firstLine.GetID()]
+        checkedIds = {node.GetID() for node in checked}
+        current = self.logic.getGroupLines(firstLine)
+        currentIds = {node.GetID() for node in current}
+        ordered = ([node for node in current if node.GetID() in checkedIds]
+                   + [node for node in checked if node.GetID() not in currentIds])
+        self.logic.setGroupLines(firstLine, ordered)
+        self._updateGroupSelector()
+        self._updateGuiFromParameterNode()
 
     def _onMarkupsModified(self, caller=None, event=None) -> None:
         """Points of the cut path or direction line changed."""
@@ -710,12 +816,12 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         """After a point is placed or dragged, put the cut path back on the model surface."""
         parameterNode = self._parameterNode
         if (self._snapping or not parameterNode or not parameterNode.snapToSurface
-                or parameterNode.inputModel is None or parameterNode.cutCurve is None
-                or caller is None or caller.GetID() != parameterNode.cutCurve.GetID()):
+                or parameterNode.inputModel is None or parameterNode.cutCurve is None or caller is None
+                or caller.GetID() not in {line.GetID() for line in self.logic.getOsteotomyLines(parameterNode.cutCurve)}):
             return
         self._snapping = True
         try:
-            self.logic.snapCurveToSurface(parameterNode.cutCurve, parameterNode.inputModel)
+            self.logic.snapCurveToSurface(caller, parameterNode.inputModel)
         except ValueError:
             pass  # empty model or non-linear transform: validateInputs already reports it
         finally:
@@ -751,7 +857,8 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                                              and not self.logic.isSolidModel(inputModel))
         self.ui.applyButton.enabled = reason is None
         self.ui.applyButton.toolTip = reason or _("Cut the model along the cutting sheet.")
-        self.ui.undoButton.enabled = bool(self.logic.getCurveResult(self._parameterNode.cutCurve))
+        self.ui.undoButton.enabled = bool(self.logic.getCurveResult(
+            self.logic.findFirstLine(self._parameterNode.cutCurve)))
         self.ui.statusLabel.text = reason or self._resultMessage or _("Ready to cut.")
         self._updateMergeButton()
 
@@ -833,7 +940,7 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     def onUndoButton(self) -> None:
         """Remove the fragments of the selected cut path and show its input model again."""
         with slicer.util.tryWithErrorDisplay(_("Failed to undo the cut."), waitCursor=True):
-            self.logic.removeCutResult(self._requireParameterNode().cutCurve)
+            self.logic.removeCutResult(self.logic.findFirstLine(self._requireParameterNode().cutCurve))
             self._resultMessage = _("Cut undone.")
         self._updateActionState()
 
@@ -1217,7 +1324,8 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
                 self._ensureTriangles(clipper.GetClippedOutput()))
 
     def removeKerf(self, polyWithDistance: vtk.vtkPolyData, sheetPolyData: vtk.vtkPolyData, kerfWidth: float,
-                   arrayName: str = "SheetDistance") -> tuple[vtk.vtkPolyData, bool]:
+                   arrayName: str = "SheetDistance",
+                   protectedName: Optional[str] = None) -> tuple[vtk.vtkPolyData, bool]:
         """Remove the material the saw blade takes away: everything closer than kerfWidth / 2 to
         the sheet (unsigned distance).
 
@@ -1235,8 +1343,13 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         :param kerfWidth: saw blade width (mm), > 0.
         :param arrayName: name of the signed distance array; it is kept in the output (exactly
             +/- kerfWidth / 2 at the crossing points).
+        :param protectedName: optional integer point array, non-zero at points that are never
+            removed (beyond an earlier line of the osteotomy that this line stops at). Such
+            points may border removed ones only across an earlier kerf gap, which holds no mesh.
         :return: (remaining triangle mesh, whether any material was removed).
-        :raises ValueError: for a non-positive kerf width.
+        :raises ValueError: for a non-positive kerf width, or StopConflictError if a removed
+            point shares an edge with a protected point inside the kerf (the line meets bone
+            across an earlier line outside that line's cut).
         """
         if not kerfWidth > 0:
             raise ValueError(_("The kerf width must be positive."))
@@ -1249,11 +1362,21 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         signed[onSurface] = np.where(signed[onSurface] >= 0, halfKerf, -halfKerf)
         arrays[arrayName] = (signed.astype(arrays[arrayName][0].dtype), arrays[arrayName][1])
         keep = np.abs(signed) >= halfKerf
+        triangles = numpy_support.vtk_to_numpy(mesh.GetPolys().GetConnectivityArray()).reshape(-1, 3).astype(np.int64)
+        if protectedName is not None and protectedName in arrays:
+            protected = arrays[protectedName][0] != 0
+            blocked = protected & ~keep  # inside the kerf, but beyond an earlier line
+            if np.any(blocked):
+                removed = ~keep & ~protected
+                for a, b in ((0, 1), (1, 2), (2, 0)):
+                    if np.any((removed[triangles[:, a]] & blocked[triangles[:, b]])
+                              | (blocked[triangles[:, a]] & removed[triangles[:, b]])):
+                        raise StopConflictError()
+            keep = keep | protected
         if np.all(keep):
             return mesh, False
 
         points = numpy_support.vtk_to_numpy(mesh.GetPoints().GetData()).astype(float)
-        triangles = numpy_support.vtk_to_numpy(mesh.GetPolys().GetConnectivityArray()).reshape(-1, 3).astype(np.int64)
         pointCount = len(points)
         keptCorners = keep[triangles]
         keptCounts = keptCorners.sum(axis=1)
@@ -2044,21 +2167,67 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         return options.depth > 0 or options.endExtension > 0
 
     @classmethod
-    def effectiveKerfWidth(cls, options: CutOptions) -> float:
+    def effectiveKerfWidth(cls, options: CutOptions, stopped: bool = False) -> float:
         """Width of bone removed: options.kerfWidth, or LIMITED_IDEAL_KERF_WIDTH for a limited
-        cut with the ideal blade (kerf 0), so that the cut ends where the sheet ends."""
-        if options.kerfWidth > 0 or not cls.isLimitedCut(options):
+        cut with the ideal blade (kerf 0), so that the cut ends where the sheet ends. A line
+        that stops at earlier lines of its osteotomy (stopped) is limited too."""
+        if options.kerfWidth > 0 or not (stopped or cls.isLimitedCut(options)):
             return float(options.kerfWidth)
         return cls.LIMITED_IDEAL_KERF_WIDTH
 
     @classmethod
-    def effectiveRefineEdgeLength(cls, options: CutOptions) -> float:
+    def effectiveRefineEdgeLength(cls, options: CutOptions, stopped: bool = False) -> float:
         """Maximum edge length near the sheet: options.refineEdgeLength, or half the effective
         kerf width when that is 0 (automatic). 0 means no refinement (zero kerf, no explicit
         length)."""
         if options.refineEdgeLength > 0:
             return float(options.refineEdgeLength)
-        return cls.effectiveKerfWidth(options) / 2.0
+        return cls.effectiveKerfWidth(options, stopped) / 2.0
+
+    @staticmethod
+    def stopSides(pathPoints: np.ndarray, earlierSheets: list[vtk.vtkPolyData]) -> list[float]:
+        """Side (+1 / -1) of each earlier sheet on which a later line of the osteotomy lies.
+
+        The path is sampled about every millimetre and the median signed distance decides, so
+        that points placed on an earlier line (distance 0) do not matter.
+
+        :param pathPoints: (N, 3) points of the later line.
+        :param earlierSheets: sheets of the earlier lines.
+        :return: one side per earlier sheet.
+        :raises ValueError: if the line lies on an earlier sheet.
+        """
+        points = np.asarray(pathPoints, dtype=float)
+        samples = [points[:1]]
+        for start, end in zip(points[:-1], points[1:]):
+            count = max(1, int(np.ceil(np.linalg.norm(end - start))))
+            samples.append(start + np.outer(np.arange(1, count + 1) / count, end - start))
+        samples = np.vstack(samples)
+        sides = []
+        for index, sheet in enumerate(earlierSheets):
+            implicitDistance = vtk.vtkImplicitPolyDataDistance()
+            implicitDistance.SetInput(sheet)
+            values = vtk.vtkDoubleArray()
+            implicitDistance.FunctionValue(numpy_support.numpy_to_vtk(samples, deep=True), values)
+            median = float(np.median(numpy_support.vtk_to_numpy(values)))
+            if abs(median) < 1e-6:
+                raise ValueError(_("A later osteotomy line lies on line {index}: move it to one side of that "
+                                   "line.").format(index=index + 1))
+            sides.append(1.0 if median > 0 else -1.0)
+        return sides
+
+    @staticmethod
+    def protectedByStops(points: np.ndarray, stops: list[tuple[vtk.vtkPolyData, float]]) -> np.ndarray:
+        """Boolean mask of the points on the far side of any stop (earlier sheet, side): a later
+        line of an osteotomy does not cut there."""
+        protected = np.zeros(len(points), dtype=bool)
+        for stopSheet, side in stops:
+            implicitDistance = vtk.vtkImplicitPolyDataDistance()
+            implicitDistance.SetInput(stopSheet)
+            values = vtk.vtkDoubleArray()
+            implicitDistance.FunctionValue(numpy_support.numpy_to_vtk(np.ascontiguousarray(points, dtype=float),
+                                                                      deep=True), values)
+            protected |= side * numpy_support.vtk_to_numpy(values) < 0
+        return protected
 
     def refineNearSheet(self, polyWithDistance: vtk.vtkPolyData, sheetPolyData: vtk.vtkPolyData,
                         maxEdgeLength: float, bandWidth: float,
@@ -2352,8 +2521,9 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         return fragments
 
     def cutPolyData(self, polyData: vtk.vtkPolyData, sheets: list[vtk.vtkPolyData],
-                    options: CutOptions,
-                    progressCallback: Optional[ProgressCallback] = None) -> list[vtk.vtkPolyData]:
+                    options: CutOptions | list[CutOptions],
+                    progressCallback: Optional[ProgressCallback] = None,
+                    stops: Optional[list[list[tuple[vtk.vtkPolyData, float]]]] = None) -> list[vtk.vtkPolyData]:
         """Cut a mesh with one or more sheets into separate fragments (headless core).
 
         Each sheet is applied in turn to every current piece, then the pieces are split into
@@ -2371,49 +2541,71 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         A groove left by a depth-limited cut is lined the same way, walls and rounded floor.
         Fragments then get display normals split at sharp edges (computeDisplayNormals).
 
+        Several lines of one osteotomy are cut together with ``stops``: a later line only removes
+        bone on the side of each earlier line where its own points lie (stopSides), so that e.g.
+        the pterygomaxillary cut of a Le Fort I ends at the horizontal cut. The earlier line's
+        kerf gap holds no mesh, so this never splits a triangle and the caps are unchanged. A
+        line with stops always uses a kerf (effectiveKerfWidth).
+
         :param polyData: model mesh in world coordinates.
-        :param sheets: cutting sheets from buildSheetPolyData.
-        :param options: cut options.
+        :param sheets: cutting sheets from buildSheetPolyData, applied in this order.
+        :param options: cut options, one for all sheets or one per sheet. The first gives the
+            minimum fragment size.
         :param progressCallback: called with (percent, message) between stages.
+        :param stops: per sheet, the (earlier sheet, side) pairs it stops at (empty for the
+            first line); None for no stops.
         :return: fragment meshes, largest first. A depth-limited kerf cut may leave one
             fragment (a groove).
         :raises ValueError: if there is no sheet, the mesh has no polygons, a kerf sheet does
             not reach the model, or a kerf sheet ends inside the model beyond its path ends
-            (sheetEndsInModel: the rounded ends of such a slot cannot be capped yet).
+            (sheetEndsInModel: the rounded ends of such a slot cannot be capped yet), or a
+            line meets bone across an earlier line outside that line's cut.
         """
         report = progressCallback or (lambda percent, message: None)
         if not sheets:
             raise ValueError(_("At least one cutting sheet is needed."))
+        optionsList = list(options) if isinstance(options, (list, tuple)) else [options] * len(sheets)
+        stopsList = list(stops) if stops is not None else [[] for _sheet in sheets]
+        if len(optionsList) != len(sheets) or len(stopsList) != len(sheets):
+            raise ValueError(_("One set of options and stops is needed per cutting sheet."))
         # A fragment of an earlier cut has duplicate points along sharp edges (display normals)
         triangles = self.mergeCoincidentPoints(self._ensureTriangles(polyData))
         if triangles.GetNumberOfCells() == 0:
             raise ValueError(_("The model has no surface polygons to cut."))
-        cap = options.capCutFaces
-        kerfWidth = self.effectiveKerfWidth(options)
-        halfKerf = kerfWidth / 2.0
+        kerfWidths = [self.effectiveKerfWidth(o, bool(s)) for o, s in zip(optionsList, stopsList)]
         uncapped = 0
 
-        if kerfWidth > 0:
+        endsMessage = _("Osteotomy line {index}: the cut ends inside the bone beyond the ends of the line. Increase "
+                        "\"Past line ends\" until the red outline of the preview no longer ends on the bone, or set "
+                        "it to 0.")
+        if any(width > 0 and not sheetStops for width, sheetStops in zip(kerfWidths, stopsList)):
             locator = vtk.vtkCellLocator()
             locator.SetDataSet(triangles)
             locator.BuildLocator()
             for sheetIndex, sheet in enumerate(sheets):
-                if self.sheetEndsInModel(triangles, sheet, kerfWidth, locator):
-                    raise ValueError(_("Osteotomy line {index}: the cut ends inside the bone beyond the ends of "
-                                       "the line. Increase \"Past line ends\" until the red outline of the preview "
-                                       "no longer ends on the bone, or set it to 0.").format(index=sheetIndex + 1))
+                if kerfWidths[sheetIndex] > 0 and not stopsList[sheetIndex] and self.sheetEndsInModel(
+                        triangles, sheet, kerfWidths[sheetIndex], locator):
+                    raise ValueError(endsMessage.format(index=sheetIndex + 1))
 
         report(5, _("Finding internal shells..."))
-        labelled = self.labelEnclosedComponents(triangles, options.minFragmentFraction)
+        labelled = self.labelEnclosedComponents(triangles, optionsList[0].minFragmentFraction)
         sides = [(labelled, ())]
         for sheetIndex, sheet in enumerate(sheets):
             report(15 + int(60 * sheetIndex / len(sheets)), _("Cutting..."))
+            sheetOptions, sheetStops = optionsList[sheetIndex], stopsList[sheetIndex]
+            kerfWidth = kerfWidths[sheetIndex]
+            halfKerf = kerfWidth / 2.0
+            cap = sheetOptions.capCutFaces
+            if sheetStops:  # the ends are checked on the pieces left by the earlier lines
+                for mesh, _signature in sides:
+                    if self.sheetEndsInModel(mesh, sheet, kerfWidth, stops=sheetStops):
+                        raise ValueError(endsMessage.format(index=sheetIndex + 1))
             nextSides = []
             removedAny = False
             sheetMap = SheetParameterisation(sheet, halfKerf) if cap else None
             for mesh, signature in sides:
                 withDistance = self.computeSheetDistance(mesh, sheet)
-                maxEdgeLength = self.effectiveRefineEdgeLength(options)
+                maxEdgeLength = self.effectiveRefineEdgeLength(sheetOptions, bool(sheetStops))
                 if maxEdgeLength > 0:
                     withDistance = self.refineNearSheet(withDistance, sheet, maxEdgeLength,
                                                         halfKerf + maxEdgeLength)
@@ -2422,7 +2614,22 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
                     sideArray.DeepCopy(withDistance.GetPointData().GetArray("SheetDistance"))
                     sideArray.SetName(f"{SHEET_SIDE_PREFIX}{sheetIndex}")
                     withDistance.GetPointData().AddArray(sideArray)
-                    remaining, removed = self.removeKerf(withDistance, sheet, kerfWidth)
+                    protectedName = None
+                    if sheetStops:
+                        protectedName = STOP_PROTECTED_ARRAY
+                        meshPoints = numpy_support.vtk_to_numpy(withDistance.GetPoints().GetData())
+                        self._addIntPointArray(withDistance, protectedName,
+                                               self.protectedByStops(meshPoints, sheetStops))
+                    try:
+                        remaining, removed = self.removeKerf(withDistance, sheet, kerfWidth,
+                                                             protectedName=protectedName)
+                    except StopConflictError:
+                        raise ValueError(_("Osteotomy line {index} reaches bone on the far side of an earlier line, "
+                                           "beyond the end of that line's cut. Make the earlier line deeper (cut "
+                                           "depth) or longer (past line ends), or move line {index} so that it meets "
+                                           "the earlier cut.").format(index=sheetIndex + 1))
+                    if protectedName:
+                        remaining.GetPointData().RemoveArray(protectedName)
                     removedAny = removedAny or removed
                     if cap and removed:
                         remaining, failed = self.capCutFaces(remaining, sheetMap)
@@ -2430,7 +2637,7 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
                     if remaining.GetNumberOfCells() > 0:
                         nextSides.append((remaining, signature))
                     continue
-                positive, negative = self.splitByDistance(withDistance, options)
+                positive, negative = self.splitByDistance(withDistance, sheetOptions)
                 for part, side in ((positive, 1), (negative, -1)):
                     if part.GetNumberOfCells() > 0:
                         if cap:
@@ -2446,7 +2653,7 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         pieces = []
         for mesh, signature in sides:
             pieces.extend(self.extractFragments(mesh, signature))
-        fragments = self.mergeEnclosedPieces(pieces, options.minFragmentFraction * labelled.GetNumberOfPoints())
+        fragments = self.mergeEnclosedPieces(pieces, optionsList[0].minFragmentFraction * labelled.GetNumberOfPoints())
 
         for fragment in fragments:
             sideArrays = [f"{SHEET_SIDE_PREFIX}{i}" for i in self._sheetSideIndices(fragment)]
@@ -2455,7 +2662,7 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         if uncapped:
             logging.warning(f"OsteotomyCuts: {uncapped} cut face(s) could not be capped; "
                             "the fragments are not watertight there.")
-        if cap:
+        if any(o.capCutFaces for o in optionsList):
             fragments = [self.computeDisplayNormals(fragment) for fragment in fragments]
         return fragments
 
@@ -2476,7 +2683,8 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         return result
 
     def sheetEndsInModel(self, polyData: vtk.vtkPolyData, sheetPolyData: vtk.vtkPolyData, kerfWidth: float,
-                         locator: Optional[vtk.vtkCellLocator] = None) -> bool:
+                         locator: Optional[vtk.vtkCellLocator] = None,
+                         stops: Optional[list[tuple[vtk.vtkPolyData, float]]] = None) -> bool:
         """Return True if an end of an open sheet lies in the model, so that a kerf cut would
         end inside the bone beyond the path ends (a slot).
 
@@ -2489,6 +2697,8 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         :param sheetPolyData: cutting sheet from buildSheetPolyData.
         :param kerfWidth: width of bone removed (mm).
         :param locator: vtkCellLocator built on polyData; built here if None.
+        :param stops: (earlier sheet, side) pairs of an osteotomy line that stops at earlier
+            lines: end samples, and model points found, beyond a stop are ignored.
         :return: False for a closed sheet or ends clear of the model.
         """
         sheetPoints = numpy_support.vtk_to_numpy(sheetPolyData.GetPoints().GetData()).astype(float)
@@ -2506,13 +2716,19 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         for pair in (0, pairCount - 1):
             start, end = sheetPoints[2 * pair], sheetPoints[2 * pair + 1]
             count = int(np.ceil(np.linalg.norm(end - start) / halfKerf)) + 1
-            for point in np.linspace(start, end, count):
+            samples = np.linspace(start, end, count)
+            if stops:
+                samples = samples[~self.protectedByStops(samples, stops)]
+            for point in samples:
                 if locator.FindClosestPointWithinRadius(point.tolist(), radius, closest, cellId, subId, distance2):
+                    if stops and self.protectedByStops(np.array([closest]), stops)[0]:
+                        continue  # bone beyond an earlier line: this line does not cut it
                     return True
         return False
 
     def computeCutOutline(self, polyData: vtk.vtkPolyData, sheetPolyData: vtk.vtkPolyData,
-                          locator: Optional[vtk.vtkStaticCellLocator] = None) -> vtk.vtkPolyData:
+                          locator: Optional[vtk.vtkStaticCellLocator] = None,
+                          stops: Optional[list[tuple[vtk.vtkPolyData, float]]] = None) -> vtk.vtkPolyData:
         """Return the lines where the cutting sheet meets the model surface (cut outline).
 
         Exact triangle-triangle intersection: for each sheet triangle, the model triangles
@@ -2523,6 +2739,8 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         :param polyData: triangulated model mesh in world coordinates.
         :param sheetPolyData: cutting sheet from buildSheetPolyData.
         :param locator: vtkStaticCellLocator built on polyData; built here if None.
+        :param stops: (earlier sheet, side) pairs of a later osteotomy line: segments beyond
+            them are left out, as the line does not cut there.
         :return: line segments on the model surface (no lines if the sheet misses the model).
         """
         empty = vtk.vtkPolyData()
@@ -2590,6 +2808,8 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
             segments.append(np.stack([first[keep] + low[keep, np.newaxis] * step[keep],
                                       first[keep] + high[keep, np.newaxis] * step[keep]], axis=1))
         segments = np.concatenate(segments) if segments else np.zeros((0, 2, 3))
+        if stops and len(segments) > 0:
+            segments = segments[~self.protectedByStops(segments.mean(axis=1), stops)]
         if len(segments) == 0:
             return empty
 
@@ -2863,6 +3083,160 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
             raise ValueError(_("Capture a view direction first."))
         return self._normalised(np.array(parameterNode.viewDirection), _("Capture a view direction first."))
 
+    #
+    # Osteotomy lines: settings per line, lines cut together (MRML)
+    #
+
+    # Fields of CutOptions stored with each line
+    LINE_OPTION_NAMES = ("extension", "minFragmentFraction", "kerfWidth", "depth", "endExtension", "capCutFaces",
+                         "refineEdgeLength")
+
+    def lineSettingsFromParameters(self, parameterNode: OsteotomyCutsParameterNode) -> LineSettings:
+        """The current direction and cut options of the parameter node (a copy)."""
+        options = CutOptions()
+        for name in self.LINE_OPTION_NAMES:
+            setattr(options, name, getattr(parameterNode.options, name))
+        return LineSettings(parameterNode.directionMode, tuple(float(c) for c in parameterNode.viewDirection),
+                            parameterNode.directionLine, options)
+
+    def getLineSettings(self, curveNode: vtkMRMLMarkupsCurveNode) -> Optional[LineSettings]:
+        """The settings stored on a cut path (storeLineSettings), or None if it has none."""
+        text = curveNode.GetAttribute(LINE_SETTINGS_ATTRIBUTE) if curveNode is not None else None
+        if not text:
+            return None
+        try:
+            stored = json.loads(text)
+            options = CutOptions()
+            for name, value in stored.get("options", {}).items():
+                if name in self.LINE_OPTION_NAMES:
+                    setattr(options, name, type(getattr(options, name))(value))
+            return LineSettings(DirectionMode(stored["directionMode"]),
+                                tuple(float(c) for c in stored["viewDirection"]),
+                                curveNode.GetNodeReference(DIRECTION_LINE_REFERENCE_ROLE), options)
+        except (ValueError, KeyError, TypeError) as error:
+            logging.warning(f"OsteotomyCuts: ignoring unreadable settings of {curveNode.GetName()}: {error}")
+            return None
+
+    def lineSettingsOf(self, curveNode: vtkMRMLMarkupsCurveNode,
+                       parameterNode: OsteotomyCutsParameterNode) -> Optional[LineSettings]:
+        """Settings of a line: the parameter node's for the selected cut path, otherwise those
+        stored on the line (None if it has none)."""
+        if parameterNode.cutCurve is not None and curveNode.GetID() == parameterNode.cutCurve.GetID():
+            return self.lineSettingsFromParameters(parameterNode)
+        return self.getLineSettings(curveNode)
+
+    def storeLineSettings(self, parameterNode: OsteotomyCutsParameterNode) -> None:
+        """Save the current direction and cut options on the selected cut path, so that each
+        line of an osteotomy keeps its own (saved with the scene)."""
+        curveNode = parameterNode.cutCurve
+        if curveNode is None:
+            return
+        settings = self.lineSettingsFromParameters(parameterNode)
+        text = json.dumps({"directionMode": settings.directionMode.value,
+                           "viewDirection": list(settings.viewDirection),
+                           "options": {name: getattr(settings.options, name) for name in self.LINE_OPTION_NAMES}},
+                          sort_keys=True)
+        if curveNode.GetAttribute(LINE_SETTINGS_ATTRIBUTE) != text:
+            curveNode.SetAttribute(LINE_SETTINGS_ATTRIBUTE, text)
+        lineId = settings.directionLine.GetID() if settings.directionLine is not None else None
+        if curveNode.GetNodeReferenceID(DIRECTION_LINE_REFERENCE_ROLE) != lineId:
+            curveNode.SetNodeReferenceID(DIRECTION_LINE_REFERENCE_ROLE, lineId)
+
+    def loadLineSettings(self, parameterNode: OsteotomyCutsParameterNode) -> bool:
+        """Show the settings stored on the selected cut path in the parameter node.
+
+        A path without stored settings keeps the current saw settings. If it has not cut
+        anything yet (a new line), its depth, reach past the ends and direction start afresh
+        (0, 0, not captured), as they belong to each line; a path that cut with the current
+        settings (a scene from an earlier version) keeps them all. They are then stored on it.
+
+        :return: True if the path had settings.
+        """
+        curveNode = parameterNode.cutCurve
+        settings = self.getLineSettings(curveNode) if curveNode is not None else None
+        rawNode = parameterNode.parameterNode
+        if settings is None:
+            if curveNode is not None and not self.getCurveResult(curveNode):
+                wasModifying = rawNode.StartModify()
+                try:
+                    parameterNode.options.depth = 0.0
+                    parameterNode.options.endExtension = 0.0
+                    parameterNode.viewDirection = NOT_CAPTURED
+                    parameterNode.directionLine = None
+                finally:
+                    rawNode.EndModify(wasModifying)
+            self.storeLineSettings(parameterNode)
+            return False
+        wasModifying = rawNode.StartModify()
+        try:
+            parameterNode.directionMode = settings.directionMode
+            parameterNode.viewDirection = settings.viewDirection
+            parameterNode.directionLine = settings.directionLine
+            for name in self.LINE_OPTION_NAMES:
+                value = getattr(settings.options, name)
+                if getattr(parameterNode.options, name) != value:
+                    setattr(parameterNode.options, name, value)
+        finally:
+            rawNode.EndModify(wasModifying)
+        return True
+
+    def resolveLineDirection(self, settings: LineSettings) -> np.ndarray:
+        """Extrusion direction of a line from its settings (as resolveDirection).
+
+        :raises ValueError: if the view direction is not captured or the line is invalid.
+        """
+        if settings.directionMode == DirectionMode.LINE:
+            if settings.directionLine is None:
+                raise ValueError(_("Select a direction line."))
+            return self.directionFromLine(settings.directionLine)
+        if not isDirectionCaptured(settings.viewDirection):
+            raise ValueError(_("Capture a view direction first."))
+        return self._normalised(np.array(settings.viewDirection), _("Capture a view direction first."))
+
+    @staticmethod
+    def getGroupLines(firstLine: vtkMRMLMarkupsCurveNode) -> list[vtkMRMLMarkupsCurveNode]:
+        """Further lines cut together with firstLine, in order (empty for a single line)."""
+        if firstLine is None:
+            return []
+        lines = (firstLine.GetNthNodeReference(GROUP_LINE_REFERENCE_ROLE, i)
+                 for i in range(firstLine.GetNumberOfNodeReferences(GROUP_LINE_REFERENCE_ROLE)))
+        return [line for line in lines if line is not None]
+
+    def setGroupLines(self, firstLine: vtkMRMLMarkupsCurveNode, lines: list[vtkMRMLMarkupsCurveNode]) -> None:
+        """Make lines (in this order) the further lines of firstLine's osteotomy. A line can be
+        in one osteotomy only: it leaves any other, and gives up further lines of its own."""
+        lines = [line for line in {line.GetID(): line for line in lines}.values()
+                 if line.GetID() != firstLine.GetID()]
+        lineIds = {line.GetID() for line in lines}
+        for other in slicer.util.getNodesByClass("vtkMRMLMarkupsCurveNode"):
+            if other.GetID() == firstLine.GetID():
+                continue
+            if other.GetID() in lineIds:
+                other.RemoveNodeReferenceIDs(GROUP_LINE_REFERENCE_ROLE)
+            else:
+                for line in self.getGroupLines(other):
+                    if line.GetID() in lineIds or line.GetID() == firstLine.GetID():
+                        self._removeReference(other, GROUP_LINE_REFERENCE_ROLE, line)
+        firstLine.RemoveNodeReferenceIDs(GROUP_LINE_REFERENCE_ROLE)
+        for line in lines:
+            firstLine.AddNodeReferenceID(GROUP_LINE_REFERENCE_ROLE, line.GetID())
+
+    def findFirstLine(self, curveNode: vtkMRMLMarkupsCurveNode) -> vtkMRMLMarkupsCurveNode:
+        """The first line of the osteotomy the given line belongs to (itself if it is first)."""
+        if curveNode is None:
+            return None
+        for other in slicer.util.getNodesByClass("vtkMRMLMarkupsCurveNode"):
+            if any(line.GetID() == curveNode.GetID() for line in self.getGroupLines(other)):
+                return other
+        return curveNode
+
+    def getOsteotomyLines(self, curveNode: vtkMRMLMarkupsCurveNode) -> list[vtkMRMLMarkupsCurveNode]:
+        """All lines of the osteotomy the given line belongs to, first line first."""
+        if curveNode is None:
+            return []
+        firstLine = self.findFirstLine(curveNode)
+        return [firstLine] + self.getGroupLines(firstLine)
+
     def validateInputs(self, parameterNode: OsteotomyCutsParameterNode) -> Optional[str]:
         """Check whether a cut can run.
 
@@ -2882,12 +3256,27 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         minPoints = 3 if self.isClosedCurve(curveNode) else 2
         if curveNode.GetNumberOfControlPoints() < minPoints:
             return _("Place at least {count} points on the cut path.").format(count=minPoints)
-        if inputModel.GetNodeReferenceID(CURVE_REFERENCE_ROLE) == curveNode.GetID():
-            return _("The model to cut was produced by this cut path. Select another model or path.")
+        lines = self.getOsteotomyLines(curveNode)
+        if inputModel.GetNodeReferenceID(CURVE_REFERENCE_ROLE) in {line.GetID() for line in lines}:
+            return _("The model to cut was produced by this osteotomy. Select another model or path.")
         try:
             self.resolveDirection(parameterNode)
         except ValueError as error:
             return str(error)
+        for line in lines:
+            if line.GetID() == curveNode.GetID():
+                continue
+            minPoints = 3 if self.isClosedCurve(line) else 2
+            if line.GetNumberOfControlPoints() < minPoints:
+                return _("Place at least {count} points on {line}.").format(count=minPoints, line=line.GetName())
+            settings = self.getLineSettings(line)
+            if settings is None:
+                return _("Select {line} as the cut path once to set its direction and depth.").format(
+                    line=line.GetName())
+            try:
+                self.resolveLineDirection(settings)
+            except ValueError as error:
+                return "{line}: {error}".format(line=line.GetName(), error=error)
         return None
 
     def getWorldPolyData(self, modelNode: vtkMRMLModelNode) -> vtk.vtkPolyData:
@@ -2989,12 +3378,53 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         reason = self.validateInputs(parameterNode)
         if reason:
             raise ValueError(reason)
-        curveNode, options = parameterNode.cutCurve, parameterNode.options
-        return self.buildSheetPolyData(self.getPathPoints(curveNode), self.resolveDirection(parameterNode),
-                                       self.computeModelExtent(parameterNode.inputModel, options),
+        return self.buildLineSheet(parameterNode.inputModel, parameterNode.cutCurve,
+                                   self.lineSettingsFromParameters(parameterNode))
+
+    def buildLineSheet(self, modelNode: vtkMRMLModelNode, curveNode: vtkMRMLMarkupsCurveNode,
+                       settings: LineSettings) -> vtk.vtkPolyData:
+        """Build the cutting sheet of one line from its settings.
+
+        :raises ValueError: if the line or its direction is invalid.
+        """
+        options = settings.options
+        return self.buildSheetPolyData(self.getPathPoints(curveNode), self.resolveLineDirection(settings),
+                                       self.computeModelExtent(modelNode, options),
                                        closed=self.isClosedCurve(curveNode),
                                        depth=options.depth if options.depth > 0 else None,
                                        endExtension=options.endExtension if options.endExtension > 0 else None)
+
+    def buildOsteotomy(self, parameterNode: OsteotomyCutsParameterNode,
+                       skipInvalid: bool = False) -> list[OsteotomyLine]:
+        """Build the sheets of every line of the selected cut path's osteotomy, in order, with
+        the earlier lines each one stops at.
+
+        :param parameterNode: module parameters (the selected line's settings come from here).
+        :param skipInvalid: leave out lines that cannot be built (for the preview) instead of
+            raising.
+        :return: the lines, first line first.
+        :raises ValueError: if the inputs are invalid (unless skipInvalid).
+        """
+        if not skipInvalid:
+            reason = self.validateInputs(parameterNode)
+            if reason:
+                raise ValueError(reason)
+        built = []
+        for curveNode in self.getOsteotomyLines(parameterNode.cutCurve):
+            try:
+                settings = self.lineSettingsOf(curveNode, parameterNode)
+                if settings is None:
+                    raise ValueError(_("Select {line} as the cut path once to set its direction and depth.").format(
+                        line=curveNode.GetName()))
+                sheet = self.buildLineSheet(parameterNode.inputModel, curveNode, settings)
+                earlier = [line.sheet for line in built]
+                sides = self.stopSides(self.getPathPoints(curveNode), earlier) if earlier else []
+            except ValueError:
+                if skipInvalid:
+                    continue
+                raise
+            built.append(OsteotomyLine(curveNode, sheet, settings.options, list(zip(earlier, sides))))
+        return built
 
     def updateSheetModel(self, parameterNode: OsteotomyCutsParameterNode) -> Optional[vtkMRMLModelNode]:
         """Show the cutting sheet for the current inputs (live preview).
@@ -3009,10 +3439,12 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
             self.hideSheetModel(parameterNode)
             return None
         try:
-            sheet = self.buildSheetForParameters(parameterNode)
+            self.buildSheetForParameters(parameterNode)  # the selected line must be valid
+            lines = self.buildOsteotomy(parameterNode, skipInvalid=True)
         except ValueError:
             self.hideSheetModel(parameterNode)
             return None
+        sheet = lines[0].sheet if len(lines) == 1 else self.mergePolyData([line.sheet for line in lines])
 
         sheetNode = parameterNode.sheetModel
         if sheetNode is None:
@@ -3028,23 +3460,29 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
             parameterNode.sheetModel = sheetNode
         sheetNode.SetAndObservePolyData(sheet)
         sheetNode.GetDisplayNode().SetVisibility(True)
-        self.updateOutlineModel(parameterNode, sheet)
+        self.updateOutlineModel(parameterNode, lines)
         return sheetNode
 
     def updateOutlineModel(self, parameterNode: OsteotomyCutsParameterNode,
-                           sheet: vtk.vtkPolyData) -> vtkMRMLModelNode:
-        """Show where the cutting sheet meets the input model's surface (computeCutOutline).
+                           lines: list[OsteotomyLine] | vtk.vtkPolyData) -> vtkMRMLModelNode:
+        """Show where the cutting sheets meet the input model's surface (computeCutOutline).
 
         Creates the "CutOutline" model node on first use (red lines, hidden from node selectors,
         not selectable) and stores it in the parameter node. It shows every place the cut comes
-        out of the bone, including places far from the cut path.
+        out of the bone, including places far from the cut path; for later lines of an
+        osteotomy, not beyond the earlier lines they stop at.
 
         :param parameterNode: module parameters; the input model must be valid.
-        :param sheet: the cutting sheet shown in the preview.
+        :param lines: the osteotomy lines shown in the preview (or a single sheet).
         :return: the outline model node.
         """
+        if isinstance(lines, vtk.vtkPolyData):
+            lines = [OsteotomyLine(parameterNode.cutCurve, lines, parameterNode.options, [])]
         locator = self._getSurfaceLocator(parameterNode.inputModel)
-        outline = self.computeCutOutline(locator.GetDataSet(), sheet, locator)
+        outlines = [self.computeCutOutline(locator.GetDataSet(), line.sheet, locator, line.stops) for line in lines]
+        outlines = [outline for outline in outlines if outline.GetNumberOfPoints() > 0]
+        outline = (outlines[0] if len(outlines) == 1 else
+                   self.mergePolyData(outlines) if outlines else vtk.vtkPolyData())
         outlineNode = parameterNode.outlineModel
         if outlineNode is None:
             outlineNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode", "CutOutline")
@@ -3088,23 +3526,26 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         reason = self.validateInputs(parameterNode)
         if reason:
             raise ValueError(reason)
-        inputModel, curveNode = parameterNode.inputModel, parameterNode.cutCurve
+        inputModel = parameterNode.inputModel
+        lines = self.buildOsteotomy(parameterNode)
+        curveNode = lines[0].curve  # the osteotomy's result belongs to its first line
         self._checkNoDependentCuts(curveNode)
 
         report = progressCallback or (lambda percent, message: None)
         report(0, _("Preparing..."))
         polyData, isSolid = self.getModelToCut(parameterNode, progressCallback)
-        sheet = self.buildSheetForParameters(parameterNode)
-        fragments = self.cutPolyData(polyData, [sheet], parameterNode.options, progressCallback)
-        # A limited cut may only cut a groove or a slot (cutPolyData has checked that it removed bone)
-        isLimited = self.isLimitedCut(parameterNode.options)
+        fragments = self.cutPolyData(polyData, [line.sheet for line in lines], [line.options for line in lines],
+                                     progressCallback, stops=[line.stops for line in lines])
+        # A limited cut, or lines stopping at each other, may only cut a groove or a slot
+        # (cutPolyData has checked that each removed bone)
+        isLimited = len(lines) > 1 or any(self.isLimitedCut(line.options) for line in lines)
         if len(fragments) < (1 if isLimited else 2):
             raise ValueError(_("The cutting sheet does not divide the model. Check the cut path and direction."))
 
         report(90, _("Creating fragment models..."))
         self.removeCutResult(curveNode)
         nodes = self.createFragmentNodes(fragments, inputModel, curveNode)
-        if isSolid and parameterNode.options.capCutFaces:
+        if isSolid and all(line.options.capCutFaces for line in lines):
             for node in nodes:  # closed pieces of a solid: later cuts use them as they are
                 node.SetAttribute(SOLID_ATTRIBUTE, "1")
         report(100, _("Done."))
@@ -4088,7 +4529,7 @@ class OsteotomyCutsTest(ScriptedLoadableModuleTest):
         parameterNode.treatBoneAsSolid = False
         fragment = logic.applyCut(parameterNode)[0]
         parameterNode.inputModel = fragment
-        self.assertIn("produced by this cut path", logic.validateInputs(parameterNode))
+        self.assertIn("produced by this osteotomy", logic.validateInputs(parameterNode))
         with self.assertRaises(ValueError):
             logic.applyCut(parameterNode)
 
@@ -5120,3 +5561,137 @@ class OsteotomyCutsTest(ScriptedLoadableModuleTest):
         np.testing.assert_array_equal(self._points(model.GetPolyData()), pointsBefore)
         # The node's mesh is its own: changing it leaves the cached solid alone
         self.assertIsNot(solidNode.GetPolyData(), logic.getSolidPolyData(model, 0.5, 1.5))
+
+    #
+    # Release Part 0d: osteotomy of several lines
+    #
+
+    # "Le Fort I" on the test box: a horizontal groove cut from the front (+y), 60 mm deep, and a
+    # vertical line on the right face extruded to the left (-x) through the box, 10 mm in front of
+    # the groove's end
+    LE_FORT_LINES = ([[-30.0, -50.0, 10.3], [30.0, -50.0, 10.3]], [[50.0, 5.3, 10.3], [50.0, 5.3, -40.0]])
+    LE_FORT_DIRECTIONS = ((0.0, 1.0, 0.0), (-1.0, 0.0, 0.0))
+
+    def _leFortCut(self, kerfWidth: float, grooveDepth: float = 60.0) -> list:
+        logic = OsteotomyCutsLogic()
+        box = self._box()
+        extent = logic.computeAutoExtent(box)
+        first, second = (np.array(line) for line in self.LE_FORT_LINES)
+        horizontal = logic.buildSheetPolyData(first, np.array(self.LE_FORT_DIRECTIONS[0]), extent, depth=grooveDepth)
+        vertical = logic.buildSheetPolyData(second, np.array(self.LE_FORT_DIRECTIONS[1]), extent)
+        options = CutOptions()
+        options.kerfWidth = kerfWidth
+        options.depth = grooveDepth
+        verticalOptions = CutOptions()
+        verticalOptions.kerfWidth = kerfWidth
+        sides = logic.stopSides(second, [horizontal])
+        return logic.cutPolyData(box, [horizontal, vertical], [options, verticalOptions],
+                                 stops=[[], [(horizontal, sides[0])]])
+
+    def test_osteotomy_stopsAtEarlierLine(self):
+        """The vertical line stops at the horizontal groove: the front-lower block comes off,
+        closed, and the bone above the groove is not cut (with a blade and the ideal blade)."""
+        for kerfWidth in (1.0, 0.0):
+            fragments = self._leFortCut(kerfWidth)
+            self.assertEqual(len(fragments), 2, msg=f"kerf {kerfWidth}")
+            for fragment in fragments:
+                self._assertWatertight(fragment)
+            big, block = sorted(fragments, key=self._volume, reverse=True)
+            half = max(kerfWidth, OsteotomyCutsLogic.LIMITED_IDEAL_KERF_WIDTH) / 2.0
+            np.testing.assert_allclose(block.GetBounds(), (-50.0, 50.0, -50.0, 5.3 - half, -50.0, 10.3 - half),
+                                       atol=1e-3)
+            self.assertAlmostEqual(self._volume(block), 100.0 * (55.3 - half) * (60.3 - half), delta=1.0)
+            selector = vtk.vtkSelectEnclosedPoints()
+            selector.Initialize(big)
+            self.assertTrue(selector.IsInsideSurface(0.0, 5.3, 30.0))  # above the groove: not cut
+            self.assertFalse(selector.IsInsideSurface(0.0, 5.3, -30.0))  # in the vertical cut
+            selector.Complete()
+
+    def test_osteotomy_junctionBeyondEarlierCut(self):
+        """A later line meeting bone across an earlier line beyond that line's cut is refused."""
+        with self.assertRaises(ValueError) as context:
+            self._leFortCut(1.0, grooveDepth=30.0)
+        self.assertIn("far side of an earlier line", str(context.exception))
+
+    def test_osteotomy_lines(self):
+        """Each line keeps its own settings; lines grouped into an osteotomy are previewed,
+        applied (from any of its lines) and undone together; all of it survives a scene reload."""
+        import os
+        logic = OsteotomyCutsLogic()
+        model = self._addModel(self._box(), "Box")
+        horizontal = self._addCurve(self.LE_FORT_LINES[0], "LeFort")
+        vertical = self._addCurve(self.LE_FORT_LINES[1], "PtMax")
+
+        # Settings per line: the vertical line first, then a new line takes them and changes them
+        parameterNode = self._configure(model, vertical, direction=self.LE_FORT_DIRECTIONS[1])
+        parameterNode.options.kerfWidth = 1.0
+        logic.storeLineSettings(parameterNode)
+        parameterNode.options.depth = 20.0
+        parameterNode.options.endExtension = 5.0
+        parameterNode.cutCurve = horizontal
+        # A new line keeps the saw settings, but not the other line's depth, reach or direction
+        self.assertFalse(logic.loadLineSettings(parameterNode))
+        self.assertEqual(parameterNode.options.kerfWidth, 1.0)
+        self.assertEqual(parameterNode.options.depth, 0.0)
+        self.assertEqual(parameterNode.options.endExtension, 0.0)
+        self.assertFalse(isDirectionCaptured(parameterNode.viewDirection))
+        parameterNode.viewDirection = self.LE_FORT_DIRECTIONS[0]
+        parameterNode.options.depth = 60.0
+        logic.storeLineSettings(parameterNode)
+        parameterNode.cutCurve = vertical
+        self.assertTrue(logic.loadLineSettings(parameterNode))
+        self.assertEqual(parameterNode.options.depth, 0.0)
+        np.testing.assert_allclose(parameterNode.viewDirection, self.LE_FORT_DIRECTIONS[1])
+        self.assertEqual(parameterNode.options.kerfWidth, 1.0)
+
+        # Group: the vertical line joins the horizontal line's osteotomy
+        self.assertEqual(self._ids(logic.getOsteotomyLines(vertical)), [vertical.GetID()])
+        logic.setGroupLines(horizontal, [vertical])
+        self.assertEqual(self._ids(logic.getOsteotomyLines(vertical)), [horizontal.GetID(), vertical.GetID()])
+        self.assertEqual(logic.findFirstLine(vertical).GetID(), horizontal.GetID())
+        self.assertIsNone(logic.validateInputs(parameterNode))
+
+        # Preview: both sheets; the vertical line's outline stops at the horizontal cut (no line
+        # on the top face). Horizontal: front 100 + sides 2 x 60; vertical: sides 2 x 60.3 + bottom 100
+        logic.updateSheetModel(parameterNode)
+        self.assertEqual(parameterNode.sheetModel.GetPolyData().GetNumberOfCells(),
+                         sum(line.sheet.GetNumberOfCells() for line in logic.buildOsteotomy(parameterNode)))
+        outline = parameterNode.outlineModel.GetPolyData()
+        self.assertAlmostEqual(self._lineLength(outline), 220.0 + 220.6, delta=5.0)
+        self.assertLess(outline.GetBounds()[5], 12.0)
+
+        # Applied from the vertical line: one result, belonging to the first line
+        nodes = logic.applyCut(parameterNode)
+        self.assertEqual(len(nodes), 2)
+        self.assertEqual(self._ids(logic.getCurveResult(horizontal)), self._ids(nodes))
+        self.assertEqual(logic.getCurveResult(vertical), [])
+        self.assertTrue(all(node.GetName().startswith("Box_LeFort_") for node in nodes))
+        for node in nodes:
+            self._assertWatertight(node.GetPolyData())
+
+        # Scene round trip keeps the settings and the group
+        scenePath = os.path.join(slicer.app.temporaryPath, "OsteotomyCutsLines.mrb")
+        try:
+            self.assertTrue(slicer.util.saveScene(scenePath))
+            slicer.mrmlScene.Clear()
+            slicer.util.loadScene(scenePath)
+        finally:
+            if os.path.exists(scenePath):
+                os.remove(scenePath)
+        horizontal = slicer.util.getNode("LeFort")
+        vertical = slicer.util.getNode("PtMax")
+        self.assertEqual(self._ids(logic.getGroupLines(horizontal)), [vertical.GetID()])
+        self.assertEqual(logic.getLineSettings(horizontal).options.depth, 60.0)
+        np.testing.assert_allclose(logic.getLineSettings(vertical).viewDirection, self.LE_FORT_DIRECTIONS[1])
+        self.assertEqual(len(logic.getCurveResult(horizontal)), 2)
+
+        # Undo through the first line removes everything
+        logic.removeCutResult(logic.findFirstLine(vertical))
+        self.assertEqual(logic.getCurveResult(horizontal), [])
+        self.assertTrue(self._isVisible(slicer.util.getNode("Box")))
+
+        # A line is in one osteotomy only
+        other = self._addCurve([[0.0, -40.0, 50.0], [0.0, 40.0, 50.0]], "Other")
+        logic.setGroupLines(other, [vertical])
+        self.assertEqual(logic.getGroupLines(horizontal), [])
+        self.assertEqual(logic.findFirstLine(vertical).GetID(), other.GetID())
