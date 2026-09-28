@@ -32,7 +32,7 @@ No other software is needed: VTK, NumPy and SciPy ship with 3D Slicer.
 - **From the Extensions Manager** (once published): in 3D Slicer, open *View → Extensions Manager*, search for **OsteotomyCuts**, install and restart Slicer.
 - **From source:** clone this repository, then in Slicer open *Edit → Application Settings → Modules* and add the `OsteotomyCuts` folder of the repository to *Additional module paths*; restart Slicer.
 
-The module appears under **Surgical Planning → Osteotomy Cuts**. On first use you are asked to accept the terms of use.
+The module appears under **Planning → Osteotomy Cuts**. On first use you are asked to accept the terms of use.
 
 ## Quick start
 

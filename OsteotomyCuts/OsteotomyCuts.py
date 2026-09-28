@@ -49,7 +49,7 @@ class OsteotomyCuts(ScriptedLoadableModule):
     def __init__(self, parent):
         ScriptedLoadableModule.__init__(self, parent)
         self.parent.title = _("Osteotomy Cuts")
-        self.parent.categories = [translate("qSlicerAbstractCoreModule", "Surgical Planning")]
+        self.parent.categories = [translate("qSlicerAbstractCoreModule", "Planning")]
         self.parent.dependencies = ["Markups", "Models", "SubjectHierarchy"]
         self.parent.contributors = [MODULE_CONTRIBUTOR]
         self.parent.helpText = _("""<p><b>Osteotomy Cuts</b> — virtual osteotomies for orthognathic and
@@ -7386,6 +7386,11 @@ class OsteotomyCutsTest(ScriptedLoadableModuleTest):
         cmakePath = self._moduleFile("..", "CMakeLists.txt")
         if os.path.exists(cmakePath):  # the source tree (not an installed extension)
             with open(cmakePath, encoding="utf-8") as cmakeFile:
-                found = re.search(r'set\(EXTENSION_CONTRIBUTORS "([^"]*)"\)', cmakeFile.read())
+                cmake = cmakeFile.read()
+            found = re.search(r'set\(EXTENSION_CONTRIBUTORS "([^"]*)"\)', cmake)
             self.assertIsNotNone(found)
             self.assertEqual(found.group(1), MODULE_CONTRIBUTOR)
+            # The category must also be one the Extensions Index accepts (e.g. "Planning")
+            category = re.search(r'set\(EXTENSION_CATEGORY "([^"]*)"\)', cmake)
+            self.assertIsNotNone(category)
+            self.assertEqual(list(slicer.modules.osteotomycuts.categories), [category.group(1)])

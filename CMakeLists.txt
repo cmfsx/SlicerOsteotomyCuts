@@ -9,7 +9,7 @@ project(OsteotomyCuts)
 #-----------------------------------------------------------------------------
 # Extension meta-information
 set(EXTENSION_HOMEPAGE "https://github.com/cmfsx/SlicerOsteotomyCuts")
-set(EXTENSION_CATEGORY "Surgical Planning")
+set(EXTENSION_CATEGORY "Planning")
 set(EXTENSION_CONTRIBUTORS "Manjula Herath (Ministry of Health, Sri Lanka; FaceLab, Colombo, Sri Lanka; Malmö University, Sweden)")
 set(EXTENSION_DESCRIPTION "Virtual osteotomies for orthognathic and craniofacial surgical planning: draw osteotomy lines on a bone model, set the saw direction, blade thickness and cut depth, and divide the bone into closed bone segments, with checks of model quality and of the distance to the nerve canal and tooth roots. Research and planning software, not a medical device. Licensed under GPL-3.0-or-later.")
 set(EXTENSION_ICONURL "https://raw.githubusercontent.com/cmfsx/SlicerOsteotomyCuts/main/OsteotomyCuts.png")
