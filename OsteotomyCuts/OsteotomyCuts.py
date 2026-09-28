@@ -559,6 +559,7 @@ class OsteotomyCutsParameterNode:
     treatBoneAsSolid - Cut a solid version of the model (makeSolidPolyData), unless it is solid already.
     solidVoxelSize - Detail (voxel size, mm) of solid bone models.
     solidGapSeal - Holes and gaps up to about twice this (mm) are sealed in solid bone models.
+    minSegmentPercent - Smaller pieces are joined to a neighbouring bone segment after a cut.
     """
 
     inputModel: vtkMRMLModelNode
@@ -576,6 +577,9 @@ class OsteotomyCutsParameterNode:
     treatBoneAsSolid: bool = True
     solidVoxelSize: Annotated[float, WithinRange(0.05, 5.0)] = 0.25
     solidGapSeal: Annotated[float, WithinRange(0.0, 10.0)] = 1.5
+    # Pieces with less surface area than this percentage of the largest bone segment are joined
+    # to the segment they touch most (joinSmallSegments); 0 keeps every piece
+    minSegmentPercent: Annotated[float, WithinRange(0.0, 50.0)] = 1.0
 
 
 #
@@ -913,6 +917,9 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             with slicer.util.tryWithErrorDisplay(_("Failed to cut the model."), waitCursor=True):
                 fragments = self.logic.applyCut(self._requireParameterNode(), reportProgress)
                 self._resultMessage = _("{count} fragments created.").format(count=len(fragments))
+                if self.logic.lastJoinedPieces:
+                    self._resultMessage += " " + _("{count} small pieces were joined to a neighbouring segment "
+                                                   "(Advanced).").format(count=self.logic.lastJoinedPieces)
         finally:
             progress.close()
             self._updateActionState()
@@ -969,6 +976,8 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         self._surfaceLocatorCache = None
         # Model node ID -> (cache key, solid world mesh), most recently used last
         self._solidCache = {}
+        # Small pieces joined to a neighbouring bone segment by the last applyCut
+        self.lastJoinedPieces = 0
 
     # A path segment closer than this angle to its extrusion direction is rejected, because the
     # sheet would degenerate to a sliver there.
@@ -2682,6 +2691,64 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         result.DeepCopy(clean.GetOutput())
         return result
 
+    def joinSmallSegments(self, fragments: list[vtk.vtkPolyData], minFraction: float,
+                          contactDistance: float = 1.0) -> tuple[list[vtk.vtkPolyData], int]:
+        """Join small pieces left between the lines of an osteotomy to a large bone segment.
+
+        Cuts through thin bone (pterygoid plates, sinus and nasal walls), and several lines
+        meeting, leave loose pieces that surgery would not separate. A piece with less surface
+        area than minFraction of the largest segment is added (as a separate shell of the same
+        model) to the large segment it touches most: the one with most of its points within
+        contactDistance, or else the nearest. Surface area is used as it is meaningful for open
+        meshes too.
+
+        :param fragments: bone segments, largest first (cutPolyData output).
+        :param minFraction: fraction of the largest segment's surface area; 0 joins nothing.
+        :param contactDistance: points closer than this (mm) to a large segment touch it.
+        :return: (bone segments, largest first, number of pieces joined).
+        """
+        if minFraction <= 0 or len(fragments) < 3:
+            return fragments, 0
+
+        def area(mesh: vtk.vtkPolyData) -> float:
+            massProperties = vtk.vtkMassProperties()
+            massProperties.SetInputData(self._ensureTriangles(mesh))
+            massProperties.Update()
+            return massProperties.GetSurfaceArea()
+
+        areas = np.array([area(fragment) for fragment in fragments])
+        isLarge = areas >= minFraction * areas.max()
+        large = [i for i in range(len(fragments)) if isLarge[i]]
+        if len(large) == len(fragments) or len(large) == 0:
+            return fragments, 0
+        distanceFunctions = {}
+        for i in large:
+            distanceFunctions[i] = vtk.vtkImplicitPolyDataDistance()
+            distanceFunctions[i].SetInput(fragments[i])
+        groups = {i: [fragments[i]] for i in large}
+        for j in (j for j in range(len(fragments)) if not isLarge[j]):
+            points = fragments[j].GetPoints().GetData()
+            contacts, nearest = [], []
+            for i in large:
+                values = vtk.vtkDoubleArray()
+                distanceFunctions[i].FunctionValue(points, values)
+                distances = np.abs(numpy_support.vtk_to_numpy(values))
+                contacts.append(int(np.count_nonzero(distances <= contactDistance)))
+                nearest.append(float(distances.min()) if len(distances) else np.inf)
+            best = large[int(np.argmax(contacts))] if max(contacts) > 0 else large[int(np.argmin(nearest))]
+            groups[best].append(fragments[j])
+        joined = []
+        for i in large:
+            append = vtk.vtkAppendPolyData()  # no point merging: keeps the split display normals
+            for mesh in groups[i]:
+                append.AddInputData(mesh)
+            append.Update()
+            mesh = vtk.vtkPolyData()
+            mesh.DeepCopy(append.GetOutput())
+            joined.append((areas[i], mesh))
+        joined.sort(key=lambda item: item[0], reverse=True)
+        return [mesh for _area, mesh in joined], len(fragments) - len(large)
+
     def sheetEndsInModel(self, polyData: vtk.vtkPolyData, sheetPolyData: vtk.vtkPolyData, kerfWidth: float,
                          locator: Optional[vtk.vtkCellLocator] = None,
                          stops: Optional[list[tuple[vtk.vtkPolyData, float]]] = None) -> bool:
@@ -3541,6 +3608,9 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         isLimited = len(lines) > 1 or any(self.isLimitedCut(line.options) for line in lines)
         if len(fragments) < (1 if isLimited else 2):
             raise ValueError(_("The cutting sheet does not divide the model. Check the cut path and direction."))
+        widestKerf = max(self.effectiveKerfWidth(line.options, bool(line.stops)) for line in lines)
+        fragments, self.lastJoinedPieces = self.joinSmallSegments(
+            fragments, parameterNode.minSegmentPercent / 100.0, contactDistance=widestKerf + 1.0)
 
         report(90, _("Creating fragment models..."))
         self.removeCutResult(curveNode)
@@ -3935,6 +4005,7 @@ class OsteotomyCutsTest(ScriptedLoadableModuleTest):
         self.assertTrue(parameterNode.treatBoneAsSolid)
         self.assertEqual(parameterNode.solidVoxelSize, 0.25)
         self.assertEqual(parameterNode.solidGapSeal, 1.5)
+        self.assertEqual(parameterNode.minSegmentPercent, 1.0)
 
         parameterNode.viewDirection = (0.0, 1.0, 0.0)
         parameterNode.directionMode = DirectionMode.LINE
@@ -4285,6 +4356,7 @@ class OsteotomyCutsTest(ScriptedLoadableModuleTest):
         """Parameters for cutting model with curve; the model is cut as it is unless solid is set."""
         parameterNode = OsteotomyCutsLogic().getParameterNode()
         parameterNode.treatBoneAsSolid = solid
+        parameterNode.minSegmentPercent = 0.0  # every piece kept, unless a test joins them
         parameterNode.inputModel = model
         parameterNode.cutCurve = curve
         parameterNode.directionMode = DirectionMode.VIEW
@@ -4722,7 +4794,8 @@ class OsteotomyCutsTest(ScriptedLoadableModuleTest):
         rawNode = parameterNode.parameterNode
         del parameterNode  # the wrapper would try (and fail) to re-read the node as it is edited
         newOptions = ("options.kerfWidth", "options.depth", "options.capCutFaces", "options.refineEdgeLength",
-                      "options.endExtension", "treatBoneAsSolid", "solidVoxelSize", "solidGapSeal")
+                      "options.endExtension", "treatBoneAsSolid", "solidVoxelSize", "solidGapSeal",
+                      "minSegmentPercent")
         for name in newOptions:  # as saved by Phase 1
             rawNode.UnsetParameter(name)
 
@@ -5695,3 +5768,18 @@ class OsteotomyCutsTest(ScriptedLoadableModuleTest):
         logic.setGroupLines(other, [vertical])
         self.assertEqual(logic.getGroupLines(horizontal), [])
         self.assertEqual(logic.findFirstLine(vertical).GetID(), other.GetID())
+
+    def test_joinSmallSegments(self):
+        """A small loose piece is joined to the large segment it touches; 0 keeps every piece."""
+        logic = OsteotomyCutsLogic()
+        left, right = self._sphere(20.0), self._sphere(20.0, centre=(50.0, 0.0, 0.0))
+        piece = self._sphere(2.0, centre=(22.5, 0.0, 0.0), resolution=16)  # 0.5 mm from the left sphere
+        fragments = [left, right, piece]
+
+        kept, joined = logic.joinSmallSegments(fragments, 0.0)
+        self.assertEqual((len(kept), joined), (3, 0))
+        kept, joined = logic.joinSmallSegments(fragments, 0.02, contactDistance=1.0)
+        self.assertEqual((len(kept), joined), (2, 1))
+        withPiece = next(mesh for mesh in kept if mesh.GetBounds()[1] > 20.0 and mesh.GetBounds()[0] < 0.0)
+        self.assertEqual(withPiece.GetNumberOfPoints(), left.GetNumberOfPoints() + piece.GetNumberOfPoints())
+        self.assertEqual(logic._connectedRegions(withPiece)[3], 2)
