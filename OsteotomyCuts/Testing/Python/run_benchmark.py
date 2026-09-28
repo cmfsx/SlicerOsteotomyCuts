@@ -2,8 +2,9 @@
 
 Run with Slicer's --python-script option (as run_headless_tests.py). Synthetic geometry only:
 a sphere of radius 40 mm with about 200 000 triangles (0.8 mm edges, like a bone surface
-segmented from CT). Prints the time of each cut, split by stage, and the result. Exits 0 when
-every cut gives watertight fragments, 1 otherwise.
+segmented from CT), and a jaw-like segmentation mesh of about a million triangles with a bumpy
+surface and marrow cavities. Prints the time of each cut, split by stage, and the result.
+Exits 0 when every capped cut gives watertight fragments, 1 otherwise.
 """
 
 import time
@@ -13,6 +14,7 @@ from collections import defaultdict
 import numpy as np
 import slicer
 import vtk
+from vtk.util import numpy_support
 
 exitCode = 1
 try:
@@ -36,6 +38,42 @@ try:
                     timings[_name] += time.perf_counter() - start
             setattr(logic, name, timed)
         return logic
+
+    def syntheticJaw() -> vtk.vtkPolyData:
+        """A jaw-like bone as a segmentation export gives it: marching cubes (0.25 mm voxels) of
+        a thick U-shaped bar with two rami, with a bumpy surface and marrow cavities, smoothed."""
+        from scipy import ndimage
+        spacing = 0.25
+        lower, upper = np.array([-58.0, -14.0, -20.0]), np.array([58.0, 82.0, 58.0])
+        shape = np.ceil((upper - lower) / spacing).astype(int) + 1
+        x = np.linspace(-40.0, 40.0, 400)
+        centre = [np.column_stack([x, 0.022 * x ** 2, np.zeros_like(x)])]
+        for side in (-1.0, 1.0):
+            t = np.linspace(0.0, 1.0, 200)[:, np.newaxis]
+            centre.append(np.array([side * 40.0, 35.2, 0.0]) + t * np.array([side * 2.0, 20.0, 42.0]))
+        centre = np.vstack(centre)
+        dense = np.vstack([np.linspace(centre[i], centre[i + 1], 6) for i in range(len(centre) - 1)])
+        index = np.clip(np.rint((dense - lower) / spacing).astype(int), 0, shape - 1)
+        outside = np.ones(shape, dtype=bool)
+        outside[index[:, 0], index[:, 1], index[:, 2]] = False
+        distance = ndimage.distance_transform_edt(outside) * spacing
+        noise = ndimage.gaussian_filter(np.random.default_rng(1).standard_normal(shape).astype(np.float32), 4.0)
+        field = (distance - 6.0 + noise * (1.6 / noise.std())).astype(np.float32)  # < 0 in the bone
+        image = vtk.vtkImageData()
+        image.SetDimensions(*shape.tolist())
+        image.SetSpacing(spacing, spacing, spacing)
+        image.SetOrigin(*lower.tolist())
+        image.GetPointData().SetScalars(numpy_support.numpy_to_vtk(field.ravel(order="F"), deep=True))
+        contour = vtk.vtkFlyingEdges3D()
+        contour.SetInputData(image)
+        contour.SetValue(0, 0.0)
+        smooth = vtk.vtkWindowedSincPolyDataFilter()
+        smooth.SetInputConnection(contour.GetOutputPort())
+        smooth.SetNumberOfIterations(15)
+        smooth.SetPassBand(0.1)
+        smooth.NormalizeCoordinatesOn()
+        smooth.Update()
+        return smooth.GetOutput()
 
     def openEdgeCount(polyData: vtk.vtkPolyData) -> int:
         edges = vtk.vtkFeatureEdges()
@@ -93,6 +131,25 @@ try:
         for stage in STAGES:
             if timings[stage] > 0:
                 print(f"    {stage:<26} {timings[stage]:6.2f} s")
+
+    # A segmentation-like jaw: about a million triangles, a bumpy surface and marrow cavities.
+    # Guards against cut faces that fail to close or never finish refining on real bone.
+    jaw = syntheticJaw()
+    timings = defaultdict(float)
+    logic = timedLogic(timings)
+    leftBody = np.array([[-30.0, 0.0, 20.0], [-30.0, 40.0, 20.0]])  # across the left body
+    sheet = logic.buildSheetPolyData(leftBody, down, logic.computeAutoExtent(jaw))
+    start = time.perf_counter()
+    fragments = logic.cutPolyData(jaw, [sheet], options(1.0))
+    total = time.perf_counter() - start
+    openEdges = [openEdgeCount(fragment) for fragment in fragments]
+    jawWatertight = all(count == 0 for count in openEdges)
+    allWatertight = allWatertight and jawWatertight
+    print(f"\nSynthetic jaw ({jaw.GetNumberOfPolys()} triangles), kerf 1.0 through the left body: {total:.2f} s, "
+          f"{len(fragments)} fragment(s), {'watertight' if jawWatertight else f'open edges {openEdges}'}")
+    for stage in STAGES:
+        if timings[stage] > 0:
+            print(f"    {stage:<26} {timings[stage]:6.2f} s")
     print("\nBENCHMARK " + ("PASSED" if allWatertight else "FAILED: a capped cut is not watertight"))
     exitCode = 0 if allWatertight else 1
 except Exception:

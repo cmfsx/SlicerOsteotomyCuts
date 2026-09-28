@@ -614,7 +614,11 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self._parameterNodeGuiTag = None
             # The raw MRML node is observed, not the wrapper: VTKObservationMixin keeps a
             # reference to every object it has observed, which would keep old wrappers alive.
-            self.removeObserver(self._parameterNode.parameterNode, vtk.vtkCommand.ModifiedEvent, self._updateGuiFromParameterNode)
+            # exit() may have removed the observer already.
+            if self.hasObserver(self._parameterNode.parameterNode, vtk.vtkCommand.ModifiedEvent,
+                                self._updateGuiFromParameterNode):
+                self.removeObserver(self._parameterNode.parameterNode, vtk.vtkCommand.ModifiedEvent,
+                                    self._updateGuiFromParameterNode)
         self._observeMarkupsNodes([])
         self._parameterNode = inputParameterNode
         if self._parameterNode:
@@ -819,6 +823,13 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
     # and they are longer than CAP_MIN_EDGE_LENGTH (mm)
     CAP_TOLERANCE = 0.01
     CAP_MIN_EDGE_LENGTH = 0.25
+    # A cap is refined with at most max(CAP_MIN_POINT_BUDGET, CAP_POINT_BUDGET_PER_RIM_POINT x
+    # its rim points) added points; normal caps need a fraction of that
+    CAP_MIN_POINT_BUDGET = 50_000
+    CAP_POINT_BUDGET_PER_RIM_POINT = 20
+    # At most this many rim edges missing from a cap's Delaunay triangulation are recovered by
+    # edge flips; with more, the slower fallback triangulation is used
+    MAX_RECOVERED_EDGES = 500
     # Rounds of simultaneous Delaunay edge flips on a cap
     MAX_FLIP_ROUNDS = 1000
     # Largest spacing (mm) of cap points placed along a bend of the cut surface
@@ -1270,10 +1281,7 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         halfKerf = sheetMap.halfKerf
 
         # Open edges, in the direction of the triangle that uses them
-        directed = np.vstack([triangles[:, [0, 1]], triangles[:, [1, 2]], triangles[:, [2, 0]]])
-        _keys, inverse, counts = np.unique(np.sort(directed, axis=1), axis=0, return_inverse=True,
-                                           return_counts=True)
-        openEdges = directed[counts[inverse.ravel()] == 1]
+        openEdges = self._openEdges(triangles, len(points))
         tolerance = self.CUT_SURFACE_TOLERANCE * (1.0 + halfKerf)
         onCut = np.abs(np.abs(distances) - halfKerf) <= tolerance
         cutEdges = openEdges[onCut[openEdges[:, 0]] & onCut[openEdges[:, 1]]]
@@ -1306,10 +1314,7 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
             triangles = root[triangles]
             triangles = triangles[(triangles[:, 0] != triangles[:, 1]) & (triangles[:, 1] != triangles[:, 2])
                                   & (triangles[:, 2] != triangles[:, 0])]
-            directed = np.vstack([triangles[:, [0, 1]], triangles[:, [1, 2]], triangles[:, [2, 0]]])
-            _keys, inverse, counts = np.unique(np.sort(directed, axis=1), axis=0, return_inverse=True,
-                                               return_counts=True)
-            openEdges = directed[counts[inverse.ravel()] == 1]
+            openEdges = self._openEdges(triangles, len(points))
             cutEdges = openEdges[onCut[openEdges[:, 0]] & onCut[openEdges[:, 1]]]
 
         result = self._capLoops(cutEdges, points, sheetMap, arrays, arrayName)
@@ -1321,6 +1326,18 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
             arrays[name] = (np.concatenate([values, capArrays[name].astype(values.dtype)]), dataType)
         return self._buildTriangleMesh(np.vstack([points, capPoints]), np.vstack([triangles, capTriangles]),
                                        arrays, normalsName, scalarsName), 0
+
+    @staticmethod
+    def _openEdges(triangles: np.ndarray, pointCount: int) -> np.ndarray:
+        """Edges used by one triangle only, directed as in that triangle.
+
+        Edges are compared as single integer keys: sorting rows (np.unique with axis=0) takes
+        seconds on the millions of edges of a segmented bone.
+        """
+        directed = np.vstack([triangles[:, [0, 1]], triangles[:, [1, 2]], triangles[:, [2, 0]]])
+        keys = np.minimum(directed[:, 0], directed[:, 1]) * pointCount + np.maximum(directed[:, 0], directed[:, 1])
+        _unique, inverse, counts = np.unique(keys, return_inverse=True, return_counts=True)
+        return directed[counts[inverse.ravel()] == 1]
 
     def _capLoops(self, edges: np.ndarray, points: np.ndarray, sheetMap: SheetParameterisation,
                   arrays: dict, arrayName: str) -> Optional[tuple[np.ndarray, np.ndarray, dict]]:
@@ -1449,8 +1466,13 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
             splitCount = int(np.count_nonzero(split))
             if splitCount == 0:
                 break
-            if firstNewId + count - len(loopIds) + splitCount > self.MAX_REFINED_POINTS:
-                break  # keep the coarser (still closed) cap rather than fail
+            # Keep the coarser (still closed) cap rather than refine without end where the chart
+            # does not follow the cut surface (e.g. a groove floor whose depth jumps)
+            budget = max(self.CAP_MIN_POINT_BUDGET, self.CAP_POINT_BUDGET_PER_RIM_POINT * len(loopIds))
+            if count - len(loopIds) + splitCount > budget or firstNewId + count + splitCount > self.MAX_REFINED_POINTS:
+                logging.warning(f"OsteotomyCuts: a cut face was not refined further ({count - len(loopIds)} points "
+                                "added); it may stray slightly from the cut surface.")
+                break
             splitStart, splitEnd = start[split], end[split]
             planar = np.vstack([planar, midPlanar[split]])
             positions = np.vstack([positions, midPoints[split]])
@@ -1518,28 +1540,64 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         except Exception:  # Qhull errors (e.g. all points collinear)
             return None
         triangles = triangulation.simplices.astype(np.int64)
-        neighbours = triangulation.neighbors.astype(np.int64)
         count = len(framed)
         if len(np.unique(triangles)) != count:
             return None  # a point was dropped (coincident points)
+        corners = framed[triangles]
+        area = ((corners[:, 1, 0] - corners[:, 0, 0]) * (corners[:, 2, 1] - corners[:, 0, 1])
+                - (corners[:, 1, 1] - corners[:, 0, 1]) * (corners[:, 2, 0] - corners[:, 0, 0]))
+        triangles[area < 0] = triangles[area < 0][:, [0, 2, 1]]  # counter-clockwise
 
-        # Split the triangles into regions separated by loop edges and keep the inside regions
+        # A loop edge with another loop point in its diametral circle (a narrow neck of a jagged
+        # rim) is not a Delaunay edge: recover it by flipping the edges that cross it
         loopKeys = np.unique(np.minimum(edges[:, 0], edges[:, 1]) * count + np.maximum(edges[:, 0], edges[:, 1]))
-        rows, columns = [], []
-        for corner in range(3):  # the neighbour opposite each corner shares the other two
-            a, b = triangles[:, (corner + 1) % 3], triangles[:, (corner + 2) % 3]
-            keys = np.minimum(a, b) * count + np.maximum(a, b)
-            isLoopEdge = np.isin(keys, loopKeys)
-            joined = (neighbours[:, corner] >= 0) & ~isLoopEdge
-            rows.append(np.flatnonzero(joined))
-            columns.append(neighbours[joined, corner])
-        rows, columns = np.concatenate(rows), np.concatenate(columns)
+        present = np.unique(np.concatenate([np.minimum(triangles[:, k], triangles[:, (k + 1) % 3]) * count
+                                            + np.maximum(triangles[:, k], triangles[:, (k + 1) % 3]) for k in range(3)]))
+        missing = loopKeys[~np.isin(loopKeys, present)]
+        if len(missing) > 0:
+            if len(missing) > self.MAX_RECOVERED_EDGES:
+                return None
+            triangles = self._recoverEdges(framed, triangles, np.column_stack([missing // count, missing % count]))
+            if triangles is None:
+                return None
+
+        # Split the triangles into regions separated by loop edges (neighbours share an edge)
+        undirected = np.concatenate([np.minimum(triangles[:, k], triangles[:, (k + 1) % 3]) * count
+                                     + np.maximum(triangles[:, k], triangles[:, (k + 1) % 3]) for k in range(3)])
+        owners = np.tile(np.arange(len(triangles)), 3)
+        order = np.argsort(undirected, kind="stable")
+        undirected, owners = undirected[order], owners[order]
+        shared = np.flatnonzero((undirected[:-1] == undirected[1:]) & ~np.isin(undirected[:-1], loopKeys))
+        rows, columns = owners[shared], owners[shared + 1]
         graph = coo_matrix((np.ones(len(rows)), (rows, columns)), shape=(len(triangles), len(triangles)))
-        regionCount, regions = connected_components(graph, directed=False)
-        representatives = np.unique(regions, return_index=True)[1]
-        centroids = framed[triangles[representatives]].mean(axis=1)
-        insideRegions = self._insideLoops(centroids, planar[edges[:, 0]], planar[edges[:, 1]])
-        triangles = triangles[insideRegions[regions]]
+        _regionCount, regions = connected_components(graph, directed=False)
+
+        # The face lies on the same side of every loop edge (the loops are directed as the mesh
+        # rim): on the left if the loops enclose positive area. The triangle on that side of each
+        # loop edge marks its region inside, the one across marks its region outside. No point
+        # tests, which fail on the tiny rim edges of a segmented bone.
+        start, end = planar[edges[:, 0]], planar[edges[:, 1]]
+        faceOnLeft = np.sum(start[:, 0] * end[:, 1] - end[:, 0] * start[:, 1]) >= 0
+        directed = np.concatenate([triangles[:, k] * count + triangles[:, (k + 1) % 3] for k in range(3)])
+        owner = np.tile(np.arange(len(triangles)), 3)
+        order = np.argsort(directed)
+        directed, owner = directed[order], owner[order]
+
+        def trianglesWith(keys: np.ndarray) -> Optional[np.ndarray]:
+            found = np.searchsorted(directed, keys)
+            if np.any(found >= len(directed)) or np.any(directed[np.minimum(found, len(directed) - 1)] != keys):
+                return None  # a loop edge is not an edge of the triangulation
+            return owner[found]
+
+        left = trianglesWith(edges[:, 0] * count + edges[:, 1])
+        right = trianglesWith(edges[:, 1] * count + edges[:, 0])
+        if left is None or right is None:
+            return None
+        inside, outside = (left, right) if faceOnLeft else (right, left)
+        insideRegions, outsideRegions = np.unique(regions[inside]), np.unique(regions[outside])
+        if np.intersect1d(insideRegions, outsideRegions).size:
+            return None  # the loops do not bound a face consistently
+        triangles = triangles[np.isin(regions, insideRegions)]
         if len(triangles) == 0 or triangles.max() >= len(planar):
             return None
 
@@ -1548,12 +1606,74 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         keys, uses = np.unique(sortedEdges[:, 0] * count + sortedEdges[:, 1], return_counts=True)
         if not np.array_equal(keys[uses == 1], loopKeys):
             return None
-        corners = planar[triangles]
-        area = ((corners[:, 1, 0] - corners[:, 0, 0]) * (corners[:, 2, 1] - corners[:, 0, 1])
-                - (corners[:, 1, 1] - corners[:, 0, 1]) * (corners[:, 2, 0] - corners[:, 0, 0]))
-        clockwise = area < 0
-        triangles[clockwise] = triangles[clockwise][:, [0, 2, 1]]
         return triangles
+
+    @staticmethod
+    def _recoverEdges(points: np.ndarray, triangles: np.ndarray, missing: np.ndarray) -> Optional[np.ndarray]:
+        """Make each given edge an edge of a 2D triangulation by flipping the edges that cross it
+        (Sloan's method for constrained triangulations). No point is added; the triangles stay
+        counter-clockwise.
+
+        :param points: (K, 2) point coordinates.
+        :param triangles: (C, 3) counter-clockwise triangles covering the points' hull.
+        :param missing: (M, 2) point index pairs to become edges.
+        :return: the triangles, or None if an edge cannot be recovered (e.g. a point lies on it).
+        """
+        triangles = [list(triangle) for triangle in np.asarray(triangles, dtype=np.int64)]
+        edgeTriangles = {}  # (smaller, larger) point index -> triangles using the edge
+
+        def edgeKey(u: int, v: int) -> tuple[int, int]:
+            return (u, v) if u < v else (v, u)
+
+        def link(index: int, add: bool) -> None:
+            triangle = triangles[index]
+            for k in range(3):
+                owners = edgeTriangles.setdefault(edgeKey(triangle[k], triangle[(k + 1) % 3]), set())
+                owners.add(index) if add else owners.discard(index)
+
+        def orientation(a: int, b: int, c: int) -> float:
+            (ax, ay), (bx, by), (cx, cy) = points[a], points[b], points[c]
+            return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+
+        def crosses(u: int, v: int, a: int, b: int) -> bool:
+            """Whether segments uv and ab cross at a point inside both."""
+            return (orientation(a, b, u) * orientation(a, b, v) < 0
+                    and orientation(u, v, a) * orientation(u, v, b) < 0)
+
+        for index in range(len(triangles)):
+            link(index, True)
+        for a, b in (tuple(int(value) for value in pair) for pair in missing):
+            if edgeTriangles.get(edgeKey(a, b)):
+                continue
+            queue = [key for key, owners in edgeTriangles.items()
+                     if owners and a not in key and b not in key and crosses(key[0], key[1], a, b)]
+            budget = 100 * len(queue) + 1000
+            while queue:
+                budget -= 1
+                if budget < 0:
+                    return None
+                u, v = queue.pop(0)
+                owners = edgeTriangles.get(edgeKey(u, v))
+                if not owners or len(owners) != 2:
+                    continue
+                first, second = owners
+                p = next(vertex for vertex in triangles[first] if vertex not in (u, v))
+                q = next(vertex for vertex in triangles[second] if vertex not in (u, v))
+                if not crosses(u, v, p, q):  # the quadrilateral u p v q is not convex: try later
+                    queue.append((u, v))
+                    continue
+                link(first, False)
+                link(second, False)
+                for index, triangle in ((first, [p, u, q]), (second, [q, v, p])):
+                    if orientation(*triangle) < 0:
+                        triangle = [triangle[0], triangle[2], triangle[1]]
+                    triangles[index] = triangle
+                    link(index, True)
+                if a not in (p, q) and b not in (p, q) and crosses(p, q, a, b):
+                    queue.append((p, q))
+            if not edgeTriangles.get(edgeKey(a, b)):
+                return None
+        return np.array(triangles, dtype=np.int64)
 
     @staticmethod
     def _nearestPoints(queries: np.ndarray, points: np.ndarray) -> np.ndarray:
@@ -4089,6 +4209,34 @@ class OsteotomyCutsTest(ScriptedLoadableModuleTest):
         self.assertEqual(len(fragments), 1)
         self._assertWatertight(fragments[0])
         self._assertOnCutSurfaces(fragments[0], sheets, kerf, self._onBoxFaces)
+
+    def test_cap_recoverEdges(self):
+        """A missing rim edge is recovered by flips (no point added, triangles counter-clockwise)."""
+        points = np.array([[0.0, 0.0], [2.0, -0.2], [4.0, 0.0], [2.0, 0.2]])
+        triangles = np.array([[0, 1, 3], [1, 2, 3]])  # Delaunay-like: diagonal 1-3, not 0-2
+        recovered = OsteotomyCutsLogic._recoverEdges(points, triangles, np.array([[0, 2]]))
+        self.assertIsNotNone(recovered)
+        edges = {tuple(sorted((int(t[k]), int(t[(k + 1) % 3])))) for t in recovered for k in range(3)}
+        self.assertIn((0, 2), edges)
+        corners = points[recovered]
+        area = ((corners[:, 1, 0] - corners[:, 0, 0]) * (corners[:, 2, 1] - corners[:, 0, 1])
+                - (corners[:, 1, 1] - corners[:, 0, 1]) * (corners[:, 2, 0] - corners[:, 0, 0]))
+        self.assertTrue(np.all(area > 0))
+        self.assertAlmostEqual(float(area.sum()) / 2.0, 0.8)  # same area as before
+        # A point on the edge makes it unrecoverable
+        onEdge = np.array([[0.0, 0.0], [2.0, 0.0], [4.0, 0.0], [2.0, 1.0], [2.0, -1.0]])
+        fan = np.array([[0, 4, 1], [1, 4, 2], [0, 1, 3], [1, 2, 3]])
+        self.assertIsNone(OsteotomyCutsLogic._recoverEdges(onEdge, fan, np.array([[0, 2]])))
+
+    def test_cap_refinementBudget(self):
+        """When a cap's refinement budget runs out, the cap stays closed (coarser)."""
+        logic = OsteotomyCutsLogic()
+        logic.CAP_MIN_POINT_BUDGET = 0
+        logic.CAP_POINT_BUDGET_PER_RIM_POINT = 0
+        sheets = self._sheets(self._sphere(30.0), [[[1.3, -40.0, 29.0], [1.3, 40.0, 29.0]]], self.DOWN, depths=[5.0])
+        fragments = logic.cutPolyData(self._sphere(30.0), sheets, self._kerfOptions(1.0, 5.0))
+        self.assertEqual(len(fragments), 1)
+        self._assertWatertight(fragments[0])
 
     def test_cap_grooveAndThroughCut(self):
         """A groove, then a through-cut across it: two watertight fragments, each lined."""

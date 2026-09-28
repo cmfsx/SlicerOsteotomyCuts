@@ -21,8 +21,14 @@ Build one phase at a time. Design each so later phases need no rewrite.
 - Phase 2: complete (steps 1-5) and confirmed by the user in Slicer on
   2026-09-27 (grooves, folded/closed grooves, through-cut across a groove,
   real bone).
-- NEXT: plan Phase 3 (BSSO / Le Fort I / genioplasty templates driven by
-  landmarks). Propose the plan and wait for approval before coding.
+- v1.0.0 pre-release (branch `release`, from 3a7458d = Phase 2, no Phase 3):
+  Parts 0-10 of the user's to-do list, done in order, stopping after each
+  for testing in Slicer. Phase 3 work continues on `master` and is merged
+  after the release (Part 10). Nothing is pushed publicly, tagged or put
+  into a pull request until the user types exactly: GO RELEASE.
+  Part 0 done: Phase 2 robustness fixes ported from master (cap regions by
+  rim-edge direction, missing rim edges recovered by flips, cap refinement
+  point budget, integer-key open edges, scene-close observer guard).
 - Workflow: implement one plan step at a time; run the headless tests,
   commit, then stop so the user can test in Slicer before the next step.
 
@@ -78,6 +84,11 @@ Build one phase at a time. Design each so later phases need no rewrite.
 ## Testing
 - Tests use synthetic geometry (vtkCubeSource, vtkSphereSource) or SampleData.
 - NEVER read, open or copy any patient data folder or DICOM directory.
+- Exception (user-approved 2026-09-28): C:\Dev\Models holds de-identified
+  STL models the user provided (Mandible_solid.stl, Lower Teeth.stl,
+  Mandibular canal.stl; RAS, anterior +y, superior +z). Read them IN PLACE
+  only; never copy or commit them. Checks (exit 0; skipped if unset):
+  $env:OSTEOTOMYCUTS_MODELS = "C:\Dev\Models"; & "C:\ProgramData\slicer.org\3D Slicer 5.13.0-2026-06-30\Slicer.exe" --no-splash --no-main-window --python-script "C:\Dev\OsteotomyCuts\OsteotomyCuts\Testing\Python\run_real_models.py" | Out-Host; $LASTEXITCODE
 - Headless test run (PowerShell); exit code 0 = all passed, 1 = failure:
   & "C:\ProgramData\slicer.org\3D Slicer 5.13.0-2026-06-30\Slicer.exe" --no-splash --no-main-window --python-script "C:\Dev\OsteotomyCuts\OsteotomyCuts\Testing\Python\run_headless_tests.py" | Out-Host; $LASTEXITCODE
 - Benchmark of the cutting core (~200k-triangle synthetic mesh; timings per
