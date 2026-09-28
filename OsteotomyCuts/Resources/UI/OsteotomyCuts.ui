@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="UTF-8"?>
+<?xml version='1.0' encoding='UTF-8'?>
 <ui version="4.0">
  <class>OsteotomyCuts</class>
  <widget class="qMRMLWidget" name="OsteotomyCuts">
@@ -14,20 +14,22 @@
    <item>
     <widget class="ctkCollapsibleButton" name="inputsCollapsibleButton">
      <property name="text">
-      <string>Inputs</string>
+      <string>1. Bone and osteotomy line</string>
      </property>
      <layout class="QFormLayout" name="inputsFormLayout">
       <item row="0" column="0">
        <widget class="QLabel" name="inputModelLabel">
         <property name="text">
-         <string>Model to cut:</string>
+         <string>Bone to cut:</string>
         </property>
        </widget>
       </item>
       <item row="0" column="1">
        <widget class="qMRMLNodeComboBox" name="inputModelSelector">
         <property name="toolTip">
-         <string>Bone model to cut. This may also be a fragment from an earlier cut.</string>
+         <string>The bone model to divide. It can also be a bone segment from an earlier cut.
+Typical: the mandible, or the maxilla and skull, from segmentation.
+Technical: a model node; the original is hidden, never modified.</string>
         </property>
         <property name="nodeTypes">
          <stringlist notr="true">
@@ -54,14 +56,16 @@
       <item row="1" column="0">
        <widget class="QLabel" name="cutCurveLabel">
         <property name="text">
-         <string>Cut path:</string>
+         <string>Osteotomy line:</string>
         </property>
        </widget>
       </item>
       <item row="1" column="1">
        <widget class="qMRMLNodeComboBox" name="cutCurveSelector">
         <property name="toolTip">
-         <string>Markups curve whose points are placed on the bone surface along the osteotomy.</string>
+         <string>The line along which the bone is cut: click points on the bone surface where you would mark the osteotomy in theatre. Each line keeps its own saw direction and cut limits.
+Typical: 3 to 10 points; each point adds a corner.
+Technical: a (linear) markups curve, extruded along the saw direction into the cutting surface (sheet).</string>
         </property>
         <property name="nodeTypes">
          <stringlist notr="true">
@@ -94,7 +98,9 @@
       <item row="2" column="1">
        <widget class="qSlicerMarkupsPlaceWidget" name="cutCurvePlaceWidget">
         <property name="toolTip">
-         <string>Place points of the cut path on the bone surface.</string>
+         <string>Click on the bone to place the points of the osteotomy line.
+Typical: place them in order along the planned cut.
+Technical: markups place mode for the selected curve.</string>
         </property>
         <property name="placeMultipleMarkups">
          <enum>qSlicerMarkupsPlaceWidget::ForcePlaceMultipleMarkups</enum>
@@ -104,14 +110,16 @@
       <item row="3" column="0">
        <widget class="QLabel" name="groupLinesLabel">
         <property name="text">
-         <string>Further lines:</string>
+         <string>Further osteotomy lines:</string>
         </property>
        </widget>
       </item>
       <item row="3" column="1">
        <widget class="qMRMLCheckableNodeComboBox" name="groupLinesSelector">
         <property name="toolTip">
-         <string>Other cut paths cut together with this one in one step, as one osteotomy (e.g. the pterygomaxillary cuts of a Le Fort I). They are cut in the order they are ticked, after the first line; each later line only cuts on its own side of the earlier lines, so it stops where it meets them. Each line keeps its own direction and saw settings: select it as the cut path to set them.</string>
+         <string>Other osteotomy lines cut together with this one in one step, as one osteotomy (e.g. the pterygomaxillary cuts of a Le Fort I). Each later line stops where it meets an earlier one.
+Typical: the lines of one osteotomy, ticked in the order they should be cut.
+Technical: lines are applied in order; a later line only removes bone on its own side of the earlier lines' cutting surfaces.</string>
         </property>
         <property name="nodeTypes">
          <stringlist notr="true">
@@ -126,7 +134,7 @@
       <item row="4" column="0" colspan="2">
        <widget class="QLabel" name="groupOrderLabel">
         <property name="text">
-         <string/>
+         <string />
         </property>
         <property name="wordWrap">
          <bool>true</bool>
@@ -136,14 +144,16 @@
       <item row="5" column="0">
        <widget class="QLabel" name="snapToSurfaceLabel">
         <property name="text">
-         <string>Snap to surface:</string>
+         <string>Keep points on the bone:</string>
         </property>
        </widget>
       </item>
       <item row="5" column="1">
        <widget class="QCheckBox" name="snapToSurfaceCheckBox">
         <property name="toolTip">
-         <string>Keep the cut path points on the surface of the model to cut.</string>
+         <string>Moves the points of the osteotomy lines onto the bone surface after they are placed or moved.
+Typical: on.
+Technical: control points are snapped to the closest point of the model surface.</string>
         </property>
         <property name="SlicerParameterName" stdset="0">
          <string>snapToSurface</string>
@@ -160,7 +170,9 @@
       <item row="6" column="1">
        <widget class="QCheckBox" name="treatBoneAsSolidCheckBox">
         <property name="toolTip">
-         <string>Cut a solid version of the bone: holes in the surface are sealed and internal surfaces (marrow, canals, inner side of the cortex) are filled, so that the cut separates the bone cleanly into closed segments. The surface is rebuilt at the solid model detail (Advanced), which moves it by about that much. The first cut of a model takes a few seconds longer. Models made with "Create solid bone model" and segments of a solid cut are used as they are.</string>
+         <string>Cuts a solid version of the bone: holes are sealed and internal surfaces (marrow, canals, inner cortex) are filled, so the bone divides cleanly into closed bone segments. Models made with "Create solid bone model", and segments of a solid cut, are used as they are.
+Typical: on; the first cut of a bone takes a few seconds longer, and its surface moves by up to about half the solid model detail (Advanced).
+Technical: the surface is voxelised, closed morphologically, cavities filled and re-meshed (flying edges, windowed sinc smoothing).</string>
         </property>
         <property name="SlicerParameterName" stdset="0">
          <string>treatBoneAsSolid</string>
@@ -170,7 +182,9 @@
       <item row="7" column="1">
        <widget class="QPushButton" name="createSolidButton">
         <property name="toolTip">
-         <string>Create a solid copy of the model to cut (named "..._solid"), seal its holes and fill its internal surfaces, and select it for cutting. The original model is hidden, not changed.</string>
+         <string>Makes a solid copy of the bone (named "..._solid") with holes sealed and internal surfaces filled, and selects it for cutting. The original model is hidden, not changed.
+Typical: once per bone model from segmentation.
+Technical: as "Treat bone as solid"; the copy is marked solid.</string>
         </property>
         <property name="text">
          <string>Create solid bone model</string>
@@ -183,16 +197,18 @@
    <item>
     <widget class="ctkCollapsibleButton" name="directionCollapsibleButton">
      <property name="text">
-      <string>Extrusion direction</string>
+      <string>2. Saw direction</string>
      </property>
      <layout class="QGridLayout" name="directionGridLayout">
       <item row="0" column="0">
        <widget class="QRadioButton" name="directionViewRadioButton">
         <property name="toolTip">
-         <string>Extrude the cut path along the viewing direction of the 3D view, captured when the button is pressed.</string>
+         <string>The saw direction is the direction you look along in the 3D view when you press "Set saw direction from view".
+Typical: rotate the view to look the way you would hold the saw.
+Technical: the camera's direction of projection, stored when set (extrusion direction).</string>
         </property>
         <property name="text">
-         <string>Current 3D view</string>
+         <string>From 3D view</string>
         </property>
         <property name="checked">
          <bool>true</bool>
@@ -202,34 +218,40 @@
       <item row="0" column="1">
        <widget class="QPushButton" name="captureViewDirectionButton">
         <property name="toolTip">
-         <string>Store the current viewing direction of the first 3D view as the extrusion direction.</string>
+         <string>Stores the current viewing direction of the 3D view as the saw direction of the selected osteotomy line.
+Typical: press again after rotating the view to change it.
+Technical: captures the direction of projection of the first 3D view.</string>
         </property>
         <property name="text">
-         <string>Capture view direction</string>
+         <string>Set saw direction from view</string>
         </property>
        </widget>
       </item>
       <item row="1" column="1">
        <widget class="QLabel" name="viewDirectionLabel">
         <property name="text">
-         <string>Not captured</string>
+         <string>Not set</string>
         </property>
        </widget>
       </item>
       <item row="2" column="0">
        <widget class="QRadioButton" name="directionLineRadioButton">
         <property name="toolTip">
-         <string>Extrude the cut path along a markups line. Place its first point outside the bone and its second point towards the inside: the cut depth is measured in that direction.</string>
+         <string>The saw direction follows a line you draw: first point outside the bone, second point towards the inside. Gives a precise, reproducible angle.
+Typical: for exact angles.
+Technical: markups line, point 1 to point 2; the cut depth is measured along it.</string>
         </property>
         <property name="text">
-         <string>Markups line</string>
+         <string>Direction line</string>
         </property>
        </widget>
       </item>
       <item row="2" column="1">
        <widget class="qMRMLNodeComboBox" name="directionLineSelector">
         <property name="toolTip">
-         <string>Markups line defining the extrusion direction.</string>
+         <string>The line that sets the saw direction.
+Typical: two points, from outside to inside the bone.
+Technical: markups line node.</string>
         </property>
         <property name="nodeTypes">
          <stringlist notr="true">
@@ -262,7 +284,9 @@
       <item row="3" column="1">
        <widget class="qSlicerMarkupsPlaceWidget" name="directionLinePlaceWidget">
         <property name="toolTip">
-         <string>Place the two points of the direction line.</string>
+         <string>Place the two points of the direction line.
+Typical: first outside the bone, then inside.
+Technical: markups place mode.</string>
         </property>
        </widget>
       </item>
@@ -272,20 +296,24 @@
    <item>
     <widget class="ctkCollapsibleButton" name="sawCollapsibleButton">
      <property name="text">
-      <string>Saw</string>
+      <string>3. Saw and cut limits</string>
      </property>
      <layout class="QFormLayout" name="sawFormLayout">
-      <item row="0" column="0">
+      <item row="0" column="0"><widget class="QLabel" name="bladePresetLabel"><property name="text"><string>Saw blade:</string></property></widget></item><item row="0" column="1"><widget class="QComboBox" name="bladePresetComboBox"><property name="toolTip"><string>Choose the saw blade; this sets the saw blade thickness below.
+Typical: "Standard blade (1.0 mm)" for an oscillating saw.
+Technical: presets of the kerf width; "Custom" when another thickness is typed.</string></property><item><property name="text"><string>Ideal cut (no bone lost)</string></property></item><item><property name="text"><string>Thin blade (0.5 mm)</string></property></item><item><property name="text"><string>Standard blade (1.0 mm)</string></property></item><item><property name="text"><string>Custom</string></property></item></widget></item><item row="1" column="0">
        <widget class="QLabel" name="kerfWidthLabel">
         <property name="text">
-         <string>Kerf width:</string>
+         <string>Saw blade thickness:</string>
         </property>
        </widget>
       </item>
-      <item row="0" column="1">
+      <item row="1" column="1">
        <widget class="ctkDoubleSpinBox" name="kerfWidthSpinBox">
         <property name="toolTip">
-         <string>Width of bone removed by the saw blade (typically about 1.0 mm for an oscillating saw, 0.3-0.5 mm for a piezo insert). 0 gives a zero-width cut.</string>
+         <string>Thickness of bone removed by the saw. Choosing a blade above sets it; typing a value chooses "Custom".
+Typical: 1.0 mm for an oscillating saw, 0.5 mm for a thin blade, 0.3-0.5 mm for a piezo insert; 0 is an ideal cut with no bone lost.
+Technical: kerf width: bone closer than half of it to the cutting surface is removed.</string>
         </property>
         <property name="decimals">
          <number>2</number>
@@ -304,17 +332,19 @@
         </property>
        </widget>
       </item>
-      <item row="1" column="0">
+      <item row="2" column="0">
        <widget class="QLabel" name="depthLabel">
         <property name="text">
-         <string>Cut depth (0 = through):</string>
+         <string>Cut depth:</string>
         </property>
        </widget>
       </item>
-      <item row="1" column="1">
+      <item row="2" column="1">
        <widget class="ctkDoubleSpinBox" name="depthSpinBox">
         <property name="toolTip">
-         <string>How deep the cut goes from the path points along the extrusion direction. 0 cuts through the whole model. Set a depth whenever other bone lies behind the cut (e.g. about 45-55 mm for a Le Fort I cut, so that it stops at the pterygoid plates). With a kerf width of 0 a limited cut removes a 0.1 mm layer.</string>
+         <string>How far the saw goes into the bone from the osteotomy line, along the saw direction.
+Typical: "Through" (0) for a complete cut; about 45-55 mm for a Le Fort I, to the pterygoid plates.
+Technical: depth of the cutting surface along the extrusion direction; a limited cut with the ideal blade removes a 0.1 mm layer.</string>
         </property>
         <property name="decimals">
          <number>1</number>
@@ -331,19 +361,21 @@
         <property name="SlicerParameterName" stdset="0">
          <string>options.depth</string>
         </property>
-       </widget>
+       <property name="specialValueText"><string>Through</string></property></widget>
       </item>
-      <item row="2" column="0">
+      <item row="3" column="0">
        <widget class="QLabel" name="endExtensionLabel">
         <property name="text">
-         <string>Past line ends (0 = auto):</string>
+         <string>Cut reach beyond the line:</string>
         </property>
        </widget>
       </item>
-      <item row="2" column="1">
+      <item row="3" column="1">
        <widget class="ctkDoubleSpinBox" name="endExtensionSpinBox">
         <property name="toolTip">
-         <string>How far the cut continues past the first and last points of the cut path. 0 continues it right through the model. Set a few millimetres to stop the cut beyond the ends of the line, in a gap between bones, so that bone farther away is not cut (e.g. 5-10 mm past the zygomatic buttresses for a Le Fort I cut). The cut must leave the bone there: a cut ending inside the bone is refused. With a kerf width of 0 a limited cut removes a 0.1 mm layer.</string>
+         <string>How far the cut continues past the first and last points of the osteotomy line. The cut must leave the bone there: a cut ending inside bone is refused.
+Typical: "Automatic" (0) cuts right through; 5-10 mm stops it in a gap between bones (e.g. past the zygomatic buttresses).
+Technical: end extension of the cutting surface along the end tangents.</string>
         </property>
         <property name="decimals">
          <number>1</number>
@@ -360,19 +392,21 @@
         <property name="SlicerParameterName" stdset="0">
          <string>options.endExtension</string>
         </property>
-       </widget>
+       <property name="specialValueText"><string>Automatic</string></property></widget>
       </item>
-      <item row="3" column="0">
+      <item row="4" column="0">
        <widget class="QLabel" name="capCutFacesLabel">
         <property name="text">
-         <string>Cap cut faces:</string>
+         <string>Close cut surfaces:</string>
         </property>
        </widget>
       </item>
-      <item row="3" column="1">
+      <item row="4" column="1">
        <widget class="QCheckBox" name="capCutFacesCheckBox">
         <property name="toolTip">
-         <string>Close the cut faces so that the fragments are watertight (needed for STL export and printing).</string>
+         <string>Closes the cut surfaces so that every bone segment is a closed (watertight) model, as needed for 3D printing and volumes.
+Typical: on.
+Technical: the cut faces are capped by triangulating their rim loops on the cutting surface.</string>
         </property>
         <property name="SlicerParameterName" stdset="0">
          <string>options.capCutFaces</string>
@@ -385,13 +419,15 @@
    <item>
     <widget class="ctkCollapsibleButton" name="structuresCollapsibleButton">
      <property name="text">
-      <string>Structures to protect</string>
+      <string>4. Structures to protect</string>
      </property>
      <layout class="QGridLayout" name="structuresGridLayout">
       <item row="0" column="0" colspan="2">
        <widget class="qMRMLNodeComboBox" name="structureNodeSelector">
         <property name="toolTip">
-         <string>Model (e.g. mandibular canal, teeth) or curve along a nerve to keep clear of the cut.</string>
+         <string>A model (e.g. the mandibular canal or the teeth) or a curve along a nerve, to keep clear of the cut.
+Typical: the canal and tooth models from segmentation.
+Technical: model node, or markups curve with a radius.</string>
         </property>
         <property name="nodeTypes">
          <stringlist notr="true">
@@ -416,7 +452,9 @@
       <item row="0" column="2">
        <widget class="QPushButton" name="addStructureButton">
         <property name="toolTip">
-         <string>Add the selected model or curve to the structures to protect. Its type is guessed from its name (nerve / canal, tooth / teeth) and can be changed below.</string>
+         <string>Adds the chosen model or curve to the structures to protect. Its type is guessed from its name (nerve / canal, tooth / teeth) and can be changed below.
+Typical: add the nerve canal and the teeth.
+Technical: stores the settings as an attribute of the node.</string>
         </property>
         <property name="text">
          <string>Add</string>
@@ -426,7 +464,9 @@
       <item row="1" column="0" colspan="3">
        <widget class="QTableWidget" name="structuresTable">
         <property name="toolTip">
-         <string>Structures to protect and how close the cut comes to each (inside the bone, allowing for the blade width). Select a row to change its settings.</string>
+         <string>How close the planned cut comes to each structure, inside the bone, allowing for the saw blade thickness. Select a row to change its settings.
+Typical: every status "Safe" before cutting.
+Technical: minimum signed distance from the cutting surface (sampled to 0.1 mm) to the structure.</string>
         </property>
         <property name="editTriggers">
          <set>QAbstractItemView::NoEditTriggers</set>
@@ -483,7 +523,9 @@
       <item row="2" column="1" colspan="2">
        <widget class="QComboBox" name="structureCategoryComboBox">
         <property name="toolTip">
-         <string>Kind of structure. Choosing it sets the usual safe distance (nerve 2 mm, tooth root 1 mm, other 1 mm).</string>
+         <string>Kind of structure. Choosing it sets its usual safe distance.
+Typical: nerve 2 mm, tooth root 1 mm, other 1 mm.
+Technical: structure category.</string>
         </property>
         <item>
          <property name="text">
@@ -512,7 +554,9 @@
       <item row="3" column="1" colspan="2">
        <widget class="ctkDoubleSpinBox" name="structureSafeDistanceSpinBox">
         <property name="toolTip">
-         <string>The cut should stay at least this far from the structure. Typical: 2 mm from the inferior alveolar nerve, 1 mm from tooth roots. Closer gives "Too close"; into the structure gives "Cut enters structure".</string>
+         <string>The cut should stay at least this far from the structure. Closer gives "Too close"; into the structure gives "Cut enters structure".
+Typical: 2 mm from the inferior alveolar nerve, 1 mm from tooth roots.
+Technical: clearance threshold.</string>
         </property>
         <property name="decimals">
          <number>1</number>
@@ -538,7 +582,9 @@
       <item row="4" column="1" colspan="2">
        <widget class="ctkDoubleSpinBox" name="structureRadiusSpinBox">
         <property name="toolTip">
-         <string>For a structure traced as a curve along its centre (e.g. the nerve): its radius. Typical: 1.5 mm for the inferior alveolar canal.</string>
+         <string>For a structure traced as a curve along its centre (e.g. the nerve): its radius.
+Typical: 1.5 mm for the inferior alveolar canal.
+Technical: the structure is a tube of this radius round the curve.</string>
         </property>
         <property name="decimals">
          <number>1</number>
@@ -557,7 +603,9 @@
       <item row="5" column="0" colspan="3">
        <widget class="QCheckBox" name="structureEnabledCheckBox">
         <property name="toolTip">
-         <string>Check the distance from the cut to this structure.</string>
+         <string>Check the distance from the cut to this structure.
+Typical: on.
+Technical: structures switched off are not checked.</string>
         </property>
         <property name="text">
          <string>Check this structure</string>
@@ -567,7 +615,9 @@
       <item row="6" column="0" colspan="2">
        <widget class="QPushButton" name="checkDistancesButton">
         <property name="toolTip">
-         <string>Measure how close the cut comes to each structure now. This is also done before every cut, and during live preview.</string>
+         <string>Measures how close the cut comes to each structure now. This is also done before every cut, and during the cut preview.
+Typical: after changing the plan.
+Technical: clearance check of all lines of the osteotomy.</string>
         </property>
         <property name="text">
          <string>Check distances</string>
@@ -577,7 +627,9 @@
       <item row="6" column="2">
        <widget class="QPushButton" name="removeStructureButton">
         <property name="toolTip">
-         <string>Stop protecting the selected structure (its model or curve is kept).</string>
+         <string>Stops protecting the selected structure; its model or curve is kept.
+Typical: 
+Technical: removes the attribute from the node.</string>
         </property>
         <property name="text">
          <string>Remove</string>
@@ -587,7 +639,7 @@
       <item row="7" column="0" colspan="3">
        <widget class="QLabel" name="structuresStatusLabel">
         <property name="text">
-         <string/>
+         <string />
         </property>
         <property name="wordWrap">
          <bool>true</bool>
@@ -606,14 +658,16 @@
       <item row="0" column="0">
        <widget class="QLabel" name="livePreviewLabel">
         <property name="text">
-         <string>Live preview:</string>
+         <string>Show cut preview:</string>
         </property>
        </widget>
       </item>
       <item row="0" column="1">
        <widget class="QCheckBox" name="livePreviewCheckBox">
         <property name="toolTip">
-         <string>Show the cutting sheet and update it while the points are moved.</string>
+         <string>Shows the planned cut (red transparent surface) and red lines wherever it comes out of the bone, updated as points move.
+Typical: on.
+Technical: cutting sheet preview and sheet/bone intersection outline.</string>
         </property>
         <property name="SlicerParameterName" stdset="0">
          <string>livePreview</string>
@@ -623,14 +677,16 @@
       <item row="1" column="0">
        <widget class="QLabel" name="sheetOpacityLabel">
         <property name="text">
-         <string>Sheet opacity:</string>
+         <string>Preview opacity:</string>
         </property>
        </widget>
       </item>
       <item row="1" column="1">
        <widget class="ctkSliderWidget" name="sheetOpacitySliderWidget">
         <property name="toolTip">
-         <string>Opacity of the cutting sheet preview.</string>
+         <string>How transparent the cut preview is.
+Typical: 0.4.
+Technical: opacity of the cutting sheet model.</string>
         </property>
         <property name="singleStep">
          <double>0.050000000000000</double>
@@ -661,14 +717,16 @@
       <item row="0" column="0">
        <widget class="QLabel" name="extensionLabel">
         <property name="text">
-         <string>Sheet extension (mm, 0 = auto):</string>
+         <string>Cut surface size:</string>
         </property>
        </widget>
       </item>
       <item row="0" column="1">
        <widget class="ctkDoubleSpinBox" name="extensionSpinBox">
         <property name="toolTip">
-         <string>How far the cutting sheet reaches out of the bone (against the extrusion direction), and into it when the cut depth is 0 and past the line ends when "Past line ends" is 0. 0 uses the model's bounding-box diagonal, which always cuts fully through. To stop a cut inside the bone, set the cut depth and "Past line ends" instead.</string>
+         <string>How far the planned cut surface reaches out of the bone (and into it when the cut depth is "Through").
+Typical: "Automatic" (the bone's size), which always cuts through. Limit the cut with the cut depth and the cut reach beyond the line instead.
+Technical: sheet extent along the extrusion direction, and past the line ends when that is automatic.</string>
         </property>
         <property name="decimals">
          <number>1</number>
@@ -682,45 +740,37 @@
         <property name="SlicerParameterName" stdset="0">
          <string>options.extension</string>
         </property>
-       </widget>
+       <property name="specialValueText"><string>Automatic</string></property></widget>
       </item>
       <item row="1" column="0">
        <widget class="QLabel" name="minFragmentFractionLabel">
         <property name="text">
-         <string>Min. fragment size (fraction):</string>
+         <string>Discard loose bits smaller than:</string>
         </property>
        </widget>
       </item>
       <item row="1" column="1">
        <widget class="ctkDoubleSpinBox" name="minFragmentFractionSpinBox">
         <property name="toolTip">
-         <string>Free-standing pieces with fewer points than this fraction of the model are discarded. Enclosed pieces (canal, marrow voids) are always kept.</string>
+         <string>Loose bits of bone with fewer points than this percentage of the bone are discarded (specks). Bits inside the bone (canal, marrow) are always kept.
+Typical: 0.1 %.
+Technical: minFragmentFraction, stored as a fraction of the model's points.</string>
         </property>
-        <property name="decimals">
-         <number>4</number>
-        </property>
-        <property name="singleStep">
-         <double>0.001000000000000</double>
-        </property>
-        <property name="maximum">
-         <double>0.500000000000000</double>
-        </property>
-        <property name="SlicerParameterName" stdset="0">
-         <string>options.minFragmentFraction</string>
-        </property>
-       </widget>
+        <property name="decimals"><number>2</number></property><property name="singleStep"><double>0.05</double></property><property name="maximum"><double>50.0</double></property><property name="suffix"><string> %</string></property></widget>
       </item>
       <item row="2" column="0">
        <widget class="QLabel" name="refineEdgeLengthLabel">
         <property name="text">
-         <string>Max. edge near cut (0 = auto):</string>
+         <string>Surface detail at the cut:</string>
         </property>
        </widget>
       </item>
       <item row="2" column="1">
        <widget class="ctkDoubleSpinBox" name="refineEdgeLengthSpinBox">
         <property name="toolTip">
-         <string>Mesh edges near the cut are subdivided until they are shorter than this, so the kerf faces are accurate. 0 uses half the kerf width.</string>
+         <string>The bone surface near the cut is refined to this detail so that the cut surfaces are accurate.
+Typical: "Automatic" (half the saw blade thickness).
+Technical: maximum edge length near the cutting sheet before cutting.</string>
         </property>
         <property name="decimals">
          <number>2</number>
@@ -737,7 +787,7 @@
         <property name="SlicerParameterName" stdset="0">
          <string>options.refineEdgeLength</string>
         </property>
-       </widget>
+       <property name="specialValueText"><string>Automatic</string></property></widget>
       </item>
       <item row="3" column="0">
        <widget class="QLabel" name="solidVoxelSizeLabel">
@@ -749,7 +799,9 @@
       <item row="3" column="1">
        <widget class="ctkDoubleSpinBox" name="solidVoxelSizeSpinBox">
         <property name="toolTip">
-         <string>Size of the smallest detail kept in solid bone models (voxel size). Typical: 0.25 mm for a mandible, 0.4-0.5 mm for a whole skull (finer needs more memory; a model too large for the detail is refused with a suggested value).</string>
+         <string>Size of the smallest detail kept in solid bone models. Finer needs more memory; a model too large for the detail is refused with a suggested value.
+Typical: 0.25 mm for a mandible, 0.4-0.5 mm for a whole skull.
+Technical: voxel size of the solid model.</string>
         </property>
         <property name="decimals">
          <number>2</number>
@@ -781,7 +833,9 @@
       <item row="4" column="1">
        <widget class="ctkDoubleSpinBox" name="solidGapSealSpinBox">
         <property name="toolTip">
-         <string>Holes and gaps in the bone surface up to about twice this width are sealed in solid bone models (morphological closing radius). Typical: 1.5 mm. Larger values also fill narrow gaps between bones and sharp notches.</string>
+         <string>Holes and gaps in the bone surface up to about twice this width are sealed in solid bone models. Larger values also fill narrow gaps between bones and sharp notches (e.g. between teeth).
+Typical: 1.5 mm.
+Technical: radius of the morphological closing.</string>
         </property>
         <property name="decimals">
          <number>1</number>
@@ -810,7 +864,9 @@
       <item row="5" column="1">
        <widget class="ctkDoubleSpinBox" name="minSegmentPercentSpinBox">
         <property name="toolTip">
-         <string>Loose pieces left between the cuts (e.g. bits of the pterygoid plates or of thin sinus and nasal walls) with less surface than this percentage of the largest bone segment are joined to the bone segment they touch most, so that only the planned segments remain. Typical: 1 %. 0 keeps every piece as its own segment.</string>
+         <string>Loose pieces left between the cuts (e.g. bits of the pterygoid plates, or of thin sinus and nasal walls) with less surface than this percentage of the largest bone segment are joined to the bone segment they touch most, so that only the planned segments remain.
+Typical: 1 %; 0 keeps every piece as its own bone segment.
+Technical: pieces are appended to the large segment with most points within the blade thickness + 1 mm.</string>
         </property>
         <property name="decimals">
          <number>1</number>
@@ -840,10 +896,12 @@
         <bool>false</bool>
        </property>
        <property name="toolTip">
-        <string>Cut the model along the cutting sheet.</string>
+        <string>Cuts the bone along the osteotomy line(s) and creates the bone segments. The bone model is checked first, and you are warned about structures that are too close.
+Typical: after checking the preview.
+Technical: applies all lines of the osteotomy in order.</string>
        </property>
        <property name="text">
-        <string>Apply cut</string>
+        <string>Make cut</string>
        </property>
       </widget>
      </item>
@@ -853,10 +911,12 @@
         <bool>false</bool>
        </property>
        <property name="toolTip">
-        <string>Remove the fragments produced by the selected cut path and show its input model again.</string>
+        <string>Removes the bone segments made by the selected osteotomy and shows its bone again.
+Typical: to change the plan and cut again.
+Technical: deletes the segments linked to the osteotomy's first line.</string>
        </property>
        <property name="text">
-        <string>Undo cut (this curve)</string>
+        <string>Undo this cut</string>
        </property>
       </widget>
      </item>
@@ -865,7 +925,7 @@
    <item>
     <widget class="QLabel" name="statusLabel">
      <property name="text">
-      <string/>
+      <string />
      </property>
      <property name="wordWrap">
       <bool>true</bool>
@@ -875,7 +935,7 @@
    <item>
     <widget class="ctkCollapsibleButton" name="mergeCollapsibleButton">
      <property name="text">
-      <string>Merge fragments</string>
+      <string>Rejoin bone segments</string>
      </property>
      <property name="collapsed">
       <bool>true</bool>
@@ -884,7 +944,9 @@
       <item>
        <widget class="qMRMLCheckableNodeComboBox" name="mergeFragmentsSelector">
         <property name="toolTip">
-         <string>Tick two or more fragments from the same cut to join them into one model.</string>
+         <string>Tick two or more bone segments from the same cut to join them into one.
+Typical: to undo an unwanted cut, e.g. on the opposite side.
+Technical: the segments are appended into one model.</string>
         </property>
         <property name="nodeTypes">
          <stringlist notr="true">
@@ -902,10 +964,12 @@
          <bool>false</bool>
         </property>
         <property name="toolTip">
-         <string>Join the ticked fragments into one model.</string>
+         <string>Joins the ticked bone segments into one model.
+Typical: two or more segments of the same cut.
+Technical: mesh append; the lowest-numbered segment keeps its name and colour.</string>
         </property>
         <property name="text">
-         <string>Merge selected</string>
+         <string>Rejoin selected bone segments</string>
         </property>
        </widget>
       </item>
@@ -972,7 +1036,7 @@
    <header>ctkSliderWidget.h</header>
   </customwidget>
  </customwidgets>
- <resources/>
+ <resources />
  <connections>
   <connection>
    <sender>OsteotomyCuts</sender>

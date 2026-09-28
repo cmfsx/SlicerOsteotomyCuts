@@ -44,42 +44,83 @@ class OsteotomyCuts(ScriptedLoadableModule):
     def __init__(self, parent):
         ScriptedLoadableModule.__init__(self, parent)
         self.parent.title = _("Osteotomy Cuts")
-        self.parent.categories = [translate("qSlicerAbstractCoreModule", "Surgical planning")]
+        self.parent.categories = [translate("qSlicerAbstractCoreModule", "Surgical Planning")]
         self.parent.dependencies = ["Markups", "Models", "SubjectHierarchy"]
-        self.parent.contributors = ["Manjula Herath (FaceLab.care)"]
-        self.parent.helpText = _("""
-Virtual osteotomy for orthognathic and craniofacial surgical planning.
-Place the points of a cut path on the bone surface, choose an extrusion direction, and
-the bone model is split along the extruded cutting sheet into separate fragments.
-The original model is hidden, never modified.
+        self.parent.contributors = [MODULE_CONTRIBUTOR]
+        self.parent.helpText = _("""<p><b>Osteotomy Cuts</b> — virtual osteotomies for orthognathic and
+craniofacial surgical planning. Draw an osteotomy line on the bone, set the
+saw direction, and the bone is divided into separate bone segments. The
+original bone model is kept unchanged and hidden.</p>
 
-The red lines of the preview show every place the cut comes out of the bone. If they appear
-where bone must stay intact (e.g. the skull base behind a maxilla), limit the cut:
-"Cut depth" stops it inside the bone, and "Past line ends" stops it a few millimetres beyond
-the first and last points of the cut path, in a gap between bones (the cut must leave the bone
-there).
+<p><b>Quick start</b></p>
+<ol>
+<li><b>Bone to cut:</b> select the bone model. For best results use
+<i>Create solid bone model</i> first, or keep <i>Treat bone as solid</i>
+ticked.</li>
+<li><b>Osteotomy line:</b> click points on the bone surface where you
+would mark the cut in theatre. Each point adds a corner.</li>
+<li><b>Saw direction:</b> rotate the 3D view to look along the direction
+you would hold the saw, then press <i>Set saw direction from view</i>.
+Or draw a direction line for a precise, reproducible angle.</li>
+<li><b>Check the preview:</b> the red transparent surface is the planned
+cut. The <b>red lines</b> show every place where the cut comes out of the
+bone.</li>
+<li><b>Make cut.</b> Use <i>Undo this cut</i> to remove it and try
+again.</li>
+</ol>
 
-Several cut paths can be cut together in one step as one osteotomy ("Further lines"). They are
-cut in order; each later line only cuts on its own side of the earlier lines, so it stops where
-it meets them. Each line keeps its own direction and saw settings: select it as the cut path to
-see or change them.
+<p><b>Keeping the cut where you want it</b><br>
+If red lines appear where bone must stay intact (for example the skull
+base behind the maxilla), limit the cut:</p>
+<ul>
+<li><b>Cut depth</b> stops the saw inside the bone at the set depth
+(0 = through and through).</li>
+<li><b>Cut reach beyond the line</b> stops the cut a few millimetres past
+the first and last points. Place those end points where the cut should
+exit, for example in a gap between bones.</li>
+<li>For an unwanted cut on the opposite side, use <i>Rejoin selected bone
+segments</i>.</li>
+</ul>
 
-Example, Le Fort I on a skull model (two lines):
-1. Horizontal line: place the cut path points from one zygomatic buttress round the anterior
-maxilla to the other, above the tooth apices. Look at the skull from the front and capture the
-view direction (the cut runs backwards). Set the cut depth to about 45-55 mm (to the pterygoid
-plates), "Past line ends" to 5-10 mm, and a kerf of 0.5-1.0 mm.
-2. Pterygomaxillary line: create a second cut path and place its points on the side of the
-maxilla behind the tuberosity, from the horizontal line downwards. Look at the skull from the
-side and capture the view direction (it cuts both sides). Leave the cut depth and "Past line
-ends" at 0: it stops at the horizontal cut, so the bone above is not cut.
-3. Select the horizontal line again and tick the second line under "Further lines". Check that
-the red lines stay on the maxilla, then apply the cut.
-""")
-        self.parent.acknowledgementText = _("""
-Based on the 3D Slicer scripted module template developed by Jean-Christophe Fillion-Robin,
-Kitware Inc., Andras Lasso, PerkLab, and Steve Pieper, Isomics, Inc.
-""")
+<p><b>Example: Le Fort I on a skull model</b></p>
+<ol>
+<li>Place the osteotomy line from one zygomatic buttress, round the
+anterior maxilla, to the other, about 5 mm above the tooth apices.</li>
+<li>View the skull from the front and press <i>Set saw direction from
+view</i> (the saw runs backwards).</li>
+<li>Set <b>Cut depth</b> to about 45–55 mm (to the pterygoid plates),
+<b>Cut reach beyond the line</b> to 5–10 mm, and <b>Saw blade
+thickness</b> to 0.5–1.0 mm.</li>
+<li>Check that the red lines stay on the maxilla, then press
+<i>Make cut</i>.</li>
+</ol>
+
+<p><b>Structures to protect</b><br>
+Add the nerve canal, tooth roots or other structures with a safe
+distance for each. The cut preview is coloured green (safe), amber (too
+close) or red (cut enters the structure), and you are warned before
+cutting. Safety checks are an aid only: they depend on the accuracy of
+the segmented or traced structures, do not guarantee the absence of
+risk, and do not replace the surgeon's own verification.</p>
+
+<p><b>Important:</b> research and planning software, not a medical
+device. Use is entirely at the user's own risk. See DISCLAIMER.md.
+Licensed under GPL-3.0-or-later.</p>""")
+        self.parent.acknowledgementText = _("""<p>Developed by <b>Dr Manjula Herath</b>, BDS, MD (OMFS), Consultant Oral
+and Maxillofacial Surgeon — Ministry of Health, Sri Lanka; FaceLab,
+Colombo, Sri Lanka (<a href="https://facelab.care">facelab.care</a>);
+Malmö University, Malmö, Sweden.</p>
+
+<p>Developed with the assistance of Claude Code (Anthropic), under the
+clinical direction and review of the author.</p>
+
+<p>Module structure based on the 3D Slicer scripted module template by
+Jean-Christophe Fillion-Robin (Kitware Inc.), Andras Lasso (PerkLab) and
+Steve Pieper (Isomics, Inc.).</p>
+
+<p>Licensed under GPL-3.0-or-later. Research and planning software, not
+a medical device; use is entirely at the user's own risk — see
+DISCLAIMER.md.</p>""")
 
 
 #
@@ -98,6 +139,9 @@ NOT_CAPTURED = (0.0, 0.0, 0.0)
 
 # Version of the module, recorded on every bone segment (provenance)
 MODULE_VERSION = "1.0.0"
+# The only contributor entry, as in the extension's CMakeLists.txt (EXTENSION_CONTRIBUTORS)
+MODULE_CONTRIBUTOR = ("Manjula Herath (Ministry of Health, Sri Lanka; FaceLab, Colombo, "
+                      "Sri Lanka; Malmö University, Sweden)")
 
 # Called with (percent 0-100, message) to report progress of long operations
 ProgressCallback = Callable[[int, str], None]
@@ -743,6 +787,11 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._previewTimer.setInterval(self.PREVIEW_DELAY_MS)
         self._previewTimer.connect("timeout()", self._updatePreview)
 
+        # Display-only widgets bound here: the blade presets (worked out from the thickness) and the
+        # discard size shown as a percentage (stored as a fraction)
+        self.ui.bladePresetComboBox.connect("activated(int)", self.onBladePresetChosen)
+        self.ui.minFragmentFractionSpinBox.connect("valueChanged(double)", self.onDiscardPercentChanged)
+
         self.ui.addStructureButton.connect("clicked(bool)", self.onAddStructure)
         self.ui.removeStructureButton.connect("clicked(bool)", self.onRemoveStructure)
         self.ui.checkDistancesButton.connect("clicked(bool)", self.onCheckDistances)
@@ -831,6 +880,20 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.addObserver(self._parameterNode.parameterNode, vtk.vtkCommand.ModifiedEvent, self._updateGuiFromParameterNode)
             self._updateGuiFromParameterNode()
 
+    # Saw blade thickness (mm) of the blade presets, in the order of the combo box; the last
+    # entry, "Custom", has none
+    BLADE_PRESETS = (0.0, 0.5, 1.0)
+
+    def onBladePresetChosen(self, index: int) -> None:
+        """A chosen blade sets the saw blade thickness ("Custom" leaves it)."""
+        if self._parameterNode and index < len(self.BLADE_PRESETS):
+            self._parameterNode.options.kerfWidth = self.BLADE_PRESETS[index]
+
+    def onDiscardPercentChanged(self, percent: float) -> None:
+        """Store the discard size, shown as a percentage, as a fraction."""
+        if self._parameterNode:
+            self._parameterNode.options.minFragmentFraction = percent / 100.0
+
     def onDirectionModeToggled(self, checked: bool) -> None:
         """Store the direction mode selected with the radio buttons."""
         if not self._parameterNode or not checked:
@@ -857,9 +920,19 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.ui.directionLineSelector.enabled = isLineMode
         self.ui.directionLinePlaceWidget.enabled = isLineMode
 
+        options = self._parameterNode.options
+        presetIndex = next((i for i, width in enumerate(self.BLADE_PRESETS) if abs(options.kerfWidth - width) < 1e-6),
+                           len(self.BLADE_PRESETS))
+        wasBlocked = self.ui.bladePresetComboBox.blockSignals(True)
+        self.ui.bladePresetComboBox.currentIndex = presetIndex
+        self.ui.bladePresetComboBox.blockSignals(wasBlocked)
+        wasBlocked = self.ui.minFragmentFractionSpinBox.blockSignals(True)
+        self.ui.minFragmentFractionSpinBox.value = 100.0 * options.minFragmentFraction
+        self.ui.minFragmentFractionSpinBox.blockSignals(wasBlocked)
+
         viewDirection = self._parameterNode.viewDirection
         if not isDirectionCaptured(viewDirection):
-            self.ui.viewDirectionLabel.text = _("Not captured")
+            self.ui.viewDirectionLabel.text = _("Not set")
         else:
             self.ui.viewDirectionLabel.text = "({:.2f}, {:.2f}, {:.2f})".format(*viewDirection)
 
@@ -1171,7 +1244,7 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.ui.createSolidButton.enabled = (haveScipy and inputModel is not None
                                              and not self.logic.isSolidModel(inputModel))
         self.ui.applyButton.enabled = reason is None
-        self.ui.applyButton.toolTip = reason or _("Cut the model along the cutting sheet.")
+        self.ui.applyButton.toolTip = reason or _("Cut the bone along the osteotomy line(s) and create the bone segments.")
         self.ui.undoButton.enabled = bool(self.logic.getCurveResult(
             self.logic.findFirstLine(self._parameterNode.cutCurve)))
         self.ui.statusLabel.text = reason or self._resultMessage or _("Ready to cut.")
@@ -1211,7 +1284,7 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     def onCaptureViewDirection(self) -> None:
         """Store the viewing direction of the first 3D view."""
-        with slicer.util.tryWithErrorDisplay(_("Failed to capture the view direction."), waitCursor=True):
+        with slicer.util.tryWithErrorDisplay(_("Failed to set the saw direction."), waitCursor=True):
             viewNode = slicer.app.layoutManager().threeDWidget(0).mrmlViewNode()
             self.logic.captureViewDirection(self._requireParameterNode(), viewNode)
 
@@ -1366,10 +1439,10 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     def onMergeButton(self) -> None:
         """Join the ticked fragments into one model."""
-        with slicer.util.tryWithErrorDisplay(_("Failed to merge the fragments."), waitCursor=True):
+        with slicer.util.tryWithErrorDisplay(_("Failed to rejoin the bone segments."), waitCursor=True):
             self._requireParameterNode()
             merged =self.logic.mergeFragments(list(self.ui.mergeFragmentsSelector.checkedNodes()))
-            self._resultMessage = _("Fragments merged into {name}.").format(name=merged.GetName())
+            self._resultMessage = _("Bone segments rejoined into {name}.").format(name=merged.GetName())
         self._updateActionState()
 
 
@@ -1533,7 +1606,7 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         if points.ndim != 2 or points.shape[1] != 3:
             raise ValueError(_("Path points must be an (N, 3) array."))
         if not extent > 0:
-            raise ValueError(_("Sheet extent must be positive."))
+            raise ValueError(_("The cut surface size must be positive."))
         endExtension = float(extent) if endExtension is None else float(endExtension)
         if not endExtension > 0:
             raise ValueError(_("The distance the cut continues past the line ends must be positive."))
@@ -1545,7 +1618,7 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
             raise ValueError(_("Directions must be a single 3-vector or one 3-vector per path point."))
         lengths = np.linalg.norm(dirs, axis=1)
         if np.any(lengths < 1e-9):
-            raise ValueError(_("The extrusion direction must not be a zero vector."))
+            raise ValueError(_("The saw direction is not set (zero vector)."))
         dirs = dirs / lengths[:, np.newaxis]
 
         depths = np.full(len(points), float(extent)) if depth is None else np.asarray(depth, dtype=float)
@@ -1566,7 +1639,7 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
 
         minPoints = 3 if closed else 2
         if len(points) < minPoints:
-            raise ValueError(_("The cut path needs at least {count} distinct points.").format(count=minPoints))
+            raise ValueError(_("The osteotomy line needs at least {count} distinct points.").format(count=minPoints))
 
         # Reject segments (nearly) parallel to the extrusion direction at either end
         maxCosine = np.cos(np.radians(self.MIN_SEGMENT_DIRECTION_ANGLE_DEG))
@@ -1577,7 +1650,7 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
             tangent = points[j] - points[i]
             tangent /= np.linalg.norm(tangent)
             if max(abs(np.dot(tangent, dirs[i])), abs(np.dot(tangent, dirs[j]))) > maxCosine:
-                raise ValueError(_("Cut path segment {index} is almost parallel to the extrusion direction.")
+                raise ValueError(_("Segment {index} of the osteotomy line runs almost along the saw direction. Change the saw direction or move the points.")
                                  .format(index=i + 1))
 
         if not closed:
@@ -1737,7 +1810,7 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         :raises ValueError: for kerfWidth > 0 (use removeKerf).
         """
         if options.kerfWidth > 0:
-            raise ValueError(_("A cut with a kerf width removes material; use removeKerf."))
+            raise ValueError(_("A saw blade thickness removes bone (internal: use removeKerf)."))
         polyWithDistance.GetPointData().SetActiveScalars(arrayName)
         clipper = vtk.vtkClipPolyData()
         clipper.SetInputData(polyWithDistance)
@@ -1776,7 +1849,7 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
             across an earlier line outside that line's cut).
         """
         if not kerfWidth > 0:
-            raise ValueError(_("The kerf width must be positive."))
+            raise ValueError(_("The saw blade thickness must be positive."))
         halfKerf = kerfWidth / 2.0
         mesh = self._ensureTriangles(polyWithDistance)
         arrays, normalsName, scalarsName = self._pointArrays(mesh)
@@ -2684,7 +2757,7 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         triangles = numpy_support.vtk_to_numpy(mesh.GetPolys().GetConnectivityArray()).reshape(-1, 3).astype(np.int64)
         arrays, normalsName, scalarsName = self._pointArrays(mesh)
         if arrayName not in arrays:
-            raise ValueError(_("The mesh has no sheet distance array."))
+            raise ValueError(_("Internal error: the mesh has no distance to the cut (SheetDistance)."))
 
         implicitDistance = vtk.vtkImplicitPolyDataDistance()
         implicitDistance.SetInput(sheetPolyData)
@@ -2708,7 +2781,7 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
                 break
             if pointCount + splitCount > self.MAX_REFINED_POINTS:
                 raise ValueError(_("Refining the mesh near the cut would create too many points. "
-                                   "Increase the maximum edge length near the cut or the kerf width."))
+                                   "Make the surface detail at the cut coarser (Advanced) or the saw blade thicker."))
 
             # New midpoints, with exact distances and interpolated point data
             splitStart, splitEnd = edgeStart[split], edgeEnd[split]
@@ -2987,11 +3060,11 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         """
         report = progressCallback or (lambda percent, message: None)
         if not sheets:
-            raise ValueError(_("At least one cutting sheet is needed."))
+            raise ValueError(_("At least one osteotomy line is needed."))
         optionsList = list(options) if isinstance(options, (list, tuple)) else [options] * len(sheets)
         stopsList = list(stops) if stops is not None else [[] for _sheet in sheets]
         if len(optionsList) != len(sheets) or len(stopsList) != len(sheets):
-            raise ValueError(_("One set of options and stops is needed per cutting sheet."))
+            raise ValueError(_("One set of options and stops is needed per osteotomy line."))
         # A fragment of an earlier cut has duplicate points along sharp edges (display normals)
         triangles = self.mergeCoincidentPoints(self._ensureTriangles(polyData))
         if triangles.GetNumberOfCells() == 0:
@@ -3000,8 +3073,8 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         uncapped = 0
 
         endsMessage = _("Osteotomy line {index}: the cut ends inside the bone beyond the ends of the line. Increase "
-                        "\"Past line ends\" until the red outline of the preview no longer ends on the bone, or set "
-                        "it to 0.")
+                        "\"Cut reach beyond the line\" until the red outline of the preview no longer ends on the bone, or set "
+                        "it to Automatic (0).")
         if any(width > 0 and not sheetStops for width, sheetStops in zip(kerfWidths, stopsList)):
             locator = vtk.vtkCellLocator()
             locator.SetDataSet(triangles)
@@ -3050,7 +3123,7 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
                     except StopConflictError:
                         raise ValueError(_("Osteotomy line {index} reaches bone on the far side of an earlier line, "
                                            "beyond the end of that line's cut. Make the earlier line deeper (cut "
-                                           "depth) or longer (past line ends), or move line {index} so that it meets "
+                                           "depth) or longer (cut reach beyond the line), or move line {index} so that it meets "
                                            "the earlier cut.").format(index=sheetIndex + 1))
                     if protectedName:
                         remaining.GetPointData().RemoveArray(protectedName)
@@ -3069,11 +3142,11 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
                             uncapped += failed
                         nextSides.append((part, signature + (side,)))
             if kerfWidth > 0 and not removedAny:
-                raise ValueError(_("Cutting sheet {index} does not reach the model. Check the cut path, "
+                raise ValueError(_("Osteotomy line {index} does not reach the bone. Check the line, the saw "
                                    "direction and depth.").format(index=sheetIndex + 1))
             sides = nextSides
 
-        report(75, _("Separating fragments..."))
+        report(75, _("Separating the bone segments..."))
         pieces = []
         for mesh, signature in sides:
             pieces.extend(self.extractFragments(mesh, signature))
@@ -3588,7 +3661,7 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         :raises ValueError: if the curve has fewer than 2 control points.
         """
         if curveNode is None or curveNode.GetNumberOfControlPoints() < 2:
-            raise ValueError(_("The cut path needs at least 2 points."))
+            raise ValueError(_("The osteotomy line needs at least 2 points."))
         if curveNode.GetCurveType() == slicer.vtkCurveGenerator.CURVE_TYPE_LINEAR_SPLINE:
             # The sampled curve adds redundant points along straight segments
             return np.array(slicer.util.arrayFromMarkupsControlPoints(curveNode, world=True), dtype=float)
@@ -3637,8 +3710,8 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
                 raise ValueError(_("Select a direction line."))
             return self.directionFromLine(parameterNode.directionLine)
         if not isDirectionCaptured(parameterNode.viewDirection):
-            raise ValueError(_("Capture a view direction first."))
-        return self._normalised(np.array(parameterNode.viewDirection), _("Capture a view direction first."))
+            raise ValueError(_("Set the saw direction first."))
+        return self._normalised(np.array(parameterNode.viewDirection), _("Set the saw direction first."))
 
     #
     # Osteotomy lines: settings per line, lines cut together (MRML)
@@ -3747,8 +3820,8 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
                 raise ValueError(_("Select a direction line."))
             return self.directionFromLine(settings.directionLine)
         if not isDirectionCaptured(settings.viewDirection):
-            raise ValueError(_("Capture a view direction first."))
-        return self._normalised(np.array(settings.viewDirection), _("Capture a view direction first."))
+            raise ValueError(_("Set the saw direction first."))
+        return self._normalised(np.array(settings.viewDirection), _("Set the saw direction first."))
 
     @staticmethod
     def getGroupLines(firstLine: vtkMRMLMarkupsCurveNode) -> list[vtkMRMLMarkupsCurveNode]:
@@ -3801,7 +3874,7 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         """
         inputModel = parameterNode.inputModel
         if inputModel is None:
-            return _("Select a model to cut.")
+            return _("Select a bone to cut.")
         if inputModel.GetPolyData() is None or inputModel.GetPolyData().GetNumberOfPoints() == 0:
             return _("The selected model is empty.")
         transformNode = inputModel.GetParentTransformNode()
@@ -3809,10 +3882,10 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
             return _("The model is under a non-linear transform. Harden the transform first.")
         curveNode = parameterNode.cutCurve
         if curveNode is None:
-            return _("Select or create a cut path.")
+            return _("Select or create an osteotomy line.")
         minPoints = 3 if self.isClosedCurve(curveNode) else 2
         if curveNode.GetNumberOfControlPoints() < minPoints:
-            return _("Place at least {count} points on the cut path.").format(count=minPoints)
+            return _("Place at least {count} points on the osteotomy line.").format(count=minPoints)
         lines = self.getOsteotomyLines(curveNode)
         if inputModel.GetNodeReferenceID(CURVE_REFERENCE_ROLE) in {line.GetID() for line in lines}:
             return _("The model to cut was produced by this osteotomy. Select another model or path.")
@@ -3828,7 +3901,7 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
                 return _("Place at least {count} points on {line}.").format(count=minPoints, line=line.GetName())
             settings = self.getLineSettings(line)
             if settings is None:
-                return _("Select {line} as the cut path once to set its direction and depth.").format(
+                return _("Select {line} as the osteotomy line once to set its saw direction and cut depth.").format(
                     line=line.GetName())
             try:
                 self.resolveLineDirection(settings)
@@ -3971,7 +4044,7 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
             try:
                 settings = self.lineSettingsOf(curveNode, parameterNode)
                 if settings is None:
-                    raise ValueError(_("Select {line} as the cut path once to set its direction and depth.").format(
+                    raise ValueError(_("Select {line} as the osteotomy line once to set its saw direction and cut depth.").format(
                         line=curveNode.GetName()))
                 sheet = self.buildLineSheet(parameterNode.inputModel, curveNode, settings)
                 earlier = [line.sheet for line in built]
@@ -4098,12 +4171,12 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         # (cutPolyData has checked that each removed bone)
         isLimited = len(lines) > 1 or any(self.isLimitedCut(line.options) for line in lines)
         if len(fragments) < (1 if isLimited else 2):
-            raise ValueError(_("The cutting sheet does not divide the model. Check the cut path and direction."))
+            raise ValueError(_("The cut does not divide the bone. Check the osteotomy line and the saw direction."))
         widestKerf = max(self.effectiveKerfWidth(line.options, bool(line.stops)) for line in lines)
         fragments, self.lastJoinedPieces = self.joinSmallSegments(
             fragments, parameterNode.minSegmentPercent / 100.0, contactDistance=widestKerf + 1.0)
 
-        report(90, _("Creating fragment models..."))
+        report(90, _("Creating the bone segments..."))
         self.removeCutResult(curveNode)
         nodes = self.createFragmentNodes(fragments, inputModel, curveNode)
         self.recordProvenance(nodes, parameterNode, lines, isSolid)
@@ -4225,7 +4298,7 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
             non-linear transform.
         """
         if modelNode is None:
-            raise ValueError(_("Select a model to cut."))
+            raise ValueError(_("Select a bone to cut."))
         solid = vtk.vtkPolyData()
         solid.DeepCopy(self.getSolidPolyData(modelNode, voxelSize, gapSeal, progressCallback))
         node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode", f"{modelNode.GetName()}_solid")
@@ -4335,18 +4408,18 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         """
         nodes = list({node.GetID(): node for node in fragmentNodes}.values())  # unique, order kept
         if len(nodes) < 2:
-            raise ValueError(_("Select at least 2 fragments to merge."))
+            raise ValueError(_("Select at least 2 bone segments to rejoin."))
         curveIds = {node.GetNodeReferenceID(CURVE_REFERENCE_ROLE) for node in nodes}
         if len(curveIds) != 1 or None in curveIds:
-            raise ValueError(_("Only fragments produced by the same cut path can be merged."))
+            raise ValueError(_("Only bone segments of the same cut can be rejoined."))
         curveNode = nodes[0].GetNodeReference(CURVE_REFERENCE_ROLE)
         if len({node.GetTransformNodeID() for node in nodes}) != 1:
-            raise ValueError(_("The fragments are under different transforms."))
+            raise ValueError(_("The bone segments are under different transforms."))
         nodeIds = {node.GetID() for node in nodes}
         for other in self.getDependentCurves(curveNode):
             if other.GetNodeReferenceID(INPUT_REFERENCE_ROLE) in nodeIds:
-                raise ValueError(_("Fragment {fragment} has been cut by {curve}. Undo that cut first.").format(
-                    fragment=other.GetNodeReference(INPUT_REFERENCE_ROLE).GetName(), curve=other.GetName()))
+                raise ValueError(_("Bone segment {segment} has been cut by {curve}. Undo that cut first.").format(
+                    segment=other.GetNodeReference(INPUT_REFERENCE_ROLE).GetName(), curve=other.GetName()))
 
         resultIds = [node.GetID() for node in self.getCurveResult(curveNode)]
         nodes.sort(key=lambda node: resultIds.index(node.GetID()))
@@ -4366,7 +4439,7 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         """Raise ValueError if other curves have cut this curve's fragments."""
         dependents = self.getDependentCurves(curveNode)
         if dependents:
-            raise ValueError(_("Fragments of {curve} have been cut further by {others}. Undo those cuts first.").format(
+            raise ValueError(_("Bone segments of {curve} have been cut further by {others}. Undo those cuts first.").format(
                 curve=curveNode.GetName(), others=", ".join(other.GetName() for other in dependents)))
 
     @staticmethod
@@ -5419,18 +5492,18 @@ class OsteotomyCutsTest(ScriptedLoadableModuleTest):
         """validateInputs says what is missing, and None once a cut can run."""
         logic = OsteotomyCutsLogic()
         parameterNode = logic.getParameterNode()
-        self.assertIn("model", logic.validateInputs(parameterNode))
+        self.assertIn("bone to cut", logic.validateInputs(parameterNode))
 
         model = self._addModel(self._box(), "Box")
         parameterNode.inputModel = model
-        self.assertIn("cut path", logic.validateInputs(parameterNode))
+        self.assertIn("osteotomy line", logic.validateInputs(parameterNode))
 
         curve = self._addCurve([[1.3, -40.0, 50.0]], "CutA")
         parameterNode.cutCurve = curve
         self.assertIn("2 points", logic.validateInputs(parameterNode))
 
         curve.AddControlPointWorld(1.3, 40.0, 50.0)
-        self.assertIn("view direction", logic.validateInputs(parameterNode))
+        self.assertIn("saw direction", logic.validateInputs(parameterNode))
 
         parameterNode.viewDirection = self.DOWN
         self.assertIsNone(logic.validateInputs(parameterNode))
@@ -6284,7 +6357,7 @@ class OsteotomyCutsTest(ScriptedLoadableModuleTest):
         self.assertTrue(logic.sheetEndsInModel(box, sheet, logic.effectiveKerfWidth(options)))
         with self.assertRaises(ValueError) as raised:
             logic.cutPolyData(box, [sheet], options)
-        self.assertIn("Past line ends", str(raised.exception))
+        self.assertIn("Cut reach beyond the line", str(raised.exception))
         # Ending 0.2 mm outside the bone (coarse mesh: no vertex near) is clear of a 0.1 mm kerf,
         # but not of a 1 mm kerf, whose rounded end reaches the bone
         near = logic.buildSheetPolyData(np.array([[1.3, -49.8, 50.0], [1.3, 49.8, 50.0]]), np.array(self.DOWN),
@@ -6854,3 +6927,81 @@ class OsteotomyCutsTest(ScriptedLoadableModuleTest):
             self.assertTrue(attribute("GitHash"))
             self.assertLess(abs((datetime.now().astimezone() - datetime.fromisoformat(attribute("Timestamp")))
                                 .total_seconds()), 600)
+
+    #
+    # Release Part 5: surgeon wording, help, acknowledgement, contributors
+    #
+
+    # Controls the help text names, exactly as labelled in the module
+    HELP_CONTROLS = ("Bone to cut", "Osteotomy line", "Create solid bone model", "Treat bone as solid",
+                     "Set saw direction from view", "Make cut", "Undo this cut", "Cut depth",
+                     "Cut reach beyond the line", "Rejoin selected bone segments", "Saw blade thickness")
+    # Technical words kept out of labels and messages (allowed in tooltips and in brackets)
+    TECHNICAL_WORDS = re.compile(r"\b(kerf|extrusions?|extrude[ds]?|sheets?|fragments?|cut paths?)\b", re.IGNORECASE)
+
+    @staticmethod
+    def _moduleFile(*parts: str) -> str:
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), *parts)
+
+    def test_wording(self):
+        """Labels and messages use surgical words; the help names real controls; every labelled
+        widget exists; tooltips give what / typical / technical."""
+        import ast
+        import xml.etree.ElementTree as ET
+        root = ET.parse(self._moduleFile("Resources", "UI", "OsteotomyCuts.ui")).getroot()
+        labels, tooltips = [], {}
+        for widget in root.iter("widget"):
+            for prop in widget.findall("property"):
+                text = prop.find("string").text if prop.find("string") is not None else None
+                if prop.get("name") in ("text", "specialValueText") and text:
+                    labels.append(text)
+                elif prop.get("name") == "toolTip" and text:
+                    tooltips[widget.get("name")] = text
+        messages = []
+        with open(self._moduleFile("OsteotomyCuts.py"), encoding="utf-8") as sourceFile:
+            tree = ast.parse(sourceFile.read())
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_" and node.args
+                    and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str)):
+                messages.append(node.args[0].value)
+        offending = [text for text in labels + messages
+                     if self.TECHNICAL_WORDS.search(re.sub(r"\([^)]*\)", "", text))]
+        self.assertEqual(offending, [])
+        for name, text in tooltips.items():
+            self.assertIn("\nTypical:", text, msg=name)
+            self.assertIn("\nTechnical:", text, msg=name)
+
+        uiWidget = slicer.util.loadUI(self._moduleFile("Resources", "UI", "OsteotomyCuts.ui"))
+        widgets = slicer.util.childWidgetVariables(uiWidget)
+        try:
+            for widget in root.iter("widget"):
+                self.assertTrue(hasattr(widgets, widget.get("name")) or widget.get("name") == "OsteotomyCuts",
+                                msg=widget.get("name"))
+        finally:
+            del widgets
+            uiWidget.deleteLater()
+            slicer.app.processEvents()
+            slicer.app.sendPostedEvents(None, qt.QEvent.DeferredDelete)
+        plainLabels = {text.rstrip(":").strip() for text in labels}
+        helpText = " ".join(slicer.modules.osteotomycuts.helpText.split())
+        for control in self.HELP_CONTROLS:
+            self.assertIn(control, helpText)
+            self.assertIn(control, plainLabels, msg=f"help names {control}, not a label")
+        self.assertIn("Quick start", helpText)
+        self.assertIn(SAFETY_NOTE, helpText)
+        self.assertIn("Structures to protect", " ".join(labels))
+
+    def test_acknowledgementAndContributors(self):
+        """The acknowledgement names all three affiliations; the contributors match CMakeLists.txt."""
+        acknowledgement = " ".join(slicer.modules.osteotomycuts.acknowledgementText.split())
+        for affiliation in ("Ministry of Health, Sri Lanka", "FaceLab, Colombo, Sri Lanka", "Malmö University"):
+            self.assertIn(affiliation, acknowledgement)
+        self.assertIn("https://facelab.care", acknowledgement)
+        self.assertIn("Claude Code (Anthropic)", acknowledgement)
+        self.assertEqual(list(slicer.modules.osteotomycuts.contributors), [MODULE_CONTRIBUTOR])
+        cmakePath = self._moduleFile("..", "CMakeLists.txt")
+        if os.path.exists(cmakePath):  # the source tree (not an installed extension)
+            with open(cmakePath, encoding="utf-8") as cmakeFile:
+                found = re.search(r'set\(EXTENSION_CONTRIBUTORS "([^"]*)"\)', cmakeFile.read())
+            self.assertIsNotNone(found)
+            self.assertEqual(found.group(1), MODULE_CONTRIBUTOR)

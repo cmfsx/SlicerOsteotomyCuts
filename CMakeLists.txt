@@ -4,11 +4,12 @@ project(OsteotomyCuts)
 
 #-----------------------------------------------------------------------------
 # Extension meta-information
-set(EXTENSION_HOMEPAGE "https://www.slicer.org/wiki/Documentation/Nightly/Extensions/OsteotomyCuts")
-set(EXTENSION_CONTRIBUTORS "Manjula Herath (FaceLab.care)")
-set(EXTENSION_DESCRIPTION "This is a extension to make OsteotomyCuts")
-set(EXTENSION_ICONURL "https://www.example.com/Slicer/Extensions/OsteotomyCuts.png")
-set(EXTENSION_SCREENSHOTURLS "https://www.example.com/Slicer/Extensions/OsteotomyCuts/Screenshots/1.png")
+set(EXTENSION_HOMEPAGE "https://github.com/cmfsx/SlicerOsteotomyCuts")
+set(EXTENSION_CATEGORY "Surgical Planning")
+set(EXTENSION_CONTRIBUTORS "Manjula Herath (Ministry of Health, Sri Lanka; FaceLab, Colombo, Sri Lanka; Malmö University, Sweden)")
+set(EXTENSION_DESCRIPTION "Virtual osteotomies for orthognathic and craniofacial surgical planning: draw osteotomy lines on a bone model, set the saw direction, blade thickness and cut depth, and divide the bone into closed bone segments, with checks of model quality and of the distance to the nerve canal and tooth roots. Research and planning software, not a medical device. Licensed under GPL-3.0-or-later.")
+set(EXTENSION_ICONURL "https://raw.githubusercontent.com/cmfsx/SlicerOsteotomyCuts/main/OsteotomyCuts.png")
+set(EXTENSION_SCREENSHOTURLS "https://raw.githubusercontent.com/cmfsx/SlicerOsteotomyCuts/main/Screenshots/1.png https://raw.githubusercontent.com/cmfsx/SlicerOsteotomyCuts/main/Screenshots/2.png https://raw.githubusercontent.com/cmfsx/SlicerOsteotomyCuts/main/Screenshots/3.png")
 set(EXTENSION_DEPENDS "NA") # Specified as a list or "NA" if no dependencies
 
 #-----------------------------------------------------------------------------
