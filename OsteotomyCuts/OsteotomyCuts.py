@@ -239,8 +239,9 @@ DEFAULT_STRUCTURE_RADIUS = 1.5
 STRUCTURE_ATTRIBUTE = "OsteotomyCuts.ProtectedStructure"
 
 # Ends every message about structures to protect
-SAFETY_NOTE = ("Distances are computed from the 3D models and depend on their accuracy; they are an aid to "
-               "planning only. The surgeon remains responsible for checking them.")
+SAFETY_NOTE = ("Safety checks are an aid only: they depend on the accuracy of the segmented or traced "
+               "structures, do not guarantee the absence of risk, and do not replace the surgeon's own "
+               "verification.")
 
 
 @dataclass

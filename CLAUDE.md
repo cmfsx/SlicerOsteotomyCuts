@@ -54,8 +54,8 @@ Build one phase at a time. Design each so later phases need no rewrite.
   node instead of a parameter-node list; checkClearances samples each
   line's sheet inside the bone, 1 mm then 0.1 mm near the minimum; table,
   closest-point markups, sheet colour, pre-cut confirm, SafetyResults /
-  SafetyOverride on segments). SAFETY_NOTE wording is a placeholder: ask
-  the user for their exact required sentence (Part 5/6).
+  SafetyOverride on segments). SAFETY_NOTE holds the user's exact
+  required sentence (given 2026-09-28); do not reword it.
   NEXT: Part 4 (provenance), then Part 5 (surgeon wording), 6-10. The full
   approved plan (Parts 0-10, with details per part) is in the user's
   Claude plans folder: twinkly-brewing-phoenix.md.
