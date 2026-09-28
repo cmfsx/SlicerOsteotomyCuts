@@ -54,6 +54,40 @@ try:
         print(f"{label}: {time.perf_counter() - start:.2f} s, {len(segments)} bone segment(s), open edges {openEdges}")
         if len(segments) < pieces or any(openEdges):
             failures.append(f"{label}: expected at least {pieces} closed bone segments")
+
+    # A limited cut with the ideal blade (thin numerical layer): a groove, one closed segment
+    limited = CutOptions()
+    limited.depth = 8.0
+    surfaceLocator = vtk.vtkCellLocator()
+    surfaceLocator.SetDataSet(bone)
+    surfaceLocator.BuildLocator()
+    path = []
+    for y in (40.0, 20.0):  # on the bone surface, as snapping places them: topmost hit from above
+        hits, cellIds = vtk.vtkPoints(), vtk.vtkIdList()
+        surfaceLocator.IntersectWithLine([-27.0, y, 200.0], [-27.0, y, -200.0], 0.0, hits, cellIds)
+        points = np.array([hits.GetPoint(i) for i in range(hits.GetNumberOfPoints())])
+        path.append(points[np.argmax(points[:, 2])])
+    sheet = logic.buildSheetPolyData(np.array(path), down, logic.computeAutoExtent(bone), depth=limited.depth)
+    start = time.perf_counter()
+    segments = logic.cutPolyData(bone, [sheet], limited)
+    openEdges = [openEdgeCount(segment) for segment in segments]
+    print(f"Left body groove 8 mm, ideal blade: {time.perf_counter() - start:.2f} s, "
+          f"{len(segments)} bone segment(s), open edges {openEdges}")
+    if len(segments) < 1 or any(openEdges):
+        failures.append("Left body groove: expected closed bone segments")
+
+    # Cut outline for the live preview: must be quick on a real bone
+    locator = vtk.vtkStaticCellLocator()
+    locator.SetDataSet(bone)
+    start = time.perf_counter()
+    locator.BuildLocator()
+    built = time.perf_counter() - start
+    start = time.perf_counter()
+    outline = logic.computeCutOutline(bone, sheet, locator)
+    elapsed = time.perf_counter() - start
+    print(f"Cut outline: locator {built:.2f} s once, then {elapsed * 1000:.0f} ms, {outline.GetNumberOfLines()} segments")
+    if outline.GetNumberOfLines() == 0 or elapsed > 0.5:
+        failures.append("Cut outline: expected lines within 0.5 s")
     print("\nREAL MODELS " + ("PASSED" if not failures else "FAILED: " + "; ".join(failures)))
     exitCode = 0 if not failures else 1
 except SystemExit:

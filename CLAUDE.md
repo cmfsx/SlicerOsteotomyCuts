@@ -29,6 +29,10 @@ Build one phase at a time. Design each so later phases need no rewrite.
   Part 0 done: Phase 2 robustness fixes ported from master (cap regions by
   rim-edge direction, missing rim edges recovered by flips, cap refinement
   point budget, integer-key open edges, scene-close observer guard).
+  Part 0b done (added 2026-09-28: a Le Fort I cut went through the whole
+  skull): limited cuts with the ideal blade, "Past line ends"
+  (options.endExtension), red cut outline in the preview, Le Fort I help.
+  NEXT: Part 1 (solid bone models).
 - Workflow: implement one plan step at a time; run the headless tests,
   commit, then stop so the user can test in Slicer before the next step.
 
@@ -45,6 +49,15 @@ Build one phase at a time. Design each so later phases need no rewrite.
   scipy Delaunay of rim + graded fill points (accepted only if bounded by
   exactly the rim), fallback vtkContourTriangulator + point insertion;
   then Delaunay flips and edge splitting to CAP_TOLERANCE.
+- Limited cuts (depth or options.endExtension set): with kerf 0 they use
+  LIMITED_IDEAL_KERF_WIDTH (0.1 mm) through the kerf path, because the
+  zero-width clip follows the signed-distance zero level, which continues
+  past the sheet's edges through the whole model. A kerf sheet whose END
+  rulings lie in the bone is refused (sheetEndsInModel): the chart has no
+  rounded slot ends, so such slots cannot be capped yet.
+- Preview outline (computeCutOutline): exact sheet/bone intersection via
+  vtkStaticCellLocator.FindCellsAlongPlane per sheet triangle, plane
+  intersection, Cyrus-Beck clip to the triangle.
 - Fragments: connectivity, enclosed shells merged into their host,
   display normals split at sharp edges.
 - scipy (bundled with Slicer) is used with guarded imports.

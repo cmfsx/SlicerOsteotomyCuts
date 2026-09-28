@@ -45,6 +45,18 @@ Virtual osteotomy for orthognathic and craniofacial surgical planning.
 Place the points of a cut path on the bone surface, choose an extrusion direction, and
 the bone model is split along the extruded cutting sheet into separate fragments.
 The original model is hidden, never modified.
+
+The red lines of the preview show every place the cut comes out of the bone. If they appear
+where bone must stay intact (e.g. the skull base behind a maxilla), limit the cut:
+"Cut depth" stops it inside the bone, and "Past line ends" stops it a few millimetres beyond
+the first and last points of the cut path, in a gap between bones (the cut must leave the bone
+there).
+
+Example, Le Fort I on a skull model: place the cut path points from one zygomatic buttress
+round the anterior maxilla to the other, above the tooth apices. Look at the skull from the
+front and capture the view direction (the cut runs backwards). Set the cut depth to about
+45-55 mm (to the pterygoid plates), "Past line ends" to 5-10 mm, and a kerf of 0.5-1.0 mm.
+Check that the red lines stay on the maxilla, then apply the cut.
 """)
         self.parent.acknowledgementText = _("""
 Based on the 3D Slicer scripted module template developed by Jean-Christophe Fillion-Robin,
@@ -105,6 +117,8 @@ class CutOptions:
     kerfWidth: Annotated[float, WithinRange(0.0, 10.0)] = 0.0
     # Cut depth (mm) from the path points along the extrusion direction; 0 = through the model
     depth: Annotated[float, WithinRange(0.0, 1000.0)] = 0.0
+    # Distance (mm) the cut continues past the ends of an open path; 0 = automatic (extension)
+    endExtension: Annotated[float, WithinRange(0.0, 10000.0)] = 0.0
     # Close the cut faces so that fragments are watertight
     capCutFaces: bool = True
     # Maximum edge length (mm) near the sheet before cutting; 0 = automatic (kerfWidth / 2)
@@ -480,6 +494,7 @@ class OsteotomyCutsParameterNode:
     livePreview - Show and update the cutting sheet while points are moved.
     options - Cut options.
     sheetModel - Model node showing the cutting sheet preview.
+    outlineModel - Model node showing where the cutting sheet meets the model surface.
     """
 
     inputModel: vtkMRMLModelNode
@@ -493,6 +508,7 @@ class OsteotomyCutsParameterNode:
     livePreview: bool = True
     options: CutOptions
     sheetModel: vtkMRMLModelNode
+    outlineModel: vtkMRMLModelNode
 
 
 #
@@ -793,7 +809,8 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
     def __init__(self) -> None:
         """Initialise the logic."""
         ScriptedLoadableModuleLogic.__init__(self)
-        # (cache key, vtkCellLocator) for snapping to the last used model surface
+        # (cache key, vtkStaticCellLocator on the triangulated world mesh) of the last used model
+        # surface, for snapping and the cut outline
         self._surfaceLocatorCache = None
 
     # A path segment closer than this angle to its extrusion direction is rejected, because the
@@ -840,9 +857,18 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
     MAX_FILL_PIXELS = 4_000_000
     # Rim edges shorter than this fraction of the model's bounding-box diagonal are collapsed
     RIM_COLLAPSE_FRACTION = 1e-4
+    # ... and shorter than these fractions of half the kerf width and of the median rim edge
+    RIM_COLLAPSE_KERF_FRACTION = 0.1
+    RIM_COLLAPSE_EDGE_FRACTION = 0.1
     # Fragment normals are not smoothed across edges sharper than this (degrees), so that cut
     # faces are shaded flat
     NORMALS_FEATURE_ANGLE = 30.0
+    # A limited cut (depth or end reach set) with the ideal blade (kerf 0) removes this thin
+    # layer (mm): a zero-width cut follows the sheet's zero level, which continues past the
+    # sheet's edges through the whole model, whereas the kerf ends where the sheet ends
+    LIMITED_IDEAL_KERF_WIDTH = 0.1
+    # Line width (pixels) of the cut outline preview
+    OUTLINE_LINE_WIDTH = 4.0
 
     def getParameterNode(self) -> OsteotomyCutsParameterNode:
         """Return the module's parameter node, creating it if needed.
@@ -881,14 +907,15 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
 
     def buildSheetPolyData(self, pathPoints: np.ndarray, directions: np.ndarray,
                            extent: float, closed: bool = False,
-                           depth: Optional[float | np.ndarray] = None) -> vtk.vtkPolyData:
+                           depth: Optional[float | np.ndarray] = None,
+                           endExtension: Optional[float] = None) -> vtk.vtkPolyData:
         """Build a ruled cutting sheet by extruding a polyline.
 
         The direction d points into the model (away from the viewer). Each path point P is
         extruded outward to A = P - extent * d and inward to B = P + depth * d (``depth``
-        defaults to ``extent``, a through-cut). An open path is also extended by ``extent`` at
-        both ends, along the end tangent with its component along d removed, so that the sheet
-        edges lie outside the model.
+        defaults to ``extent``, a through-cut). An open path is also extended by
+        ``endExtension`` (default ``extent``, so that the sheet edges lie outside the model) at
+        both ends, along the end tangent with its component along d removed.
 
         Output point order is A, B pairs along the (extended) path:
         ``[A_start, B_start, A_0, B_0, ..., A_last, B_last, A_end, B_end]`` for an open path and
@@ -902,15 +929,21 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         :param closed: join the last point to the first and do not extend the ends.
         :param depth: inward reach (mm) along d from the path: one value, or (N,) one per path
             point (for templates). None means ``extent`` (through-cut).
+        :param endExtension: distance (mm) the sheet continues past the ends of an open path.
+            None means ``extent``.
         :return: triangulated sheet with consistent winding, point and cell normals.
         :raises ValueError: too few distinct points, a zero or malformed direction, a
-            non-positive extent or depth, or a path segment (nearly) parallel to its direction.
+            non-positive extent, depth or end extension, or a path segment (nearly) parallel to
+            its direction.
         """
         points = np.asarray(pathPoints, dtype=float)
         if points.ndim != 2 or points.shape[1] != 3:
             raise ValueError(_("Path points must be an (N, 3) array."))
         if not extent > 0:
             raise ValueError(_("Sheet extent must be positive."))
+        endExtension = float(extent) if endExtension is None else float(endExtension)
+        if not endExtension > 0:
+            raise ValueError(_("The distance the cut continues past the line ends must be positive."))
 
         dirs = np.asarray(directions, dtype=float)
         if dirs.shape == (3,):
@@ -955,8 +988,8 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
                                  .format(index=i + 1))
 
         if not closed:
-            startPoint = points[0] + extent * self._endExtensionDirection(points[0] - points[1], dirs[0])
-            endPoint = points[-1] + extent * self._endExtensionDirection(points[-1] - points[-2], dirs[-1])
+            startPoint = points[0] + endExtension * self._endExtensionDirection(points[0] - points[1], dirs[0])
+            endPoint = points[-1] + endExtension * self._endExtensionDirection(points[-1] - points[-2], dirs[-1])
             points = np.vstack([startPoint, points, endPoint])
             dirs = np.vstack([dirs[0], dirs, dirs[-1]])
             depths = np.concatenate([depths[:1], depths, depths[-1:]])
@@ -1289,10 +1322,15 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
             return mesh, 0
 
         # Collapse tiny rim edges (from crossings next to slivers): the triangulation of the
-        # loops cannot tell such points apart
+        # loops cannot tell such points apart. Kept well below the kerf and the typical rim edge,
+        # so that a thin kerf's rounded floor and a finely refined rim are not collapsed.
         lengths = np.linalg.norm(points[cutEdges[:, 0]] - points[cutEdges[:, 1]], axis=1)
         diagonal = float(np.linalg.norm(points.max(axis=0) - points.min(axis=0)))
-        short = lengths < self.RIM_COLLAPSE_FRACTION * diagonal
+        collapseLength = min(self.RIM_COLLAPSE_FRACTION * diagonal,
+                             self.RIM_COLLAPSE_EDGE_FRACTION * float(np.median(lengths)))
+        if halfKerf > 0:
+            collapseLength = min(collapseLength, self.RIM_COLLAPSE_KERF_FRACTION * halfKerf)
+        short = lengths < collapseLength
         if np.any(short):
             root = np.arange(len(points))
 
@@ -1316,6 +1354,8 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
                                   & (triangles[:, 2] != triangles[:, 0])]
             openEdges = self._openEdges(triangles, len(points))
             cutEdges = openEdges[onCut[openEdges[:, 0]] & onCut[openEdges[:, 1]]]
+            if len(cutEdges) == 0:
+                return mesh, 1
 
         result = self._capLoops(cutEdges, points, sheetMap, arrays, arrayName)
         if result is None:
@@ -1936,12 +1976,27 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         return triangles
 
     @staticmethod
-    def effectiveRefineEdgeLength(options: CutOptions) -> float:
-        """Maximum edge length near the sheet: options.refineEdgeLength, or kerfWidth / 2 when
-        that is 0 (automatic). 0 means no refinement (zero kerf, no explicit length)."""
+    def isLimitedCut(options: CutOptions) -> bool:
+        """Return True if the cut may end inside the model: a limited depth, or a set distance
+        past the line ends. Such a cut may leave the model in one piece (a groove or a slot)."""
+        return options.depth > 0 or options.endExtension > 0
+
+    @classmethod
+    def effectiveKerfWidth(cls, options: CutOptions) -> float:
+        """Width of bone removed: options.kerfWidth, or LIMITED_IDEAL_KERF_WIDTH for a limited
+        cut with the ideal blade (kerf 0), so that the cut ends where the sheet ends."""
+        if options.kerfWidth > 0 or not cls.isLimitedCut(options):
+            return float(options.kerfWidth)
+        return cls.LIMITED_IDEAL_KERF_WIDTH
+
+    @classmethod
+    def effectiveRefineEdgeLength(cls, options: CutOptions) -> float:
+        """Maximum edge length near the sheet: options.refineEdgeLength, or half the effective
+        kerf width when that is 0 (automatic). 0 means no refinement (zero kerf, no explicit
+        length)."""
         if options.refineEdgeLength > 0:
             return float(options.refineEdgeLength)
-        return options.kerfWidth / 2.0
+        return cls.effectiveKerfWidth(options) / 2.0
 
     def refineNearSheet(self, polyWithDistance: vtk.vtkPolyData, sheetPolyData: vtk.vtkPolyData,
                         maxEdgeLength: float, bandWidth: float,
@@ -2245,7 +2300,9 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
 
         With kerfWidth = 0 each piece is split at signed distance 0 into its two sides. With a
         kerf, material within kerfWidth / 2 of the sheet is removed (removeKerf) and the sides
-        are found afterwards from the signed distance kept per sheet.
+        are found afterwards from the signed distance kept per sheet. A limited cut (depth or
+        end reach set) with kerfWidth = 0 removes LIMITED_IDEAL_KERF_WIDTH (effectiveKerfWidth),
+        so that it ends where its sheet ends.
 
         With capCutFaces, the cut faces a sheet leaves are capped (capCutFaces) right
         after that sheet, so later sheets cut closed meshes and the fragments are watertight.
@@ -2258,8 +2315,9 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         :param progressCallback: called with (percent, message) between stages.
         :return: fragment meshes, largest first. A depth-limited kerf cut may leave one
             fragment (a groove).
-        :raises ValueError: if there is no sheet, the mesh has no polygons, or a kerf sheet
-            does not reach the model.
+        :raises ValueError: if there is no sheet, the mesh has no polygons, a kerf sheet does
+            not reach the model, or a kerf sheet ends inside the model beyond its path ends
+            (sheetEndsInModel: the rounded ends of such a slot cannot be capped yet).
         """
         report = progressCallback or (lambda percent, message: None)
         if not sheets:
@@ -2269,8 +2327,19 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         if triangles.GetNumberOfCells() == 0:
             raise ValueError(_("The model has no surface polygons to cut."))
         cap = options.capCutFaces
-        halfKerf = options.kerfWidth / 2.0
+        kerfWidth = self.effectiveKerfWidth(options)
+        halfKerf = kerfWidth / 2.0
         uncapped = 0
+
+        if kerfWidth > 0:
+            locator = vtk.vtkCellLocator()
+            locator.SetDataSet(triangles)
+            locator.BuildLocator()
+            for sheetIndex, sheet in enumerate(sheets):
+                if self.sheetEndsInModel(triangles, sheet, kerfWidth, locator):
+                    raise ValueError(_("Osteotomy line {index}: the cut ends inside the bone beyond the ends of "
+                                       "the line. Increase \"Past line ends\" until the red outline of the preview "
+                                       "no longer ends on the bone, or set it to 0.").format(index=sheetIndex + 1))
 
         report(5, _("Finding internal shells..."))
         labelled = self.labelEnclosedComponents(triangles, options.minFragmentFraction)
@@ -2285,13 +2354,13 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
                 maxEdgeLength = self.effectiveRefineEdgeLength(options)
                 if maxEdgeLength > 0:
                     withDistance = self.refineNearSheet(withDistance, sheet, maxEdgeLength,
-                                                        options.kerfWidth / 2.0 + maxEdgeLength)
-                if options.kerfWidth > 0:
+                                                        halfKerf + maxEdgeLength)
+                if kerfWidth > 0:
                     sideArray = vtk.vtkDoubleArray()
                     sideArray.DeepCopy(withDistance.GetPointData().GetArray("SheetDistance"))
                     sideArray.SetName(f"{SHEET_SIDE_PREFIX}{sheetIndex}")
                     withDistance.GetPointData().AddArray(sideArray)
-                    remaining, removed = self.removeKerf(withDistance, sheet, options.kerfWidth)
+                    remaining, removed = self.removeKerf(withDistance, sheet, kerfWidth)
                     removedAny = removedAny or removed
                     if cap and removed:
                         remaining, failed = self.capCutFaces(remaining, sheetMap)
@@ -2306,7 +2375,7 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
                             part, failed = self.capCutFaces(part, sheetMap)
                             uncapped += failed
                         nextSides.append((part, signature + (side,)))
-            if options.kerfWidth > 0 and not removedAny:
+            if kerfWidth > 0 and not removedAny:
                 raise ValueError(_("Cutting sheet {index} does not reach the model. Check the cut path, "
                                    "direction and depth.").format(index=sheetIndex + 1))
             sides = nextSides
@@ -2339,6 +2408,143 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
             append.AddInputData(polyData)
         clean = vtk.vtkCleanPolyData()
         clean.SetInputConnection(append.GetOutputPort())
+        clean.Update()
+        result = vtk.vtkPolyData()
+        result.DeepCopy(clean.GetOutput())
+        return result
+
+    def sheetEndsInModel(self, polyData: vtk.vtkPolyData, sheetPolyData: vtk.vtkPolyData, kerfWidth: float,
+                         locator: Optional[vtk.vtkCellLocator] = None) -> bool:
+        """Return True if an end of an open sheet lies in the model, so that a kerf cut would
+        end inside the bone beyond the path ends (a slot).
+
+        The ends are the sheet's first and last rulings (from the outer to the inner edge). An
+        end lies in the model if it passes within half the kerf of the model surface: points
+        spaced half a kerf apart along it are tested within a slightly larger radius, so an end
+        a little farther away may also count (never one that is closer).
+
+        :param polyData: triangulated model mesh.
+        :param sheetPolyData: cutting sheet from buildSheetPolyData.
+        :param kerfWidth: width of bone removed (mm).
+        :param locator: vtkCellLocator built on polyData; built here if None.
+        :return: False for a closed sheet or ends clear of the model.
+        """
+        sheetPoints = numpy_support.vtk_to_numpy(sheetPolyData.GetPoints().GetData()).astype(float)
+        pairCount = len(sheetPoints) // 2
+        if sheetPolyData.GetNumberOfPolys() == 2 * pairCount:
+            return False  # closed: no ends
+        if locator is None:
+            locator = vtk.vtkCellLocator()
+            locator.SetDataSet(polyData)
+            locator.BuildLocator()
+        halfKerf = kerfWidth / 2.0
+        radius = halfKerf * np.sqrt(1.0 + 0.25 ** 2)  # covers the gaps between the samples
+        closest = [0.0, 0.0, 0.0]
+        cellId, subId, distance2 = vtk.reference(0), vtk.reference(0), vtk.reference(0.0)
+        for pair in (0, pairCount - 1):
+            start, end = sheetPoints[2 * pair], sheetPoints[2 * pair + 1]
+            count = int(np.ceil(np.linalg.norm(end - start) / halfKerf)) + 1
+            for point in np.linspace(start, end, count):
+                if locator.FindClosestPointWithinRadius(point.tolist(), radius, closest, cellId, subId, distance2):
+                    return True
+        return False
+
+    def computeCutOutline(self, polyData: vtk.vtkPolyData, sheetPolyData: vtk.vtkPolyData,
+                          locator: Optional[vtk.vtkStaticCellLocator] = None) -> vtk.vtkPolyData:
+        """Return the lines where the cutting sheet meets the model surface (cut outline).
+
+        Exact triangle-triangle intersection: for each sheet triangle, the model triangles
+        crossing its plane are found with a cell locator plane query (fast enough for live
+        preview on large bones), each is intersected with the plane, and the segment is clipped
+        to the sheet triangle. So the outline ends exactly where the sheet ends.
+
+        :param polyData: triangulated model mesh in world coordinates.
+        :param sheetPolyData: cutting sheet from buildSheetPolyData.
+        :param locator: vtkStaticCellLocator built on polyData; built here if None.
+        :return: line segments on the model surface (no lines if the sheet misses the model).
+        """
+        empty = vtk.vtkPolyData()
+        if polyData.GetNumberOfPolys() == 0 or sheetPolyData.GetNumberOfPolys() == 0:
+            return empty
+        if locator is None:
+            locator = vtk.vtkStaticCellLocator()
+            locator.SetDataSet(polyData)
+            locator.BuildLocator()
+        points = numpy_support.vtk_to_numpy(polyData.GetPoints().GetData()).astype(float)
+        triangles = numpy_support.vtk_to_numpy(polyData.GetPolys().GetConnectivityArray()).reshape(-1, 3)
+        sheetPoints = numpy_support.vtk_to_numpy(sheetPolyData.GetPoints().GetData()).astype(float)
+        sheetTriangles = numpy_support.vtk_to_numpy(sheetPolyData.GetPolys().GetConnectivityArray()).reshape(-1, 3)
+
+        segments = []
+        found = vtk.vtkIdList()
+        for corners in sheetPoints[sheetTriangles]:
+            normal = np.cross(corners[1] - corners[0], corners[2] - corners[0])
+            length = np.linalg.norm(normal)
+            if not length > 0:
+                continue
+            normal /= length
+            found.Reset()
+            locator.FindCellsAlongPlane(corners[0].tolist(), normal.tolist(), 0.0, found)
+            cellIds = np.array([found.GetId(i) for i in range(found.GetNumberOfIds())], dtype=np.int64)
+            if len(cellIds) == 0:
+                continue
+            cellPoints = points[triangles[cellIds]]  # (k, 3 corners, xyz)
+            overlaps = (np.all(cellPoints.max(axis=1) >= corners.min(axis=0), axis=1)
+                        & np.all(cellPoints.min(axis=1) <= corners.max(axis=0), axis=1))
+            cellPoints = cellPoints[overlaps]
+
+            # Intersect each model triangle with the plane: the corner alone on its side, and
+            # the crossings on its two edges (a corner on the plane counts as below it)
+            heights = (cellPoints - corners[0]) @ normal
+            above = heights > 0
+            aboveCount = above.sum(axis=1)
+            crossing = (aboveCount == 1) | (aboveCount == 2)
+            cellPoints, heights, above = cellPoints[crossing], heights[crossing], above[crossing]
+            if len(cellPoints) == 0:
+                continue
+            lone = np.where(above.sum(axis=1) == 1, np.argmax(above, axis=1), np.argmin(above, axis=1))
+            rows = np.arange(len(cellPoints))
+            ends = []
+            for other in (lone + 1) % 3, (lone + 2) % 3:
+                h0, h1 = heights[rows, lone], heights[rows, other]
+                t = (h0 / (h0 - h1))[:, np.newaxis]
+                ends.append(cellPoints[rows, lone] + t * (cellPoints[rows, other] - cellPoints[rows, lone]))
+            first, second = ends
+
+            # Clip the segments to the sheet triangle (Cyrus-Beck); inward edge normals
+            low, high = np.zeros(len(first)), np.ones(len(first))
+            step = second - first
+            for k in range(3):
+                inward = np.cross(normal, corners[(k + 1) % 3] - corners[k])
+                value, rate = (first - corners[k]) @ inward, step @ inward
+                outside = (np.abs(rate) <= 1e-15) & (value < 0)
+                low[outside], high[outside] = 1.0, 0.0
+                moving = np.abs(rate) > 1e-15
+                limit = np.where(moving, -value / np.where(moving, rate, 1.0), 0.0)
+                entering, leaving = moving & (rate > 0), moving & (rate < 0)
+                low[entering] = np.maximum(low[entering], limit[entering])
+                high[leaving] = np.minimum(high[leaving], limit[leaving])
+            keep = high > low
+            segments.append(np.stack([first[keep] + low[keep, np.newaxis] * step[keep],
+                                      first[keep] + high[keep, np.newaxis] * step[keep]], axis=1))
+        segments = np.concatenate(segments) if segments else np.zeros((0, 2, 3))
+        if len(segments) == 0:
+            return empty
+
+        outline = vtk.vtkPolyData()
+        outlinePoints = vtk.vtkPoints()
+        outlinePoints.SetData(numpy_support.numpy_to_vtk(np.ascontiguousarray(segments.reshape(-1, 3)), deep=True))
+        outline.SetPoints(outlinePoints)
+        cells = vtk.vtkCellArray()
+        cells.SetData(numpy_support.numpy_to_vtk(np.arange(0, 2 * len(segments) + 1, 2, dtype=np.int64), deep=True,
+                                                 array_type=vtk.VTK_ID_TYPE),
+                      numpy_support.numpy_to_vtk(np.arange(2 * len(segments), dtype=np.int64), deep=True,
+                                                 array_type=vtk.VTK_ID_TYPE))
+        outline.SetLines(cells)
+        clean = vtk.vtkCleanPolyData()  # join the segments at shared ends
+        clean.SetInputData(outline)
+        clean.ToleranceIsAbsoluteOn()
+        clean.SetAbsoluteTolerance(0.0)
         clean.Update()
         result = vtk.vtkPolyData()
         result.DeepCopy(clean.GetOutput())
@@ -2433,9 +2639,6 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
             self.resolveDirection(parameterNode)
         except ValueError as error:
             return str(error)
-        if parameterNode.options.depth > 0 and not parameterNode.options.kerfWidth > 0:
-            # A zero-width cut that stops inside the model removes nothing and separates nothing
-            return _("A limited cut depth needs a kerf width greater than 0.")
         return None
 
     def getWorldPolyData(self, modelNode: vtkMRMLModelNode) -> vtk.vtkPolyData:
@@ -2489,8 +2692,9 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
             curveNode.EndModify(wasModifying)
         return moved
 
-    def _getSurfaceLocator(self, modelNode: vtkMRMLModelNode) -> vtk.vtkCellLocator:
-        """Cell locator on the model surface in world coordinates, cached until the model changes."""
+    def _getSurfaceLocator(self, modelNode: vtkMRMLModelNode) -> vtk.vtkStaticCellLocator:
+        """Cell locator on the model surface in world coordinates, cached until the model changes.
+        Its data set (GetDataSet()) is the triangulated world mesh."""
         transformNode = modelNode.GetParentTransformNode()
         polyData = modelNode.GetPolyData()
         matrixKey = None
@@ -2500,8 +2704,8 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
             matrixKey = tuple(matrix.GetElement(r, c) for r in range(4) for c in range(4))
         key = (modelNode.GetID(), polyData.GetMTime() if polyData else 0, matrixKey)
         if self._surfaceLocatorCache is None or self._surfaceLocatorCache[0] != key:
-            locator = vtk.vtkCellLocator()
-            locator.SetDataSet(self.getWorldPolyData(modelNode))
+            locator = vtk.vtkStaticCellLocator()
+            locator.SetDataSet(self._ensureTriangles(self.getWorldPolyData(modelNode)))
             locator.BuildLocator()
             self._surfaceLocatorCache = (key, locator)
         return self._surfaceLocatorCache[1]
@@ -2536,7 +2740,8 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         return self.buildSheetPolyData(self.getPathPoints(curveNode), self.resolveDirection(parameterNode),
                                        self.computeModelExtent(parameterNode.inputModel, options),
                                        closed=self.isClosedCurve(curveNode),
-                                       depth=options.depth if options.depth > 0 else None)
+                                       depth=options.depth if options.depth > 0 else None,
+                                       endExtension=options.endExtension if options.endExtension > 0 else None)
 
     def updateSheetModel(self, parameterNode: OsteotomyCutsParameterNode) -> Optional[vtkMRMLModelNode]:
         """Show the cutting sheet for the current inputs (live preview).
@@ -2570,13 +2775,43 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
             parameterNode.sheetModel = sheetNode
         sheetNode.SetAndObservePolyData(sheet)
         sheetNode.GetDisplayNode().SetVisibility(True)
+        self.updateOutlineModel(parameterNode, sheet)
         return sheetNode
 
+    def updateOutlineModel(self, parameterNode: OsteotomyCutsParameterNode,
+                           sheet: vtk.vtkPolyData) -> vtkMRMLModelNode:
+        """Show where the cutting sheet meets the input model's surface (computeCutOutline).
+
+        Creates the "CutOutline" model node on first use (red lines, hidden from node selectors,
+        not selectable) and stores it in the parameter node. It shows every place the cut comes
+        out of the bone, including places far from the cut path.
+
+        :param parameterNode: module parameters; the input model must be valid.
+        :param sheet: the cutting sheet shown in the preview.
+        :return: the outline model node.
+        """
+        locator = self._getSurfaceLocator(parameterNode.inputModel)
+        outline = self.computeCutOutline(locator.GetDataSet(), sheet, locator)
+        outlineNode = parameterNode.outlineModel
+        if outlineNode is None:
+            outlineNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode", "CutOutline")
+            outlineNode.SetHideFromEditors(True)
+            outlineNode.SetSelectable(False)
+            outlineNode.CreateDefaultDisplayNodes()
+            displayNode = outlineNode.GetDisplayNode()
+            displayNode.SetColor(1.0, 0.0, 0.0)
+            displayNode.SetLineWidth(self.OUTLINE_LINE_WIDTH)
+            displayNode.SetVisibility2D(False)
+            parameterNode.outlineModel = outlineNode
+        outlineNode.SetAndObservePolyData(outline)
+        outlineNode.GetDisplayNode().SetVisibility(True)
+        return outlineNode
+
     def hideSheetModel(self, parameterNode: OsteotomyCutsParameterNode) -> None:
-        """Hide the cutting sheet preview, if there is one."""
-        sheetNode = parameterNode.sheetModel
-        if sheetNode is not None and sheetNode.GetDisplayNode() is not None:
-            sheetNode.GetDisplayNode().SetVisibility(False)
+        """Hide the cutting sheet preview and the cut outline, if there are any."""
+        for node in (parameterNode.sheetModel, parameterNode.outlineModel):
+            if node is not None and node.GetDisplayNode() is not None:
+                node.GetDisplayNode().SetVisibility(False)
 
     #
     # Cut results (MRML)
@@ -2592,8 +2827,8 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
 
         :param parameterNode: module parameters (input model, cut path, direction, options).
         :param progressCallback: called with (percent, message) between stages.
-        :return: the new fragment model nodes, largest first (a single node for a groove, a
-            depth-limited cut that does not separate the model).
+        :return: the new fragment model nodes, largest first (a single node for a groove or a
+            slot, a limited cut that does not separate the model).
         :raises ValueError: if inputs are invalid, the sheet does not cut the model, or later
             cuts depend on the previous result of this curve.
         """
@@ -2608,9 +2843,9 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         polyData = self.getWorldPolyData(inputModel)
         sheet = self.buildSheetForParameters(parameterNode)
         fragments = self.cutPolyData(polyData, [sheet], parameterNode.options, progressCallback)
-        # A depth-limited cut may only cut a groove (cutPolyData has checked that it removed bone)
-        isGroove = parameterNode.options.depth > 0 and parameterNode.options.kerfWidth > 0
-        if len(fragments) < (1 if isGroove else 2):
+        # A limited cut may only cut a groove or a slot (cutPolyData has checked that it removed bone)
+        isLimited = self.isLimitedCut(parameterNode.options)
+        if len(fragments) < (1 if isLimited else 2):
             raise ValueError(_("The cutting sheet does not divide the model. Check the cut path and direction."))
 
         report(90, _("Creating fragment models..."))
@@ -2925,6 +3160,7 @@ class OsteotomyCutsTest(ScriptedLoadableModuleTest):
         # Phase 2 defaults reproduce the Phase 1 zero-width through-cut
         self.assertEqual(parameterNode.options.kerfWidth, 0.0)
         self.assertEqual(parameterNode.options.depth, 0.0)
+        self.assertEqual(parameterNode.options.endExtension, 0.0)
         self.assertTrue(parameterNode.options.capCutFaces)
         self.assertEqual(parameterNode.options.refineEdgeLength, 0.0)
 
@@ -3674,21 +3910,26 @@ class OsteotomyCutsTest(ScriptedLoadableModuleTest):
                 logic.buildSheetPolyData(path, down, 50.0, depth=depth)
 
     def test_depthOptions(self):
-        """Depth needs a kerf; the preview sheet follows the depth; a groove gives one fragment."""
+        """The preview sheet follows the depth; a groove gives one fragment, with the ideal blade
+        (a thin numerical layer) or a kerf."""
         logic = OsteotomyCutsLogic()
         model = self._addModel(self._box(), "Box")
         curve = self._addCurve(self.X_CUT_PATH, "CutA")
         parameterNode = self._configure(model, curve)
 
         parameterNode.options.depth = 12.0
-        self.assertIn("kerf width", logic.validateInputs(parameterNode))
-        self.assertIsNone(logic.updateSheetModel(parameterNode))
-
-        parameterNode.options.kerfWidth = 1.0
         self.assertIsNone(logic.validateInputs(parameterNode))
         sheetNode = logic.updateSheetModel(parameterNode)
         self.assertAlmostEqual(sheetNode.GetPolyData().GetBounds()[4], 50.0 - 12.0, places=6)
+        nodes = logic.applyCut(parameterNode)  # ideal blade: a thin groove, nothing is separated
+        self.assertEqual(len(nodes), 1)
+        points = self._points(nodes[0].GetPolyData())
+        halfLayer = logic.LIMITED_IDEAL_KERF_WIDTH / 2.0
+        inGroove = (np.abs(points[:, 0] - 1.3) < halfLayer - 0.001) & (points[:, 2] > 50.0 - 12.0)
+        self.assertFalse(np.any(inGroove))
 
+        parameterNode.options.kerfWidth = 1.0
+        self.assertIsNone(logic.validateInputs(parameterNode))
         nodes = logic.applyCut(parameterNode)  # a groove: nothing is separated
         self.assertEqual(len(nodes), 1)
         self.assertEqual(nodes[0].GetName(), "Box_CutA_1")
@@ -3705,7 +3946,8 @@ class OsteotomyCutsTest(ScriptedLoadableModuleTest):
         parameterNode.options.extension = 250.0
         rawNode = parameterNode.parameterNode
         del parameterNode  # the wrapper would try (and fail) to re-read the node as it is edited
-        newOptions = ("options.kerfWidth", "options.depth", "options.capCutFaces", "options.refineEdgeLength")
+        newOptions = ("options.kerfWidth", "options.depth", "options.capCutFaces", "options.refineEdgeLength",
+                      "options.endExtension")
         for name in newOptions:  # as saved by Phase 1
             rawNode.UnsetParameter(name)
 
@@ -4250,3 +4492,162 @@ class OsteotomyCutsTest(ScriptedLoadableModuleTest):
         for fragment in fragments:
             self._assertWatertight(fragment)
             self._assertOnCutSurfaces(fragment, sheets, kerf, self._onBoxFaces)
+
+    #
+    # Release part 0b: limiting the cut
+    #
+
+    @staticmethod
+    def _lineLength(lines: vtk.vtkPolyData) -> float:
+        points = numpy_support.vtk_to_numpy(lines.GetPoints().GetData())
+        pairs = numpy_support.vtk_to_numpy(lines.GetLines().GetConnectivityArray()).reshape(-1, 2)
+        return float(np.linalg.norm(points[pairs[:, 0]] - points[pairs[:, 1]], axis=1).sum())
+
+    def test_sheet_endExtension(self):
+        """The sheet continues past the path ends by endExtension; the outward reach stays the extent."""
+        logic = OsteotomyCutsLogic()
+        path = np.array([[-10.0, 0.0, 0.0], [10.0, 0.0, 0.0]])
+        down = np.array([0.0, 0.0, -1.0])
+        points = self._points(logic.buildSheetPolyData(path, down, 50.0, depth=8.0, endExtension=5.0))
+        np.testing.assert_allclose(points[0::2, 0], [-15.0, -10.0, 10.0, 15.0])
+        np.testing.assert_allclose(points[0::2, 2], 50.0)
+        np.testing.assert_allclose(points[1::2, 2], -8.0)
+        # By default the ends reach as far as the extent
+        np.testing.assert_allclose(self._points(logic.buildSheetPolyData(path, down, 50.0))[0::2, 0],
+                                   [-60.0, -10.0, 10.0, 60.0])
+        for endExtension in (0.0, -1.0):
+            with self.assertRaises(ValueError, msg=str(endExtension)):
+                logic.buildSheetPolyData(path, down, 50.0, endExtension=endExtension)
+
+    def test_limitedIdealCut(self):
+        """A limited cut with the ideal blade ends where its sheet ends: it removes a thin groove
+        and leaves one watertight piece (a zero-width cut would split the box in two)."""
+        logic = OsteotomyCutsLogic()
+        options = self._kerfOptions(0.0, 10.0)
+        width = logic.LIMITED_IDEAL_KERF_WIDTH
+        self.assertTrue(logic.isLimitedCut(options))
+        self.assertEqual(logic.effectiveKerfWidth(options), width)
+        self.assertEqual(logic.effectiveKerfWidth(self._kerfOptions(0.0)), 0.0)
+        self.assertEqual(logic.effectiveKerfWidth(self._kerfOptions(1.0, 10.0)), 1.0)
+
+        box = self._box()
+        fragments = self._cut(box, [self.X_CUT_PATH], self.DOWN, options=options)
+        self.assertEqual(len(fragments), 1)
+        self._assertWatertight(fragments[0])
+        expected = 100.0 * (width * 10.0 + np.pi * (width / 2.0) ** 2 / 2.0)
+        self.assertAlmostEqual(self._volume(box) - self._volume(fragments[0]), expected, delta=0.01 * expected)
+
+    def test_cap_fineRefinement(self):
+        """Rim edges much shorter than the model scale (a fine refinement length) are not
+        collapsed away: the groove is still capped, watertight and of the right volume."""
+        options = self._kerfOptions(0.5, 10.0)
+        options.refineEdgeLength = 0.02
+        box = self._box()
+        fragments = self._cut(box, [self.X_CUT_PATH], self.DOWN, options=options)
+        self.assertEqual(len(fragments), 1)
+        self._assertWatertight(fragments[0])
+        expected = 100.0 * (0.5 * 10.0 + np.pi * 0.25 ** 2 / 2.0)
+        self.assertAlmostEqual(self._volume(box) - self._volume(fragments[0]), expected, delta=0.01 * expected)
+
+    def test_endExtension_sparesOtherBone(self):
+        """Stopping the cut past the line ends spares bone beyond them (e.g. the skull base
+        beyond a Le Fort I cut); an automatic reach cuts it too."""
+        logic = OsteotomyCutsLogic()
+        other = vtk.vtkTransformPolyDataFilter()
+        other.SetInputData(self._box(20.0, 8))
+        shift = vtk.vtkTransform()
+        shift.Translate(0.0, 120.0, 0.0)
+        other.SetTransform(shift)
+        other.Update()
+        model = self._append(self._box(), other.GetOutput())
+        path = np.array(self.X_CUT_PATH)  # y from -40 to 40, over the first box only
+        extent = logic.computeAutoExtent(model)
+
+        options = CutOptions()
+        fragments = logic.cutPolyData(model, [logic.buildSheetPolyData(path, np.array(self.DOWN), extent)], options)
+        self.assertEqual(len(fragments), 4)  # both boxes split
+
+        options.endExtension = 15.0  # the cut stops at y = +/-55, in the gap between the boxes
+        sheet = logic.buildSheetPolyData(path, np.array(self.DOWN), extent, endExtension=15.0)
+        self.assertFalse(logic.sheetEndsInModel(model, sheet, logic.effectiveKerfWidth(options)))
+        fragments = logic.cutPolyData(model, [sheet], options)
+        self.assertEqual(len(fragments), 3)  # the second box is whole
+        for fragment in fragments:
+            self._assertWatertight(fragment)
+        self.assertTrue(any(abs(self._volume(fragment) - 40.0 ** 3) < 1.0 for fragment in fragments))
+
+    def test_endInsideBone_refused(self):
+        """A cut that would end inside the bone beyond its line ends (a slot) is refused with a
+        clear message, rather than leaving bone segments that are not closed."""
+        logic = OsteotomyCutsLogic()
+        box = self._box()
+        path = np.array([[1.3, -20.0, 50.0], [1.3, 20.0, 50.0]])
+        sheet = logic.buildSheetPolyData(path, np.array(self.DOWN), logic.computeAutoExtent(box), endExtension=5.0)
+        options = CutOptions()
+        options.endExtension = 5.0
+        self.assertTrue(logic.sheetEndsInModel(box, sheet, logic.effectiveKerfWidth(options)))
+        with self.assertRaises(ValueError) as raised:
+            logic.cutPolyData(box, [sheet], options)
+        self.assertIn("Past line ends", str(raised.exception))
+        # Ending 0.2 mm outside the bone (coarse mesh: no vertex near) is clear of a 0.1 mm kerf,
+        # but not of a 1 mm kerf, whose rounded end reaches the bone
+        near = logic.buildSheetPolyData(np.array([[1.3, -49.8, 50.0], [1.3, 49.8, 50.0]]), np.array(self.DOWN),
+                                        logic.computeAutoExtent(box), endExtension=0.4)
+        self.assertFalse(logic.sheetEndsInModel(box, near, 0.1))
+        self.assertTrue(logic.sheetEndsInModel(box, near, 1.0))
+
+    def test_cutOutline(self):
+        """The outline follows the cut where it meets the surface, and stops where the sheet stops."""
+        logic = OsteotomyCutsLogic()
+        box = self._box()
+        extent = logic.computeAutoExtent(box)
+        path, down = np.array(self.X_CUT_PATH), np.array(self.DOWN)
+
+        # Through-cut: round the box, on its top, front, bottom and back faces
+        through = logic.computeCutOutline(box, logic.buildSheetPolyData(path, down, extent))
+        self.assertAlmostEqual(self._lineLength(through), 400.0, delta=1e-6)
+        np.testing.assert_allclose(self._points(through)[:, 0], 1.3, atol=1e-6)
+
+        # 10 mm deep: across the top face and 10 mm down the front and back faces
+        groove = logic.computeCutOutline(box, logic.buildSheetPolyData(path, down, extent, depth=10.0))
+        self.assertAlmostEqual(self._lineLength(groove), 120.0, delta=1e-6)
+        self.assertAlmostEqual(groove.GetBounds()[4], 40.0, delta=1e-6)
+
+        # Stopping 5 mm past the line ends (y = +/-40): on the top and bottom faces only, |y| <= 45
+        slot = logic.computeCutOutline(box, logic.buildSheetPolyData(path, down, extent, endExtension=5.0))
+        self.assertAlmostEqual(np.abs(self._points(slot)[:, 1]).max(), 45.0, delta=1e-6)
+        self.assertAlmostEqual(self._lineLength(slot), 180.0, delta=1e-6)
+
+        # A sheet that misses the model gives no lines
+        missing = logic.computeCutOutline(box, logic.buildSheetPolyData(path + [200.0, 0.0, 0.0], down, 10.0))
+        self.assertEqual(missing.GetNumberOfLines(), 0)
+
+    def test_outlinePreview(self):
+        """The preview shows the cut outline on the model, hidden with the sheet."""
+        logic = OsteotomyCutsLogic()
+        model = self._addModel(self._box(), "Box")
+        curve = self._addCurve(self.X_CUT_PATH, "CutA")
+        parameterNode = self._configure(model, curve)
+        parameterNode.options.depth = 10.0
+
+        self.assertIsNotNone(logic.updateSheetModel(parameterNode))
+        outlineNode = parameterNode.outlineModel
+        self.assertIsNotNone(outlineNode)
+        self.assertTrue(outlineNode.GetHideFromEditors())
+        self.assertFalse(outlineNode.GetSelectable())
+        self.assertTrue(outlineNode.GetDisplayNode().GetVisibility())
+        self.assertAlmostEqual(self._lineLength(outlineNode.GetPolyData()), 120.0, delta=1e-6)
+
+        # The outline follows a moved model (world coordinates)
+        transform = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLinearTransformNode")
+        matrix = vtk.vtkMatrix4x4()
+        matrix.SetElement(2, 3, -5.0)  # top face at z = 45: the 10 mm deep sheet enters 5 mm
+        transform.SetMatrixTransformToParent(matrix)
+        model.SetAndObserveTransformNodeID(transform.GetID())
+        logic.updateSheetModel(parameterNode)
+        self.assertAlmostEqual(self._lineLength(outlineNode.GetPolyData()), 110.0, delta=1e-6)
+
+        parameterNode.livePreview = False
+        self.assertIsNone(logic.updateSheetModel(parameterNode))
+        self.assertFalse(outlineNode.GetDisplayNode().GetVisibility())
+        self.assertEqual(len(slicer.util.getNodes("CutOutline*")), 1)

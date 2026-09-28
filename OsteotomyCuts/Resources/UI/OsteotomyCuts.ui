@@ -255,7 +255,7 @@
       <item row="1" column="1">
        <widget class="ctkDoubleSpinBox" name="depthSpinBox">
         <property name="toolTip">
-         <string>How deep the cut goes from the path points along the extrusion direction. 0 cuts through the whole model. A limited depth needs a kerf width greater than 0.</string>
+         <string>How deep the cut goes from the path points along the extrusion direction. 0 cuts through the whole model. Set a depth whenever other bone lies behind the cut (e.g. about 45-55 mm for a Le Fort I cut, so that it stops at the pterygoid plates). With a kerf width of 0 a limited cut removes a 0.1 mm layer.</string>
         </property>
         <property name="decimals">
          <number>1</number>
@@ -275,13 +275,42 @@
        </widget>
       </item>
       <item row="2" column="0">
+       <widget class="QLabel" name="endExtensionLabel">
+        <property name="text">
+         <string>Past line ends (0 = auto):</string>
+        </property>
+       </widget>
+      </item>
+      <item row="2" column="1">
+       <widget class="ctkDoubleSpinBox" name="endExtensionSpinBox">
+        <property name="toolTip">
+         <string>How far the cut continues past the first and last points of the cut path. 0 continues it right through the model. Set a few millimetres to stop the cut beyond the ends of the line, in a gap between bones, so that bone farther away is not cut (e.g. 5-10 mm past the zygomatic buttresses for a Le Fort I cut). The cut must leave the bone there: a cut ending inside the bone is refused. With a kerf width of 0 a limited cut removes a 0.1 mm layer.</string>
+        </property>
+        <property name="decimals">
+         <number>1</number>
+        </property>
+        <property name="singleStep">
+         <double>1.000000000000000</double>
+        </property>
+        <property name="maximum">
+         <double>10000.000000000000000</double>
+        </property>
+        <property name="suffix">
+         <string> mm</string>
+        </property>
+        <property name="SlicerParameterName" stdset="0">
+         <string>options.endExtension</string>
+        </property>
+       </widget>
+      </item>
+      <item row="3" column="0">
        <widget class="QLabel" name="capCutFacesLabel">
         <property name="text">
          <string>Cap cut faces:</string>
         </property>
        </widget>
       </item>
-      <item row="2" column="1">
+      <item row="3" column="1">
        <widget class="QCheckBox" name="capCutFacesCheckBox">
         <property name="toolTip">
          <string>Close the cut faces so that the fragments are watertight (needed for STL export and printing).</string>
@@ -365,7 +394,7 @@
       <item row="0" column="1">
        <widget class="ctkDoubleSpinBox" name="extensionSpinBox">
         <property name="toolTip">
-         <string>How far the cutting sheet extends beyond the path. 0 uses the model's bounding-box diagonal, which always cuts fully through.</string>
+         <string>How far the cutting sheet reaches out of the bone (against the extrusion direction), and into it when the cut depth is 0 and past the line ends when "Past line ends" is 0. 0 uses the model's bounding-box diagonal, which always cuts fully through. To stop a cut inside the bone, set the cut depth and "Past line ends" instead.</string>
         </property>
         <property name="decimals">
          <number>1</number>
