@@ -87,6 +87,19 @@ FRAGMENT_REFERENCE_ROLE = "OsteotomyCuts.Fragment"  # curve -> fragments (severa
 INPUT_REFERENCE_ROLE = "OsteotomyCuts.Input"  # curve / fragment -> model that was cut
 CURVE_REFERENCE_ROLE = "OsteotomyCuts.Curve"  # fragment -> curve that produced it
 
+# Model node attribute ("1") marking a solid bone model: made by "Create solid bone model", or a
+# capped bone segment cut from a solid model. Such models are cut as they are.
+SOLID_ATTRIBUTE = "OsteotomyCuts.Solid"
+
+
+def importNdimage():
+    """Return scipy.ndimage, or None if scipy is not available (it is bundled with Slicer)."""
+    try:
+        from scipy import ndimage
+    except ImportError:
+        return None
+    return ndimage
+
 # Prefix of the temporary point arrays holding the signed distance to each kerf sheet, from
 # which the side of each piece is found after the kerf is removed
 SHEET_SIDE_PREFIX = "SheetSide"
@@ -495,6 +508,9 @@ class OsteotomyCutsParameterNode:
     options - Cut options.
     sheetModel - Model node showing the cutting sheet preview.
     outlineModel - Model node showing where the cutting sheet meets the model surface.
+    treatBoneAsSolid - Cut a solid version of the model (makeSolidPolyData), unless it is solid already.
+    solidVoxelSize - Detail (voxel size, mm) of solid bone models.
+    solidGapSeal - Holes and gaps up to about twice this (mm) are sealed in solid bone models.
     """
 
     inputModel: vtkMRMLModelNode
@@ -509,6 +525,9 @@ class OsteotomyCutsParameterNode:
     options: CutOptions
     sheetModel: vtkMRMLModelNode
     outlineModel: vtkMRMLModelNode
+    treatBoneAsSolid: bool = True
+    solidVoxelSize: Annotated[float, WithinRange(0.05, 5.0)] = 0.25
+    solidGapSeal: Annotated[float, WithinRange(0.0, 10.0)] = 1.5
 
 
 #
@@ -561,6 +580,10 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         self.ui.cutCurveSelector.connect("nodeAddedByUser(vtkMRMLNode*)", self.onCutCurveAdded)
         self.ui.captureViewDirectionButton.connect("clicked(bool)", self.onCaptureViewDirection)
+        self.ui.createSolidButton.connect("clicked(bool)", self.onCreateSolidButton)
+        if importNdimage() is None:
+            for widget in (self.ui.createSolidButton, self.ui.treatBoneAsSolidCheckBox):
+                widget.toolTip = _("Solid bone models need scipy, which is missing from this Slicer installation.")
         self.ui.applyButton.connect("clicked(bool)", self.onApplyButton)
         self.ui.undoButton.connect("clicked(bool)", self.onUndoButton)
         self.ui.mergeButton.connect("clicked(bool)", self.onMergeButton)
@@ -721,6 +744,11 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if not self._parameterNode:
             return
         reason = self.logic.validateInputs(self._parameterNode)
+        haveScipy = importNdimage() is not None
+        inputModel = self._parameterNode.inputModel
+        self.ui.treatBoneAsSolidCheckBox.enabled = haveScipy
+        self.ui.createSolidButton.enabled = (haveScipy and inputModel is not None
+                                             and not self.logic.isSolidModel(inputModel))
         self.ui.applyButton.enabled = reason is None
         self.ui.applyButton.toolTip = reason or _("Cut the model along the cutting sheet.")
         self.ui.undoButton.enabled = bool(self.logic.getCurveResult(self._parameterNode.cutCurve))
@@ -782,6 +810,26 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             progress.close()
             self._updateActionState()
 
+    def onCreateSolidButton(self) -> None:
+        """Create a solid version of the model to cut and select it, with a progress dialog."""
+        parameterNode = self._requireParameterNode()
+        progress = slicer.util.createProgressDialog(labelText=_("Making the bone solid..."), maximum=100)
+
+        def reportProgress(percent: int, message: str) -> None:
+            progress.labelText = message
+            progress.value = percent
+            slicer.app.processEvents()
+
+        try:
+            with slicer.util.tryWithErrorDisplay(_("Failed to create the solid bone model."), waitCursor=True):
+                solidNode = self.logic.createSolidModel(parameterNode.inputModel, parameterNode.solidVoxelSize,
+                                                        parameterNode.solidGapSeal, reportProgress)
+                parameterNode.inputModel = solidNode
+                self._resultMessage = _("Solid bone model {name} created.").format(name=solidNode.GetName())
+        finally:
+            progress.close()
+            self._updateActionState()
+
     def onUndoButton(self) -> None:
         """Remove the fragments of the selected cut path and show its input model again."""
         with slicer.util.tryWithErrorDisplay(_("Failed to undo the cut."), waitCursor=True):
@@ -812,6 +860,8 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         # (cache key, vtkStaticCellLocator on the triangulated world mesh) of the last used model
         # surface, for snapping and the cut outline
         self._surfaceLocatorCache = None
+        # Model node ID -> (cache key, solid world mesh), most recently used last
+        self._solidCache = {}
 
     # A path segment closer than this angle to its extrusion direction is rejected, because the
     # sheet would degenerate to a sliver there.
@@ -869,6 +919,18 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
     LIMITED_IDEAL_KERF_WIDTH = 0.1
     # Line width (pixels) of the cut outline preview
     OUTLINE_LINE_WIDTH = 4.0
+
+    # Solid bone models (makeSolidPolyData): at most this many voxels in the working volume
+    # (a few bytes each in several arrays)
+    MAX_SOLID_VOXELS = 150_000_000
+    # Solid pieces smaller than this fraction of the largest piece's volume are dropped (specks)
+    SOLID_MIN_PIECE_FRACTION = 0.01
+    # Distance transforms of the closing run on slabs of about this many voxels
+    SOLID_SLAB_VOXELS = 8_000_000
+    # Pass band of the windowed sinc smoothing of the voxel surface (as Slicer's segmentations)
+    SOLID_SMOOTHING_PASS_BAND = 0.01
+    # Solid copies of this many models are kept for sequential cuts
+    SOLID_CACHE_SIZE = 3
 
     def getParameterNode(self) -> OsteotomyCutsParameterNode:
         """Return the module's parameter node, creating it if needed.
@@ -2550,6 +2612,193 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         result.DeepCopy(clean.GetOutput())
         return result
 
+    def makeSolidPolyData(self, polyData: vtk.vtkPolyData, voxelSize: float = 0.25, closingMm: float = 1.5,
+                          smoothingIterations: int = 20,
+                          progressCallback: Optional[ProgressCallback] = None) -> vtk.vtkPolyData:
+        """Return a closed, solid version of a bone surface (the input is not modified).
+
+        Segmented bone models often have holes, internal surfaces (marrow, canals, the inner
+        side of the cortex) and loose specks, so a cut does not separate them cleanly. Here the
+        surface is voxelised: the inside found by a scan-line stencil, plus every voxel the
+        surface passes through (so the shell stays closed where the mesh has holes). Gaps are
+        then sealed by a morphological closing with a ball of radius closingMm (exact Euclidean
+        distance transforms), enclosed cavities are filled, pieces smaller than
+        SOLID_MIN_PIECE_FRACTION of the largest are dropped, and the surface is rebuilt
+        (flying edges) and smoothed (windowed sinc). Surface voxels outside the stencil are
+        peeled where bone lies behind them, so the surface is not moved outwards on average;
+        plates thinner than a voxel are kept, a voxel thick. The surface moves by up to about
+        half a voxel.
+
+        :param polyData: bone mesh in world coordinates.
+        :param voxelSize: voxel edge (mm); smaller keeps more detail but needs more memory.
+        :param closingMm: radius (mm) of the closing; holes up to about twice this are sealed.
+        :param smoothingIterations: iterations of the windowed sinc smoothing (0 = none).
+        :param progressCallback: called with (percent, message) between stages.
+        :return: closed triangle mesh with outward point normals.
+        :raises ValueError: if scipy is missing, the mesh has no polygons, or the volume would
+            need more than MAX_SOLID_VOXELS voxels (a coarser voxel size is suggested).
+        """
+        report = progressCallback or (lambda percent, message: None)
+        ndimage = importNdimage()
+        if ndimage is None:
+            raise ValueError(_("Solid bone models need scipy, which is missing from this Slicer installation."))
+        if not voxelSize > 0 or closingMm < 0:
+            raise ValueError(_("The solid model detail must be positive and the gap sealing not negative."))
+        triangles = self._ensureTriangles(polyData)
+        if triangles.GetNumberOfPolys() == 0:
+            raise ValueError(_("The model has no surface polygons."))
+
+        # Working volume: the bounds plus room for the closing and a background border
+        margin = closingMm + 2.0 * voxelSize
+        bounds = np.array(triangles.GetBounds())
+        origin = bounds[0::2] - margin
+        dimensions = np.ceil((bounds[1::2] + margin - origin) / voxelSize).astype(np.int64) + 1
+        voxelCount = int(np.prod(dimensions))
+        if voxelCount > self.MAX_SOLID_VOXELS:
+            suggested = voxelSize * (voxelCount / self.MAX_SOLID_VOXELS) ** (1.0 / 3.0)
+            raise ValueError(_("The model is too large for a solid model with {size:.2f} mm detail ({count} million "
+                               "voxels, at most {limit} million). Use a detail of {suggested:.2f} mm or more.").format(
+                size=voxelSize, count=voxelCount // 1_000_000, limit=self.MAX_SOLID_VOXELS // 1_000_000,
+                suggested=np.ceil(suggested * 100.0) / 100.0))
+        spacing = (voxelSize,) * 3
+        shape = tuple(int(n) for n in dimensions[::-1])  # numpy order (z, y, x)
+
+        report(0, _("Making the bone solid: filling..."))
+        stencil = vtk.vtkPolyDataToImageStencil()
+        stencil.SetInputData(triangles)
+        stencil.SetOutputOrigin(*origin)
+        stencil.SetOutputSpacing(*spacing)
+        stencil.SetOutputWholeExtent(0, int(dimensions[0]) - 1, 0, int(dimensions[1]) - 1, 0, int(dimensions[2]) - 1)
+        toImage = vtk.vtkImageStencilToImage()
+        toImage.SetInputConnection(stencil.GetOutputPort())
+        toImage.SetInsideValue(1)
+        toImage.SetOutsideValue(0)
+        toImage.SetOutputScalarTypeToUnsignedChar()
+        toImage.Update()
+        inside = numpy_support.vtk_to_numpy(toImage.GetOutput().GetPointData().GetScalars()).reshape(shape) > 0
+        report(15, _("Making the bone solid: surface..."))
+        surface = np.zeros(shape, dtype=bool)
+        self._markSurfaceVoxels(surface, triangles, origin, voxelSize)
+        mask = inside | surface
+
+        report(30, _("Making the bone solid: sealing gaps..."))
+        if closingMm > 0:
+            mask = self._dilateMask(mask, closingMm, voxelSize, ndimage)
+            mask = ~self._dilateMask(~mask, closingMm, voxelSize, ndimage)  # erosion
+
+        report(60, _("Making the bone solid: filling cavities..."))
+        background, _count = ndimage.label(~mask)
+        borderLabels = np.unique(np.concatenate([background[[0, -1]].ravel(), background[:, [0, -1]].ravel(),
+                                                 background[:, :, [0, -1]].ravel()]))
+        mask = ~np.isin(background, borderLabels[borderLabels > 0])
+        del background
+        # Surface voxels outside the stencil would move the surface out by half a voxel on
+        # average: peel those on the outside with bone behind them (thin plates stay)
+        mask &= ~(surface & ~inside & ndimage.binary_dilation(~mask) & ndimage.binary_dilation(inside & mask))
+        del inside, surface
+        pieces, pieceCount = ndimage.label(mask)
+        if pieceCount == 0:
+            raise ValueError(_("The solid model is empty. Use a finer detail."))
+        sizes = np.bincount(pieces.ravel())
+        sizes[0] = 0
+        kept = sizes >= self.SOLID_MIN_PIECE_FRACTION * sizes.max()
+        mask = kept[pieces]
+        del pieces
+        dropped = int(pieceCount - np.count_nonzero(kept))
+
+        report(75, _("Making the bone solid: surface..."))
+        image = vtk.vtkImageData()
+        image.SetDimensions(*(int(n) for n in dimensions))
+        image.SetOrigin(*origin)
+        image.SetSpacing(*spacing)
+        scalars = numpy_support.numpy_to_vtk(mask.astype(np.uint8).ravel(), deep=True,
+                                             array_type=vtk.VTK_UNSIGNED_CHAR)
+        image.GetPointData().SetScalars(scalars)
+        del mask
+        contour = vtk.vtkFlyingEdges3D()
+        contour.SetInputData(image)
+        contour.SetValue(0, 0.5)
+        contour.ComputeNormalsOff()
+        contour.ComputeGradientsOff()
+        contour.ComputeScalarsOff()
+        surfacePort = contour.GetOutputPort()
+        if smoothingIterations > 0:
+            smoother = vtk.vtkWindowedSincPolyDataFilter()
+            smoother.SetInputConnection(surfacePort)
+            smoother.SetNumberOfIterations(int(smoothingIterations))
+            smoother.BoundarySmoothingOff()
+            smoother.FeatureEdgeSmoothingOff()
+            smoother.SetFeatureAngle(120.0)  # the right angles of the voxel steps are not features
+            smoother.SetPassBand(self.SOLID_SMOOTHING_PASS_BAND)
+            smoother.NonManifoldSmoothingOn()
+            smoother.NormalizeCoordinatesOn()
+            surfacePort = smoother.GetOutputPort()
+        normals = vtk.vtkPolyDataNormals()
+        normals.SetInputConnection(surfacePort)
+        normals.SplittingOff()
+        normals.ConsistencyOn()
+        normals.AutoOrientNormalsOn()
+        normals.Update()
+        result = vtk.vtkPolyData()
+        result.DeepCopy(normals.GetOutput())
+        report(100, _("Making the bone solid: done."))
+
+        def volume(mesh: vtk.vtkPolyData) -> float:
+            massProperties = vtk.vtkMassProperties()
+            massProperties.SetInputData(mesh)
+            massProperties.Update()
+            return massProperties.GetVolume()
+
+        logging.info(f"OsteotomyCuts: solid model with {voxelSize:g} mm voxels, {closingMm:g} mm gap sealing: "
+                     f"volume {volume(triangles):.0f} -> {volume(result):.0f} mm3 (the first is only meaningful "
+                     f"for a closed input), {result.GetNumberOfPolys()} triangles, {dropped} speck(s) dropped")
+        return result
+
+    @staticmethod
+    def _markSurfaceVoxels(mask: np.ndarray, triangles: vtk.vtkPolyData, origin: np.ndarray,
+                           voxelSize: float) -> None:
+        """Set the voxels (mask in (z, y, x) order, voxel centres at origin + index * voxelSize)
+        that the triangles pass through, sampling each triangle at most half a voxel apart."""
+        points = numpy_support.vtk_to_numpy(triangles.GetPoints().GetData()).astype(float)
+        corners = points[numpy_support.vtk_to_numpy(triangles.GetPolys().GetConnectivityArray()).reshape(-1, 3)]
+        edgeLengths = np.linalg.norm(corners - np.roll(corners, 1, axis=1), axis=2).max(axis=1)
+        steps = np.maximum(np.ceil(edgeLengths / (0.5 * voxelSize)), 1).astype(np.int64)
+        limit = np.array(mask.shape[::-1]) - 1
+        for n in np.unique(steps):
+            i, j = np.meshgrid(np.arange(n + 1), np.arange(n + 1), indexing="ij")
+            inside = i + j <= n
+            a, b = i[inside] / n, j[inside] / n
+            weights = np.stack([1.0 - a - b, a, b], axis=1)  # (m, 3)
+            group = corners[steps == n]
+            chunk = max(1, 4_000_000 // len(weights))
+            for start in range(0, len(group), chunk):
+                samples = np.einsum("mc,kcx->kmx", weights, group[start:start + chunk]).reshape(-1, 3)
+                ijk = np.clip(np.rint((samples - origin) / voxelSize).astype(np.int64), 0, limit)
+                mask[ijk[:, 2], ijk[:, 1], ijk[:, 0]] = True
+
+    def _dilateMask(self, mask: np.ndarray, radius: float, voxelSize: float, ndimage) -> np.ndarray:
+        """Dilate a (z, y, x) mask with an exact ball of the given radius (mm).
+
+        Euclidean distance transforms on slabs along z, overlapping by the radius, so memory
+        stays bounded on large volumes; the result is the same as on the whole volume.
+        """
+        result = np.zeros_like(mask)
+        overlap = int(np.ceil(radius / voxelSize)) + 1
+        depth = mask.shape[0]
+        slab = max(8, self.SOLID_SLAB_VOXELS // max(1, mask.shape[1] * mask.shape[2]))
+        for z0 in range(0, depth, slab):
+            z1 = min(z0 + slab, depth)
+            low, high = max(0, z0 - overlap), min(depth, z1 + overlap)
+            part = mask[low:high]
+            if not part.any():
+                continue
+            if part.all():
+                result[z0:z1] = True
+                continue
+            distances = ndimage.distance_transform_edt(~part, sampling=voxelSize)
+            result[z0:z1] = distances[z0 - low:z1 - low] <= radius
+        return result
+
     #
     # Inputs and directions (MRML)
     #
@@ -2695,20 +2944,24 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
     def _getSurfaceLocator(self, modelNode: vtkMRMLModelNode) -> vtk.vtkStaticCellLocator:
         """Cell locator on the model surface in world coordinates, cached until the model changes.
         Its data set (GetDataSet()) is the triangulated world mesh."""
-        transformNode = modelNode.GetParentTransformNode()
         polyData = modelNode.GetPolyData()
-        matrixKey = None
-        if transformNode is not None and transformNode.IsTransformToWorldLinear():
-            matrix = vtk.vtkMatrix4x4()
-            transformNode.GetMatrixTransformToWorld(matrix)
-            matrixKey = tuple(matrix.GetElement(r, c) for r in range(4) for c in range(4))
-        key = (modelNode.GetID(), polyData.GetMTime() if polyData else 0, matrixKey)
+        key = (modelNode.GetID(), polyData.GetMTime() if polyData else 0, self._worldMatrixKey(modelNode))
         if self._surfaceLocatorCache is None or self._surfaceLocatorCache[0] != key:
             locator = vtk.vtkStaticCellLocator()
             locator.SetDataSet(self._ensureTriangles(self.getWorldPolyData(modelNode)))
             locator.BuildLocator()
             self._surfaceLocatorCache = (key, locator)
         return self._surfaceLocatorCache[1]
+
+    @staticmethod
+    def _worldMatrixKey(modelNode: vtkMRMLModelNode) -> Optional[tuple]:
+        """The model's linear transform to world as a tuple (None without one), for cache keys."""
+        transformNode = modelNode.GetParentTransformNode()
+        if transformNode is None or not transformNode.IsTransformToWorldLinear():
+            return None
+        matrix = vtk.vtkMatrix4x4()
+        transformNode.GetMatrixTransformToWorld(matrix)
+        return tuple(matrix.GetElement(r, c) for r in range(4) for c in range(4))
 
     #
     # Cutting sheet preview (MRML)
@@ -2840,7 +3093,7 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
 
         report = progressCallback or (lambda percent, message: None)
         report(0, _("Preparing..."))
-        polyData = self.getWorldPolyData(inputModel)
+        polyData, isSolid = self.getModelToCut(parameterNode, progressCallback)
         sheet = self.buildSheetForParameters(parameterNode)
         fragments = self.cutPolyData(polyData, [sheet], parameterNode.options, progressCallback)
         # A limited cut may only cut a groove or a slot (cutPolyData has checked that it removed bone)
@@ -2851,8 +3104,83 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         report(90, _("Creating fragment models..."))
         self.removeCutResult(curveNode)
         nodes = self.createFragmentNodes(fragments, inputModel, curveNode)
+        if isSolid and parameterNode.options.capCutFaces:
+            for node in nodes:  # closed pieces of a solid: later cuts use them as they are
+                node.SetAttribute(SOLID_ATTRIBUTE, "1")
         report(100, _("Done."))
         return nodes
+
+    @staticmethod
+    def isSolidModel(modelNode: vtkMRMLModelNode) -> bool:
+        """Return True for a model marked solid (SOLID_ATTRIBUTE), which is cut as it is."""
+        return modelNode is not None and modelNode.GetAttribute(SOLID_ATTRIBUTE) == "1"
+
+    def getModelToCut(self, parameterNode: OsteotomyCutsParameterNode,
+                      progressCallback: Optional[ProgressCallback] = None) -> tuple[vtk.vtkPolyData, bool]:
+        """Return the world mesh that a cut of the input model uses, and whether it is solid.
+
+        With treatBoneAsSolid, a model not marked solid is replaced by its solid version
+        (getSolidPolyData, cached). Without scipy the model is used as it is (with a warning).
+
+        :raises ValueError: if the model is empty, under a non-linear transform, or too large
+            for a solid model at the chosen detail.
+        """
+        inputModel = parameterNode.inputModel
+        if self.isSolidModel(inputModel):
+            return self.getWorldPolyData(inputModel), True
+        if not parameterNode.treatBoneAsSolid:
+            return self.getWorldPolyData(inputModel), False
+        if importNdimage() is None:
+            logging.warning("OsteotomyCuts: scipy is missing, so the bone is cut as it is, not as a solid.")
+            return self.getWorldPolyData(inputModel), False
+        return self.getSolidPolyData(inputModel, parameterNode.solidVoxelSize, parameterNode.solidGapSeal,
+                                     progressCallback), True
+
+    def getSolidPolyData(self, modelNode: vtkMRMLModelNode, voxelSize: float, gapSeal: float,
+                         progressCallback: Optional[ProgressCallback] = None) -> vtk.vtkPolyData:
+        """Return the solid version (makeSolidPolyData) of a model's world mesh.
+
+        Cached per model, keyed by its mesh modification time, transform and the settings, so
+        that re-applying a cut does not rebuild it. The cached mesh must not be modified.
+
+        :raises ValueError: as makeSolidPolyData, or getWorldPolyData.
+        """
+        key = (modelNode.GetPolyData().GetMTime() if modelNode.GetPolyData() else 0,
+               self._worldMatrixKey(modelNode), float(voxelSize), float(gapSeal))
+        cached = self._solidCache.pop(modelNode.GetID(), None)
+        if cached is None or cached[0] != key:
+            cached = (key, self.makeSolidPolyData(self.getWorldPolyData(modelNode), voxelSize, gapSeal,
+                                                  progressCallback=progressCallback))
+        self._solidCache[modelNode.GetID()] = cached  # most recently used last
+        while len(self._solidCache) > self.SOLID_CACHE_SIZE:
+            del self._solidCache[next(iter(self._solidCache))]
+        return cached[1]
+
+    def createSolidModel(self, modelNode: vtkMRMLModelNode, voxelSize: float, gapSeal: float,
+                         progressCallback: Optional[ProgressCallback] = None) -> vtkMRMLModelNode:
+        """Create "<Name>_solid", a solid version of the model in world coordinates, marked
+        solid, next to it in the subject hierarchy with its colour. The original is hidden,
+        never modified.
+
+        :raises ValueError: as makeSolidPolyData, or if the model is empty or under a
+            non-linear transform.
+        """
+        if modelNode is None:
+            raise ValueError(_("Select a model to cut."))
+        solid = vtk.vtkPolyData()
+        solid.DeepCopy(self.getSolidPolyData(modelNode, voxelSize, gapSeal, progressCallback))
+        node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode", f"{modelNode.GetName()}_solid")
+        node.SetAndObservePolyData(solid)
+        node.CreateDefaultDisplayNodes()
+        node.SetAttribute(SOLID_ATTRIBUTE, "1")
+        shNode = slicer.mrmlScene.GetSubjectHierarchyNode()
+        shNode.SetItemParent(shNode.GetItemByDataNode(node),
+                             shNode.GetItemParent(shNode.GetItemByDataNode(modelNode)))
+        displayNode = modelNode.GetDisplayNode()
+        if displayNode is not None:
+            node.GetDisplayNode().SetColor(displayNode.GetColor())
+            displayNode.SetVisibility(False)
+        return node
 
     def createFragmentNodes(self, fragments: list[vtk.vtkPolyData], inputModel: vtkMRMLModelNode,
                             curveNode: vtkMRMLMarkupsCurveNode) -> list[vtkMRMLModelNode]:
@@ -3163,6 +3491,9 @@ class OsteotomyCutsTest(ScriptedLoadableModuleTest):
         self.assertEqual(parameterNode.options.endExtension, 0.0)
         self.assertTrue(parameterNode.options.capCutFaces)
         self.assertEqual(parameterNode.options.refineEdgeLength, 0.0)
+        self.assertTrue(parameterNode.treatBoneAsSolid)
+        self.assertEqual(parameterNode.solidVoxelSize, 0.25)
+        self.assertEqual(parameterNode.solidGapSeal, 1.5)
 
         parameterNode.viewDirection = (0.0, 1.0, 0.0)
         parameterNode.directionMode = DirectionMode.LINE
@@ -3509,8 +3840,10 @@ class OsteotomyCutsTest(ScriptedLoadableModuleTest):
         return node
 
     @staticmethod
-    def _configure(model, curve, direction=DOWN) -> OsteotomyCutsParameterNode:
+    def _configure(model, curve, direction=DOWN, solid=False) -> OsteotomyCutsParameterNode:
+        """Parameters for cutting model with curve; the model is cut as it is unless solid is set."""
         parameterNode = OsteotomyCutsLogic().getParameterNode()
+        parameterNode.treatBoneAsSolid = solid
         parameterNode.inputModel = model
         parameterNode.cutCurve = curve
         parameterNode.directionMode = DirectionMode.VIEW
@@ -3752,6 +4085,7 @@ class OsteotomyCutsTest(ScriptedLoadableModuleTest):
         self.assertIsNone(logic.validateInputs(parameterNode))
 
         # A fragment cannot be cut again by the curve that produced it
+        parameterNode.treatBoneAsSolid = False
         fragment = logic.applyCut(parameterNode)[0]
         parameterNode.inputModel = fragment
         self.assertIn("produced by this cut path", logic.validateInputs(parameterNode))
@@ -3947,7 +4281,7 @@ class OsteotomyCutsTest(ScriptedLoadableModuleTest):
         rawNode = parameterNode.parameterNode
         del parameterNode  # the wrapper would try (and fail) to re-read the node as it is edited
         newOptions = ("options.kerfWidth", "options.depth", "options.capCutFaces", "options.refineEdgeLength",
-                      "options.endExtension")
+                      "options.endExtension", "treatBoneAsSolid", "solidVoxelSize", "solidGapSeal")
         for name in newOptions:  # as saved by Phase 1
             rawNode.UnsetParameter(name)
 
@@ -3964,6 +4298,9 @@ class OsteotomyCutsTest(ScriptedLoadableModuleTest):
         self.assertEqual(parameterNode.options.extension, 250.0)
         self.assertEqual(parameterNode.options.kerfWidth, 0.0)
         self.assertTrue(parameterNode.options.capCutFaces)
+        self.assertTrue(parameterNode.treatBoneAsSolid)
+        self.assertEqual(parameterNode.solidVoxelSize, 0.25)
+        self.assertEqual(parameterNode.solidGapSeal, 1.5)
         self.assertEqual(parameterNode.cutCurve.GetName(), "CutA")
         self.assertEqual(logic.addMissingParameters(parameterNode.parameterNode), [])
 
@@ -4651,3 +4988,135 @@ class OsteotomyCutsTest(ScriptedLoadableModuleTest):
         self.assertIsNone(logic.updateSheetModel(parameterNode))
         self.assertFalse(outlineNode.GetDisplayNode().GetVisibility())
         self.assertEqual(len(slicer.util.getNodes("CutOutline*")), 1)
+
+    #
+    # Release Part 1: solid bone models
+    #
+
+    @staticmethod
+    def _holedSphere(radius: float, holeRadius: float) -> vtk.vtkPolyData:
+        """Sphere at the origin with a round hole of about holeRadius at +x."""
+        hole = vtk.vtkSphere()
+        hole.SetCenter(radius, 0.0, 0.0)
+        hole.SetRadius(holeRadius)
+        clip = vtk.vtkClipPolyData()
+        clip.SetInputData(OsteotomyCutsTest._sphere(radius))
+        clip.SetClipFunction(hole)
+        clip.Update()
+        return clip.GetOutput()
+
+    def _hollowSphere(self) -> vtk.vtkPolyData:
+        """Shell between spheres of radius 30 and 20, its cavity open to the outside through a
+        tunnel 1 mm wide along +x (an open, non-solid bone model)."""
+        tube = vtk.vtkCylinderSource()  # along y
+        tube.SetRadius(0.5)
+        tube.SetHeight(10.0)
+        tube.SetResolution(16)
+        tube.CappingOff()
+        transform = vtk.vtkTransform()
+        transform.Translate(25.0, 0.0, 0.0)
+        transform.RotateZ(-90.0)
+        moved = vtk.vtkTransformPolyDataFilter()
+        moved.SetInputConnection(tube.GetOutputPort())
+        moved.SetTransform(transform)
+        moved.Update()
+        return self._append(self._holedSphere(30.0, 0.5), self._holedSphere(20.0, 0.5), moved.GetOutput())
+
+    def _boxWithMarrow(self) -> vtk.vtkPolyData:
+        """40 mm box with an internal sphere surface of radius 10 (like the inner cortex)."""
+        return self._append(self._box(20.0, 10), self._sphere(10.0, resolution=32))
+
+    def _assertClosedSolid(self, polyData: vtk.vtkPolyData, expectedVolume: float) -> None:
+        logic = OsteotomyCutsLogic()
+        merged = logic.mergeCoincidentPoints(polyData)
+        self.assertEqual(self._openEdgeCount(merged), 0)
+        self.assertEqual(logic._connectedRegions(merged)[3], 1)
+        self.assertAlmostEqual(self._volume(merged), expectedVolume, delta=0.03 * expectedVolume)
+
+    def test_solid_hollowSphere(self):
+        """A hollow, open sphere becomes one closed solid of the outer sphere's volume; the
+        input is not modified."""
+        logic = OsteotomyCutsLogic()
+        model = self._hollowSphere()
+        self.assertGreater(self._openEdgeCount(model), 0)
+        pointsBefore = self._points(model).copy()
+        solid = logic.makeSolidPolyData(model, voxelSize=0.5)
+        np.testing.assert_array_equal(self._points(model), pointsBefore)
+        self._assertClosedSolid(solid, 4.0 / 3.0 * np.pi * 30.0 ** 3)
+        self.assertIsNotNone(solid.GetPointData().GetNormals())
+
+    def test_solid_sealsHole(self):
+        """A 1 mm hole is sealed; the surface stays within about a voxel of the original."""
+        logic = OsteotomyCutsLogic()
+        solid = logic.makeSolidPolyData(self._holedSphere(20.0, 0.5), voxelSize=0.5)
+        self._assertClosedSolid(solid, 4.0 / 3.0 * np.pi * 20.0 ** 3)
+        radii = self._radii(solid)
+        self.assertLess(np.max(np.abs(radii - 20.0)), 0.5)
+
+    def test_solid_errors(self):
+        """Too many voxels (memory guard) and invalid settings raise ValueError before any work."""
+        logic = OsteotomyCutsLogic()
+        with self.assertRaises(ValueError) as context:
+            logic.makeSolidPolyData(self._box(), voxelSize=0.02)
+        self.assertIn("detail", str(context.exception))
+        for voxelSize, closing in ((0.0, 1.5), (0.5, -1.0)):
+            with self.assertRaises(ValueError):
+                logic.makeSolidPolyData(self._box(), voxelSize=voxelSize, closingMm=closing)
+        with self.assertRaises(ValueError):
+            logic.makeSolidPolyData(vtk.vtkPolyData())
+
+    def test_solid_cutOption(self):
+        """With "treat bone as solid", bone segments are closed and filled, marked solid, and
+        cutting them again uses them as they are; without it the internal surface is kept."""
+        logic = OsteotomyCutsLogic()
+        model = self._addModel(self._boxWithMarrow(), "Box")
+        curve = self._addCurve([[1.3, -30.0, 20.0], [1.3, 30.0, 20.0]], "CutA")
+        parameterNode = self._configure(model, curve)
+
+        nodes = logic.applyCut(parameterNode)  # option off: as before
+        self.assertEqual(len(nodes), 2)
+        for node in nodes:
+            merged = logic.mergeCoincidentPoints(node.GetPolyData())
+            self.assertEqual(logic._connectedRegions(merged)[3], 2)  # box half + marrow half
+            self.assertFalse(logic.isSolidModel(node))
+        self.assertEqual(logic._solidCache, {})
+
+        parameterNode.treatBoneAsSolid = True
+        parameterNode.solidVoxelSize = 0.5
+        nodes = logic.applyCut(parameterNode)
+        self.assertEqual(len(nodes), 2)
+        volumes = sorted(self._volume(node.GetPolyData()) for node in nodes)
+        for node, expected in zip(sorted(nodes, key=lambda n: self._volume(n.GetPolyData())),
+                                  (18.7 * 1600.0, 21.3 * 1600.0)):
+            self._assertClosedSolid(node.GetPolyData(), expected)
+            self.assertTrue(logic.isSolidModel(node))
+        self.assertLess(volumes[0], volumes[1])
+        self.assertFalse(logic.isSolidModel(model))
+        solid = logic.getSolidPolyData(model, 0.5, 1.5)
+        logic.applyCut(parameterNode)  # re-applied: the cached solid is reused
+        self.assertIs(logic.getSolidPolyData(model, 0.5, 1.5), solid)
+
+        # A solid bone segment is cut as it is (no new solid model)
+        right = next(node for node in logic.getCurveResult(curve) if node.GetPolyData().GetBounds()[0] > 0.0)
+        curveB = self._addCurve([[5.0, 2.7, 20.0], [15.0, 2.7, 20.0]], "CutB")
+        parameterNode.inputModel = right
+        parameterNode.cutCurve = curveB
+        self.assertEqual(len(logic.applyCut(parameterNode)), 2)
+        self.assertEqual(list(logic._solidCache), [model.GetID()])
+
+    def test_createSolidModel(self):
+        """"Create solid bone model" adds a closed, marked copy and hides the original, unchanged."""
+        logic = OsteotomyCutsLogic()
+        model = self._addModel(self._boxWithMarrow(), "Box")
+        pointsBefore = self._points(model.GetPolyData()).copy()
+        solidNode = logic.createSolidModel(model, 0.5, 1.5)
+
+        self.assertEqual(solidNode.GetName(), "Box_solid")
+        self.assertTrue(logic.isSolidModel(solidNode))
+        self.assertEqual(solidNode.GetAttribute(SOLID_ATTRIBUTE), "1")
+        self._assertClosedSolid(solidNode.GetPolyData(), 40.0 ** 3)
+        self.assertFalse(self._isVisible(model))
+        self.assertTrue(self._isVisible(solidNode))
+        np.testing.assert_array_equal(self._points(model.GetPolyData()), pointsBefore)
+        # The node's mesh is its own: changing it leaves the cached solid alone
+        self.assertIsNot(solidNode.GetPolyData(), logic.getSolidPolyData(model, 0.5, 1.5))

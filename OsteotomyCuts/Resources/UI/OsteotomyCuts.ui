@@ -118,6 +118,33 @@
         </property>
        </widget>
       </item>
+      <item row="4" column="0">
+       <widget class="QLabel" name="treatBoneAsSolidLabel">
+        <property name="text">
+         <string>Treat bone as solid:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="4" column="1">
+       <widget class="QCheckBox" name="treatBoneAsSolidCheckBox">
+        <property name="toolTip">
+         <string>Cut a solid version of the bone: holes in the surface are sealed and internal surfaces (marrow, canals, inner side of the cortex) are filled, so that the cut separates the bone cleanly into closed segments. The surface is rebuilt at the solid model detail (Advanced), which moves it by about that much. The first cut of a model takes a few seconds longer. Models made with "Create solid bone model" and segments of a solid cut are used as they are.</string>
+        </property>
+        <property name="SlicerParameterName" stdset="0">
+         <string>treatBoneAsSolid</string>
+        </property>
+       </widget>
+      </item>
+      <item row="5" column="1">
+       <widget class="QPushButton" name="createSolidButton">
+        <property name="toolTip">
+         <string>Create a solid copy of the model to cut (named "..._solid"), seal its holes and fill its internal surfaces, and select it for cutting. The original model is hidden, not changed.</string>
+        </property>
+        <property name="text">
+         <string>Create solid bone model</string>
+        </property>
+       </widget>
+      </item>
      </layout>
     </widget>
    </item>
@@ -462,6 +489,67 @@
         </property>
         <property name="SlicerParameterName" stdset="0">
          <string>options.refineEdgeLength</string>
+        </property>
+       </widget>
+      </item>
+      <item row="3" column="0">
+       <widget class="QLabel" name="solidVoxelSizeLabel">
+        <property name="text">
+         <string>Solid model detail:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="3" column="1">
+       <widget class="ctkDoubleSpinBox" name="solidVoxelSizeSpinBox">
+        <property name="toolTip">
+         <string>Size of the smallest detail kept in solid bone models (voxel size). Typical: 0.25 mm for a mandible, 0.4-0.5 mm for a whole skull (finer needs more memory; a model too large for the detail is refused with a suggested value).</string>
+        </property>
+        <property name="decimals">
+         <number>2</number>
+        </property>
+        <property name="singleStep">
+         <double>0.050000000000000</double>
+        </property>
+        <property name="minimum">
+         <double>0.050000000000000</double>
+        </property>
+        <property name="maximum">
+         <double>5.000000000000000</double>
+        </property>
+        <property name="suffix">
+         <string> mm</string>
+        </property>
+        <property name="SlicerParameterName" stdset="0">
+         <string>solidVoxelSize</string>
+        </property>
+       </widget>
+      </item>
+      <item row="4" column="0">
+       <widget class="QLabel" name="solidGapSealLabel">
+        <property name="text">
+         <string>Solid model gap sealing:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="4" column="1">
+       <widget class="ctkDoubleSpinBox" name="solidGapSealSpinBox">
+        <property name="toolTip">
+         <string>Holes and gaps in the bone surface up to about twice this width are sealed in solid bone models (morphological closing radius). Typical: 1.5 mm. Larger values also fill narrow gaps between bones and sharp notches.</string>
+        </property>
+        <property name="decimals">
+         <number>1</number>
+        </property>
+        <property name="singleStep">
+         <double>0.500000000000000</double>
+        </property>
+        <property name="maximum">
+         <double>10.000000000000000</double>
+        </property>
+        <property name="suffix">
+         <string> mm</string>
+        </property>
+        <property name="SlicerParameterName" stdset="0">
+         <string>solidGapSeal</string>
         </property>
        </widget>
       </item>

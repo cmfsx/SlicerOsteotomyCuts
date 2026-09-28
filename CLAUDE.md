@@ -34,7 +34,11 @@ Build one phase at a time. Design each so later phases need no rewrite.
   (options.endExtension), red cut outline in the preview, Le Fort I help.
   Confirmed by the user in Slicer on 2026-09-28 (mandible; a skull that
   did not separate turned out to be a non-solid model, which Part 1 fixes).
-  NEXT: Part 1 (solid bone models), then Parts 2-10 in order. The full
+  Part 1 done 2026-09-28 (solid bone models: makeSolidPolyData, "Create
+  solid bone model", treatBoneAsSolid on by default), AWAITING the user's
+  Slicer test. Deviation from the plan: all pieces >= 1% of the largest are
+  kept (not only the largest), so separate bones / both canals survive.
+  NEXT: Part 2 (model quality warnings), then Parts 3-10 in order. The full
   approved plan (Parts 0-10, with details per part) is in the user's
   Claude plans folder: twinkly-brewing-phoenix.md.
 - To resume in a new session: check `git branch --show-current` is
@@ -67,6 +71,12 @@ Build one phase at a time. Design each so later phases need no rewrite.
   intersection, Cyrus-Beck clip to the triangle.
 - Fragments: connectivity, enclosed shells merged into their host,
   display normals split at sharp edges.
+- Solid bone (applyCut -> getModelToCut, not in cutPolyData): with
+  treatBoneAsSolid the world mesh is replaced by makeSolidPolyData (stencil +
+  surface voxels, slab-wise EDT closing, cavity fill, peel of outer surface
+  voxels, flying edges + windowed sinc), cached per model. Models with
+  attribute OsteotomyCuts.Solid = "1" (button output, capped segments of a
+  solid cut) are cut as they are.
 - scipy (bundled with Slicer) is used with guarded imports.
 
 ## Environment

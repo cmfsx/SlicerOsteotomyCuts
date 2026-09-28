@@ -5,7 +5,8 @@ variable OSTEOTOMYCUTS_MODELS set to a folder holding "Mandible_solid.stl" (a ma
 anterior +y, superior +z, symphysis near x = 0). Without it the script exits 0 after saying so.
 
 Checks: a midline split of the symphysis and a vertical cut through the left body each give
-watertight bone segments. Prints the timings. Exits 0 when all checks pass, 1 otherwise.
+watertight bone segments; a groove; a solid version of the mandible is closed, keeps its volume
+and splits into closed segments; the cut outline is quick. Prints the timings. Exits 0 when all checks pass, 1 otherwise.
 """
 
 import os
@@ -75,6 +76,32 @@ try:
           f"{len(segments)} bone segment(s), open edges {openEdges}")
     if len(segments) < 1 or any(openEdges):
         failures.append("Left body groove: expected closed bone segments")
+
+    # Solid bone model (release Part 1): closed, one piece, close to the (already solid) mandible,
+    # and a cut of it gives closed bone segments
+    start = time.perf_counter()
+    solid = logic.makeSolidPolyData(bone)
+    elapsed = time.perf_counter() - start
+    volumes = []
+    for mesh in (bone, solid):
+        massProperties = vtk.vtkMassProperties()
+        massProperties.SetInputData(mesh)
+        massProperties.Update()
+        volumes.append(massProperties.GetVolume())
+    change = volumes[1] / volumes[0] - 1.0
+    print(f"Solid mandible: {elapsed:.1f} s, {solid.GetNumberOfPolys()} triangles, open edges {openEdgeCount(solid)}, "
+          f"volume change {100.0 * change:+.2f}%")
+    if openEdgeCount(solid) or abs(change) > 0.02:
+        failures.append("Solid mandible: expected a closed model within 2% of the volume")
+    solidSheet = logic.buildSheetPolyData(np.array([[0.0, 90.0, 40.0], [0.0, 30.0, 40.0]]), down,
+                                          logic.computeAutoExtent(solid))
+    start = time.perf_counter()
+    segments = logic.cutPolyData(solid, [solidSheet], options)
+    openEdges = [openEdgeCount(segment) for segment in segments]
+    print(f"Solid mandible midline split: {time.perf_counter() - start:.2f} s, {len(segments)} bone segment(s), "
+          f"open edges {openEdges}")
+    if len(segments) != 2 or any(openEdges):
+        failures.append("Solid mandible midline split: expected 2 closed bone segments")
 
     # Cut outline for the live preview: must be quick on a real bone
     locator = vtk.vtkStaticCellLocator()
