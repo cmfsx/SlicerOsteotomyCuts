@@ -11,6 +11,7 @@ First public release: virtual osteotomies for orthognathic and craniofacial surg
 - **Osteotomy lines** of any shape, placed on the bone surface, cut along a saw direction taken from the 3D view or from a direction line.
 - **Saw blade thickness** (ideal cut, thin 0.5 mm, standard 1.0 mm or custom), **cut depth**, and **cut reach beyond the line** to stop a cut in a gap between bones.
 - **Several osteotomy lines in one step**, each with its own saw direction and limits; later lines stop where they meet earlier ones (e.g. horizontal and pterygomaxillary cuts of a Le Fort I).
+- **Symmetrical cuts:** a midline plane; mirror an osteotomy to the other side (mirrored points and saw directions, same settings, points put on the other side's surface), or make a line (e.g. a genioplasty) symmetric by drawing one half.
 - **Closed (watertight) bone segments**, with a check of every segment and a warning when one is not closed; small loose pieces between cuts are joined to the neighbouring segment.
 - **Solid bone models** (*Create solid bone model*, *Treat bone as solid*): holes sealed, marrow and canals filled, so that segmented bone divides cleanly.
 - **Model check before cutting**: a bone model that is not closed, has internal surfaces or several pieces is reported, with the option to make it solid.
@@ -34,9 +35,9 @@ First public release: virtual osteotomies for orthognathic and craniofacial surg
 
 ### Verification
 
-- 86 headless tests on synthetic geometry, all passing (88 s).
+- 87 headless tests on synthetic geometry, all passing (about 90 s).
 - Benchmark of the cutting core, all capped cuts watertight (including a 1.1 million triangle synthetic jaw, 4.6 s).
-- Checks on de-identified mandible, canal and teeth models: all bone segments closed; the canal correctly reported as entered by a body cut.
+- Checks on de-identified mandible, canal and teeth models: all bone segments closed; the canal correctly reported as entered by a body cut; a left body cut mirrored to the right side gives closed segments.
 - Licence scan (ScanCode Toolkit 32.5.0): only GPL-3.0 licensing, no third-party code.
 
 ### Licence

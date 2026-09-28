@@ -33,6 +33,7 @@ from slicer import (
     vtkMRMLMarkupsCurveNode,
     vtkMRMLMarkupsFiducialNode,
     vtkMRMLMarkupsLineNode,
+    vtkMRMLMarkupsPlaneNode,
     vtkMRMLModelNode,
 )
 
@@ -712,6 +713,7 @@ class OsteotomyCutsParameterNode:
     solidGapSeal - Holes and gaps up to about twice this (mm) are sealed in solid bone models.
     minSegmentPercent - Smaller pieces are joined to a neighbouring bone segment after a cut.
     clearanceMarkups - Points marking where the cut comes closest to each structure to protect.
+    midlinePlane - Plane of symmetry for mirrored and symmetric osteotomy lines.
     """
 
     inputModel: vtkMRMLModelNode
@@ -733,6 +735,7 @@ class OsteotomyCutsParameterNode:
     # to the segment they touch most (joinSmallSegments); 0 keeps every piece
     minSegmentPercent: Annotated[float, WithinRange(0.0, 50.0)] = 1.0
     clearanceMarkups: vtkMRMLMarkupsFiducialNode
+    midlinePlane: vtkMRMLMarkupsPlaneNode
 
 
 #
@@ -795,6 +798,9 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.ui.cutCurveSelector.connect("nodeAddedByUser(vtkMRMLNode*)", self.onCutCurveAdded)
         self.ui.captureViewDirectionButton.connect("clicked(bool)", self.onCaptureViewDirection)
         self.ui.showTermsButton.connect("clicked(bool)", self.onShowTerms)
+        self.ui.createMidlinePlaneButton.connect("clicked(bool)", self.onCreateMidlinePlane)
+        self.ui.mirrorOsteotomyButton.connect("clicked(bool)", self.onMirrorOsteotomy)
+        self.ui.makeSymmetricButton.connect("clicked(bool)", self.onMakeSymmetric)
         self.ui.createSolidButton.connect("clicked(bool)", self.onCreateSolidButton)
         if importNdimage() is None:
             for widget in (self.ui.createSolidButton, self.ui.treatBoneAsSolidCheckBox):
@@ -841,6 +847,9 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self._clearanceTimer.stop()
         self.removeObservers()
         self._observedMarkupsNodes = []
+        self._clearanceResults = {}
+        if self.logic:
+            self.logic.clearCaches()  # cached meshes and locators are not kept alive at exit
 
     def enter(self) -> None:
         """Called each time the user opens this module (asking for the terms of use first, once
@@ -1303,6 +1312,11 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.ui.treatBoneAsSolidCheckBox.enabled = haveScipy
         self.ui.createSolidButton.enabled = (haveScipy and inputModel is not None
                                              and not self.logic.isSolidModel(inputModel))
+        hasPlane = self._parameterNode.midlinePlane is not None
+        hasLine = self._parameterNode.cutCurve is not None
+        self.ui.createMidlinePlaneButton.enabled = inputModel is not None
+        self.ui.mirrorOsteotomyButton.enabled = hasPlane and hasLine
+        self.ui.makeSymmetricButton.enabled = hasPlane and hasLine
         self.ui.applyButton.enabled = reason is None and self._termsAccepted()
         self.ui.applyButton.toolTip = reason or _("Cut the bone along the osteotomy line(s) and create the bone segments.")
         self.ui.undoButton.enabled = self._termsAccepted() and bool(self.logic.getCurveResult(
@@ -1469,6 +1483,30 @@ class OsteotomyCutsWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 "These bone segments are not closed: {names}.\n\nThey may not print correctly and their volumes "
                 "are not reliable. Keep \"Cap cut faces\" on, and use \"Treat bone as solid\" or \"Create solid "
                 "bone model\" for a model with holes.").format(names=", ".join(notClosed)))
+
+    def onCreateMidlinePlane(self) -> None:
+        """Create a midline plane through the bone and select it."""
+        with slicer.util.tryWithErrorDisplay(_("Failed to create the midline plane."), waitCursor=True):
+            parameterNode = self._requireParameterNode()
+            parameterNode.midlinePlane = self.logic.createMidlinePlane(parameterNode.inputModel)
+            self._resultMessage = _("Move and rotate the midline plane onto the true midline with its handles.")
+        self._updateActionState()
+
+    def onMirrorOsteotomy(self) -> None:
+        """Mirror the selected osteotomy to the other side and select the copy."""
+        with slicer.util.tryWithErrorDisplay(_("Failed to mirror the osteotomy."), waitCursor=True):
+            parameterNode = self._requireParameterNode()
+            created = self.logic.mirrorOsteotomy(parameterNode)
+            parameterNode.cutCurve = created[0]  # its stored settings are shown (_syncLineSettings)
+            self._resultMessage = _("Mirrored osteotomy created: {names}. Check it in the preview, then make the "
+                                    "cut.").format(names=", ".join(node.GetName() for node in created))
+        self._updateActionState()
+
+    def onMakeSymmetric(self) -> None:
+        """Make the selected osteotomy line symmetric about the midline plane."""
+        with slicer.util.tryWithErrorDisplay(_("Failed to make the line symmetric."), waitCursor=True):
+            self._resultMessage = self.logic.makeLineSymmetric(self._requireParameterNode())
+        self._updateActionState()
 
     def onCreateSolidButton(self) -> None:
         """Create a solid version of the model to cut and select it, with a progress dialog."""
@@ -4248,6 +4286,13 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
         report(100, _("Done."))
         return nodes
 
+    def clearCaches(self) -> None:
+        """Release the cached solid bone meshes and the surface locator (e.g. when the module
+        widget is cleaned up)."""
+        self._solidCache = {}
+        self._surfaceLocatorCache = None
+        self.lastSegmentQuality = []
+
     _gitHash = None  # cached for the session
 
     @classmethod
@@ -4520,6 +4565,172 @@ class OsteotomyCutsLogic(ScriptedLoadableModuleLogic):
     #
     # Mesh helpers
     #
+
+    #
+    # Symmetry (midline plane, mirrored and symmetric osteotomy lines)
+    #
+
+    # A line's end point closer than this (mm) to the midline plane is placed on it
+    MIDLINE_POINT_TOLERANCE = 1.0
+
+    def createMidlinePlane(self, modelNode: vtkMRMLModelNode) -> vtkMRMLMarkupsPlaneNode:
+        """Create a "Midline plane" through the centre of the model's world bounds, facing left-right
+        (RAS x), sized to the model, with handles to move and rotate it onto the true midline."""
+        if modelNode is None:
+            raise ValueError(_("Select a bone to cut."))
+        bounds = np.zeros(6)
+        modelNode.GetRASBounds(bounds)
+        if not np.all(bounds[1::2] >= bounds[0::2]):
+            raise ValueError(_("The selected model is empty."))
+        plane = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsPlaneNode", _("Midline plane"))
+        plane.SetPlaneType(plane.PlaneTypePointNormal)
+        plane.SetOriginWorld(*((bounds[0::2] + bounds[1::2]) / 2.0))
+        plane.SetNormalWorld(1.0, 0.0, 0.0)
+        plane.SetSizeMode(plane.SizeModeAbsolute)
+        plane.SetSize(float(bounds[3] - bounds[2]) * 1.2 + 10.0, float(bounds[5] - bounds[4]) * 1.2 + 10.0)
+        plane.CreateDefaultDisplayNodes()
+        plane.GetDisplayNode().SetHandlesInteractive(True)
+        plane.GetDisplayNode().SetOpacity(0.3)
+        return plane
+
+    @staticmethod
+    def planeOriginNormal(planeNode: vtkMRMLMarkupsPlaneNode) -> tuple[np.ndarray, np.ndarray]:
+        """(origin, unit normal) of a markups plane in world coordinates.
+
+        :raises ValueError: if there is no plane or its normal is zero.
+        """
+        if planeNode is None:
+            raise ValueError(_("Select or create a midline plane first."))
+        origin, normal = [0.0] * 3, [0.0] * 3
+        planeNode.GetOriginWorld(origin)
+        planeNode.GetNormalWorld(normal)
+        normal = np.array(normal, dtype=float)
+        length = np.linalg.norm(normal)
+        if not length > 0:
+            raise ValueError(_("The midline plane has no direction."))
+        return np.array(origin, dtype=float), normal / length
+
+    @staticmethod
+    def mirrorPoints(points: np.ndarray, origin: np.ndarray, normal: np.ndarray) -> np.ndarray:
+        """Mirror (K, 3) points across the plane through origin with unit normal."""
+        points = np.asarray(points, dtype=float)
+        return points - 2.0 * ((points - origin) @ normal)[:, np.newaxis] * normal
+
+    @staticmethod
+    def mirrorDirection(direction, normal: np.ndarray) -> np.ndarray:
+        """Mirror a direction (vector) across a plane with unit normal."""
+        direction = np.asarray(direction, dtype=float)
+        return direction - 2.0 * np.dot(direction, normal) * normal
+
+    def _setCurvePointsWorld(self, curveNode: vtkMRMLMarkupsCurveNode, points: np.ndarray,
+                             parameterNode: OsteotomyCutsParameterNode) -> None:
+        """Replace a curve's control points (world) and put them on the bone surface if "Keep
+        points on the bone" is on."""
+        wasModifying = curveNode.StartModify()
+        curveNode.RemoveAllControlPoints()
+        for point in points:
+            curveNode.AddControlPointWorld(vtk.vtkVector3d(*point))
+        curveNode.EndModify(wasModifying)
+        if parameterNode.snapToSurface and parameterNode.inputModel is not None:
+            self.snapCurveToSurface(curveNode, parameterNode.inputModel)
+
+    def mirrorOsteotomy(self, parameterNode: OsteotomyCutsParameterNode) -> list[vtkMRMLMarkupsCurveNode]:
+        """Mirror the selected line's osteotomy (all its lines) across the midline plane, e.g. the
+        left BSSO to the right side: new lines "<name> mirrored" with mirrored points and saw
+        directions (a direction line is mirrored too) and the same saw settings, grouped in the
+        same order. The new points are put on the bone surface if "Keep points on the bone" is on,
+        so the new cut follows the other side's actual anatomy.
+
+        :return: the new lines, first line first.
+        :raises ValueError: without a midline plane, an osteotomy line, or a line's settings.
+        """
+        origin, normal = self.planeOriginNormal(parameterNode.midlinePlane)
+        if parameterNode.cutCurve is None:
+            raise ValueError(_("Select or create an osteotomy line."))
+        self.storeLineSettings(parameterNode)
+        created = []
+        for line in self.getOsteotomyLines(parameterNode.cutCurve):
+            settings = self.lineSettingsOf(line, parameterNode)
+            if settings is None:
+                raise ValueError(_("Select {line} as the osteotomy line once to set its saw direction and cut "
+                                   "depth.").format(line=line.GetName()))
+            mirrored = slicer.mrmlScene.AddNewNodeByClass(line.GetClassName(), _("{name} mirrored").format(
+                name=line.GetName()))
+            mirrored.SetCurveTypeToLinear()
+            mirrored.CreateDefaultDisplayNodes()
+            if line.GetDisplayNode() is not None and mirrored.GetDisplayNode() is not None:
+                mirrored.GetDisplayNode().SetSelectedColor(line.GetDisplayNode().GetSelectedColor())
+            self._setCurvePointsWorld(mirrored, self.mirrorPoints(
+                slicer.util.arrayFromMarkupsControlPoints(line, world=True), origin, normal), parameterNode)
+            directionLine = None
+            if settings.directionLine is not None:
+                directionLine = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsLineNode", _("{name} mirrored").format(
+                    name=settings.directionLine.GetName()))
+                slicer.util.updateMarkupsControlPointsFromArray(directionLine, self.mirrorPoints(
+                    slicer.util.arrayFromMarkupsControlPoints(settings.directionLine, world=True), origin, normal),
+                    world=True)
+            viewDirection = (tuple(float(c) for c in self.mirrorDirection(settings.viewDirection, normal))
+                             if isDirectionCaptured(settings.viewDirection) else NOT_CAPTURED)
+            mirroredSettings = LineSettings(settings.directionMode, viewDirection, directionLine, settings.options)
+            self._storeSettingsOn(mirrored, mirroredSettings)
+            created.append(mirrored)
+        self.setGroupLines(created[0], created[1:])
+        return created
+
+    def _storeSettingsOn(self, curveNode: vtkMRMLMarkupsCurveNode, settings: LineSettings) -> None:
+        """Store line settings on a cut path that is not the selected one (as storeLineSettings)."""
+        curveNode.SetAttribute(LINE_SETTINGS_ATTRIBUTE, json.dumps(
+            {"directionMode": settings.directionMode.value, "viewDirection": list(settings.viewDirection),
+             "options": {name: getattr(settings.options, name) for name in self.LINE_OPTION_NAMES}},
+            sort_keys=True))
+        curveNode.SetNodeReferenceID(DIRECTION_LINE_REFERENCE_ROLE,
+                                     settings.directionLine.GetID() if settings.directionLine is not None else None)
+
+    def makeLineSymmetric(self, parameterNode: OsteotomyCutsParameterNode) -> str:
+        """Make the selected osteotomy line symmetric about the midline plane, e.g. a genioplasty:
+        draw it from the midline to one side, then its mirror image is added on the other side.
+
+        Points on the side where most of the line lies are kept, ordered from the midline outwards;
+        an end point within MIDLINE_POINT_TOLERANCE of the plane is placed on it. The mirrored points
+        are added before them, so the line runs from one side to the other. A saw direction from
+        the 3D view is turned into the plane (a symmetric cut needs a direction in the midline plane).
+
+        :return: a message for the user saying what was done.
+        :raises ValueError: without a midline plane or a line of at least 2 points on one side.
+        """
+        origin, normal = self.planeOriginNormal(parameterNode.midlinePlane)
+        curveNode = parameterNode.cutCurve
+        if curveNode is None:
+            raise ValueError(_("Select or create an osteotomy line."))
+        points = np.array(slicer.util.arrayFromMarkupsControlPoints(curveNode, world=True), dtype=float)
+        if len(points) < 2:
+            raise ValueError(_("Place at least {count} points on the osteotomy line.").format(count=2))
+        distances = (points - origin) @ normal
+        side = 1.0 if np.median(distances) >= 0 else -1.0
+        keep = (side * distances > 0) | (np.abs(distances) <= self.MIDLINE_POINT_TOLERANCE)
+        half = points[keep]
+        if len(half) < 2:
+            raise ValueError(_("Draw the osteotomy line from the midline to one side first."))
+        halfDistances = np.abs((half - origin) @ normal)
+        if halfDistances[-1] < halfDistances[0]:
+            half = half[::-1]
+            halfDistances = halfDistances[::-1]
+        if halfDistances[0] <= self.MIDLINE_POINT_TOLERANCE:
+            half[0] -= ((half[0] - origin) @ normal) * normal  # onto the plane, shared by both halves
+            mirrored = self.mirrorPoints(half[1:], origin, normal)[::-1]
+        else:
+            mirrored = self.mirrorPoints(half, origin, normal)[::-1]
+        self._setCurvePointsWorld(curveNode, np.vstack([mirrored, half]), parameterNode)
+        message = _("The osteotomy line is now symmetric about the midline plane.")
+        if parameterNode.directionMode == DirectionMode.VIEW and isDirectionCaptured(parameterNode.viewDirection):
+            direction = np.array(parameterNode.viewDirection, dtype=float)
+            inPlane = direction - np.dot(direction, normal) * normal
+            if np.linalg.norm(inPlane) > 1e-6:
+                parameterNode.viewDirection = tuple(float(c) for c in inPlane / np.linalg.norm(inPlane))
+                message += " " + _("Its saw direction was turned into the midline plane.")
+        elif parameterNode.directionMode == DirectionMode.LINE:
+            message += " " + _("Check that the direction line lies in the midline plane.")
+        return message
 
     #
     # Structures to protect (nerve canal, tooth roots)
@@ -7031,17 +7242,12 @@ class OsteotomyCutsTest(ScriptedLoadableModuleTest):
             self.assertIn("\nTypical:", text, msg=name)
             self.assertIn("\nTechnical:", text, msg=name)
 
-        uiWidget = slicer.util.loadUI(self._moduleFile("Resources", "UI", "OsteotomyCuts.ui"))
-        widgets = slicer.util.childWidgetVariables(uiWidget)
-        try:
-            for widget in root.iter("widget"):
-                self.assertTrue(hasattr(widgets, widget.get("name")) or widget.get("name") == "OsteotomyCuts",
-                                msg=widget.get("name"))
-        finally:
-            del widgets
-            uiWidget.deleteLater()
-            slicer.app.processEvents()
-            slicer.app.sendPostedEvents(None, qt.QEvent.DeferredDelete)
+        # Every widget the code uses (self.ui.<name>) is defined in the .ui file (checked statically:
+        # loading the module's .ui here would leave MRML widget observers behind at exit)
+        uiNames = {widget.get("name") for widget in root.iter("widget")}
+        usedNames = set(re.findall(r"self\.ui\.(\w+)", open(self._moduleFile("OsteotomyCuts.py"), encoding="utf-8").read()))
+        self.assertEqual(sorted(usedNames - uiNames), [])
+        self.assertEqual(len(uiNames), len(list(root.iter("widget"))))  # names are unique
         plainLabels = {text.rstrip(":").strip() for text in labels}
         helpText = " ".join(slicer.modules.osteotomycuts.helpText.split())
         for control in self.HELP_CONTROLS:
@@ -7050,6 +7256,70 @@ class OsteotomyCutsTest(ScriptedLoadableModuleTest):
         self.assertIn("Quick start", helpText)
         self.assertIn(SAFETY_NOTE, helpText)
         self.assertIn("Structures to protect", " ".join(labels))
+
+    #
+    # Symmetry
+    #
+
+    def test_symmetry(self):
+        """A midline plane through the bone; a two-line osteotomy mirrored with its settings and
+        directions; a line drawn to one side made symmetric, with its saw direction in the plane."""
+        logic = OsteotomyCutsLogic()
+        model = self._addModel(self._box(), "Box")
+        plane = logic.createMidlinePlane(model)
+        origin, normal = logic.planeOriginNormal(plane)
+        np.testing.assert_allclose(origin, [0.0, 0.0, 0.0], atol=1e-6)
+        np.testing.assert_allclose(np.abs(normal), [1.0, 0.0, 0.0], atol=1e-9)
+
+        first = self._addCurve([[20.3, -40.0, 50.0], [20.3, 40.0, 50.0]], "Left")
+        second = self._addCurve([[50.0, 10.3, 20.0], [50.0, 10.3, -40.0]], "Left vertical")
+        parameterNode = self._configure(model, second, direction=(-1.0, 0.0, 0.0))
+        parameterNode.snapToSurface = False
+        parameterNode.options.kerfWidth = 1.0
+        logic.storeLineSettings(parameterNode)
+        parameterNode.cutCurve = first
+        logic.loadLineSettings(parameterNode)
+        parameterNode.viewDirection = (0.6, 0.0, -0.8)
+        parameterNode.options.depth = 30.0
+        logic.storeLineSettings(parameterNode)
+        logic.setGroupLines(first, [second])
+        with self.assertRaises(ValueError):
+            logic.mirrorOsteotomy(parameterNode)  # no midline plane yet
+        parameterNode.midlinePlane = plane
+
+        created = logic.mirrorOsteotomy(parameterNode)
+        self.assertEqual([node.GetName() for node in created], ["Left mirrored", "Left vertical mirrored"])
+        self.assertEqual(self._ids(logic.getGroupLines(created[0])), [created[1].GetID()])
+        np.testing.assert_allclose(slicer.util.arrayFromMarkupsControlPoints(created[0], world=True),
+                                   [[-20.3, -40.0, 50.0], [-20.3, 40.0, 50.0]], atol=1e-6)
+        np.testing.assert_allclose(slicer.util.arrayFromMarkupsControlPoints(created[1], world=True),
+                                   [[-50.0, 10.3, 20.0], [-50.0, 10.3, -40.0]], atol=1e-6)
+        mirroredFirst, mirroredSecond = (logic.getLineSettings(node) for node in created)
+        np.testing.assert_allclose(mirroredFirst.viewDirection, (-0.6, 0.0, -0.8), atol=1e-9)
+        self.assertEqual((mirroredFirst.options.depth, mirroredFirst.options.kerfWidth), (30.0, 1.0))
+        np.testing.assert_allclose(mirroredSecond.viewDirection, (1.0, 0.0, 0.0), atol=1e-9)
+        parameterNode.cutCurve = created[1]
+        logic.loadLineSettings(parameterNode)
+        self.assertEqual(len(logic.buildOsteotomy(parameterNode)), 2)  # the mirrored osteotomy is ready to cut
+
+        genioplasty = self._addCurve([[0.4, -45.0, 50.0], [20.0, -30.0, 50.0], [40.0, -10.0, 50.0]], "Genioplasty")
+        parameterNode.cutCurve = genioplasty
+        logic.loadLineSettings(parameterNode)
+        parameterNode.directionMode = DirectionMode.VIEW
+        parameterNode.viewDirection = (0.3, 0.9539392, 0.0)
+        logic.makeLineSymmetric(parameterNode)
+        np.testing.assert_allclose(slicer.util.arrayFromMarkupsControlPoints(genioplasty, world=True),
+                                   [[-40.0, -10.0, 50.0], [-20.0, -30.0, 50.0], [0.0, -45.0, 50.0],
+                                    [20.0, -30.0, 50.0], [40.0, -10.0, 50.0]], atol=1e-6)
+        np.testing.assert_allclose(parameterNode.viewDirection, (0.0, 1.0, 0.0), atol=1e-6)
+
+        # Drawn from the side towards the midline, without touching it: all points mirrored
+        chin = self._addCurve([[30.0, -20.0, 50.0], [10.0, -40.0, 50.0]], "Chin")
+        parameterNode.cutCurve = chin
+        logic.makeLineSymmetric(parameterNode)
+        np.testing.assert_allclose(slicer.util.arrayFromMarkupsControlPoints(chin, world=True),
+                                   [[-30.0, -20.0, 50.0], [-10.0, -40.0, 50.0], [10.0, -40.0, 50.0],
+                                    [30.0, -20.0, 50.0]], atol=1e-6)
 
     def test_disclaimer(self):
         """The terms shown on first use are those of DISCLAIMER.md; the dialog has its controls."""

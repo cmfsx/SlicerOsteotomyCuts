@@ -209,6 +209,78 @@ Technical: as "Treat bone as solid"; the copy is marked solid.</string>
         </property>
        </widget>
       </item>
+      <item row="8" column="0">
+       <widget class="QLabel" name="midlinePlaneLabel">
+        <property name="text">
+         <string>Midline plane:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="8" column="1">
+       <widget class="qMRMLNodeComboBox" name="midlinePlaneSelector">
+        <property name="toolTip">
+         <string>The plane of symmetry used to mirror osteotomy lines to the other side and to make a line symmetric.
+Typical: the midsagittal plane, created below and moved with its handles onto the true midline.
+Technical: markups plane (point and normal); points and saw directions are reflected across it.</string>
+        </property>
+        <property name="nodeTypes">
+         <stringlist notr="true">
+          <string>vtkMRMLMarkupsPlaneNode</string>
+         </stringlist>
+        </property>
+        <property name="noneEnabled">
+         <bool>true</bool>
+        </property>
+        <property name="addEnabled">
+         <bool>false</bool>
+        </property>
+        <property name="removeEnabled">
+         <bool>true</bool>
+        </property>
+        <property name="renameEnabled">
+         <bool>true</bool>
+        </property>
+        <property name="SlicerParameterName" stdset="0">
+         <string>midlinePlane</string>
+        </property>
+       </widget>
+      </item>
+      <item row="9" column="1">
+       <widget class="QPushButton" name="createMidlinePlaneButton">
+        <property name="toolTip">
+         <string>Creates a midline plane through the centre of the bone, facing left-right, with handles to move and rotate it onto the true midline (e.g. through nasion, anterior nasal spine and menton).
+Typical: create once, then adjust it in the 3D view.
+Technical: markups plane at the centre of the model's bounds, normal along RAS x.</string>
+        </property>
+        <property name="text">
+         <string>Create midline plane</string>
+        </property>
+       </widget>
+      </item>
+      <item row="10" column="1">
+       <widget class="QPushButton" name="mirrorOsteotomyButton">
+        <property name="toolTip">
+         <string>Copies the selected osteotomy (all its lines) to the other side, mirrored across the midline plane, with mirrored saw directions and the same blade and cut limits. The copy is selected so that it can be checked and cut.
+Typical: plan the left BSSO, then mirror it for the right side.
+Technical: control points and directions are reflected; the points are then put on the bone surface (Keep points on the bone), so the copy follows the other side's own anatomy.</string>
+        </property>
+        <property name="text">
+         <string>Mirror osteotomy to other side</string>
+        </property>
+       </widget>
+      </item>
+      <item row="11" column="1">
+       <widget class="QPushButton" name="makeSymmetricButton">
+        <property name="toolTip">
+         <string>Makes the selected osteotomy line symmetric: draw it from the midline to one side, and its mirror image is added on the other side. A saw direction from the 3D view is turned into the midline plane.
+Typical: genioplasty, or any cut across the midline.
+Technical: the points on one side are reflected across the midline plane; an end point within 1 mm of the plane is placed on it.</string>
+        </property>
+        <property name="text">
+         <string>Make line symmetric</string>
+        </property>
+       </widget>
+      </item>
      </layout>
     </widget>
    </item>
@@ -1102,6 +1174,12 @@ Technical: mesh append; the lowest-numbered segment keeps its name and colour.</
    <sender>OsteotomyCuts</sender>
    <signal>mrmlSceneChanged(vtkMRMLScene*)</signal>
    <receiver>structureNodeSelector</receiver>
+   <slot>setMRMLScene(vtkMRMLScene*)</slot>
+  </connection>
+  <connection>
+   <sender>OsteotomyCuts</sender>
+   <signal>mrmlSceneChanged(vtkMRMLScene*)</signal>
+   <receiver>midlinePlaneSelector</receiver>
    <slot>setMRMLScene(vtkMRMLScene*)</slot>
   </connection>
   <connection>

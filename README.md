@@ -11,6 +11,7 @@ A [3D Slicer](https://www.slicer.org) extension for virtual osteotomies in ortho
 - **Osteotomy lines of any shape:** click points on the bone surface; each point adds a corner. The cut follows the line along the saw direction, taken from the 3D view or from a direction line.
 - **Saw blade thickness and cut limits:** ideal cut, thin (0.5 mm) or standard (1.0 mm) blade or any thickness; a limited cut depth; and a cut reach beyond the line that stops the cut in a gap between bones.
 - **Several lines in one osteotomy:** e.g. the horizontal and pterygomaxillary cuts of a Le Fort I in one step. Each later line stops where it meets an earlier one. Each line keeps its own saw direction and limits.
+- **Symmetrical cuts:** mirror an osteotomy (e.g. the left BSSO) to the other side across a midline plane, with mirrored saw directions and the same settings, or make a line such as a genioplasty symmetric by drawing one half.
 - **Closed bone segments:** the cut surfaces are closed, so the segments are watertight for 3D printing and volumes. Every segment is checked, and you are warned if one is not closed.
 - **Solid bone models:** segmented bone often has holes and internal surfaces; *Create solid bone model* (or *Treat bone as solid*) seals holes and fills marrow and canals so that the bone divides cleanly.
 - **Live preview:** the planned cut is shown as a red transparent surface, with red lines wherever it comes out of the bone.
@@ -42,6 +43,12 @@ If red lines appear where bone must stay intact (for example the skull base behi
 3. Select the horizontal line again and tick the second one under **Further osteotomy lines**. Check that the red lines stay on the maxilla, then press *Make cut*. Small loose pieces between the cuts are joined to the neighbouring bone segment.
 
 ![Le Fort I](Screenshots/2.png)
+
+## Symmetrical cuts
+
+1. Press **Create midline plane** (section 1): a plane through the centre of the bone, facing left-right. Move and rotate it with its handles onto the true midline (e.g. through nasion, anterior nasal spine and menton).
+2. **Mirror osteotomy to other side:** plan one side (e.g. the left BSSO, all its lines), then press the button. A mirrored copy with mirrored saw directions and the same blade and cut limits is created and selected; its points are put on the other side's bone surface, so it follows that side's own anatomy. Check it in the preview, then make the cut.
+3. **Make line symmetric:** for a cut across the midline such as a genioplasty, draw the line from the midline to one side, then press the button: its mirror image is added on the other side and the saw direction is turned into the midline plane.
 
 ## Structures to protect
 

@@ -130,6 +130,37 @@ try:
         if canal.status != ClearanceStatus.ENTERS or elapsed > 10.0:
             failures.append("Clearance: expected the body cut to enter the canal, within 10 s")
 
+    # Symmetry: the left body cut mirrored to the right side across a midline plane through the
+    # centre of the mandible's bounds; the mirrored points are put on the right side's surface
+    parameterNode = logic.getParameterNode()
+    parameterNode.inputModel = mandible
+    parameterNode.treatBoneAsSolid = False
+    parameterNode.snapToSurface = True
+    left = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsCurveNode", "LeftBodyCut")
+    left.SetCurveTypeToLinear()
+    slicer.util.updateMarkupsControlPointsFromArray(left, np.array(path), world=True)
+    parameterNode.cutCurve = left
+    logic.loadLineSettings(parameterNode)
+    parameterNode.viewDirection = tuple(down)
+    parameterNode.options.kerfWidth = 1.0
+    logic.storeLineSettings(parameterNode)
+    parameterNode.midlinePlane = logic.createMidlinePlane(mandible)
+    start = time.perf_counter()
+    right = logic.mirrorOsteotomy(parameterNode)[0]
+    rightPoints = slicer.util.arrayFromMarkupsControlPoints(right, world=True)
+    surfaceLocator.FindClosestPoint(rightPoints[0].tolist(), [0.0] * 3, vtk.reference(0), vtk.reference(0),
+                                    gap := vtk.reference(0.0))
+    print(f"Mirrored line: {time.perf_counter() - start:.2f} s, x {rightPoints[:, 0].round(1).tolist()} "
+          f"(left {np.array(path)[:, 0].round(1).tolist()}), first point {float(gap) ** 0.5:.3f} mm from the surface")
+    for curve in (left, right):
+        parameterNode.cutCurve = curve
+        logic.loadLineSettings(parameterNode)
+        nodes = logic.applyCut(parameterNode)
+        openEdges = [openEdgeCount(node.GetPolyData()) for node in nodes]
+        print(f"{curve.GetName()}: {len(nodes)} bone segment(s), open edges {openEdges}")
+        if len(nodes) < 2 or any(openEdges) or not rightPoints[0, 0] > 0:
+            failures.append(f"Symmetry: {curve.GetName()} expected closed bone segments on its side")
+
     # Cut outline for the live preview: must be quick on a real bone
     locator = vtk.vtkStaticCellLocator()
     locator.SetDataSet(bone)
