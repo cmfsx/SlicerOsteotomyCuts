@@ -4,6 +4,14 @@ title: "Osteotomy Cuts: a 3D Slicer extension for multi-segment osteotomy planni
 type: software
 version: 1.0.0
 date-released: "2026-09-28"
+doi: 10.5281/zenodo.23021991
+identifiers:
+  - type: doi
+    value: 10.5281/zenodo.23021991
+    description: All versions
+  - type: doi
+    value: 10.5281/zenodo.23021992
+    description: Version 1.0.0
 license: GPL-3.0-or-later
 repository-code: "https://github.com/cmfsx/SlicerOsteotomyCuts"
 url: "https://github.com/cmfsx/SlicerOsteotomyCuts"

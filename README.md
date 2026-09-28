@@ -1,5 +1,7 @@
 <p align="center"><img src="Docs/Logo/OsteotomyCuts_banner.png" width="256" alt="Osteotomy Cuts logo"></p>
 
+[![DOI](https://zenodo.org/badge/1393198499.svg)](https://doi.org/10.5281/zenodo.23021991)
+
 # Osteotomy Cuts
 
 > **Important — research and planning software, not a medical device.** Use is entirely at the user's own risk. Safety checks are an aid only: they depend on the accuracy of the segmented or traced structures, do not guarantee the absence of risk, and do not replace the surgeon's own verification. See [DISCLAIMER.md](DISCLAIMER.md).
@@ -96,7 +98,9 @@ The author is the copyright holder of this software and may offer it under a com
 
 If you use Osteotomy Cuts in your work, please cite it as:
 
-> Herath M. *Osteotomy Cuts: a 3D Slicer extension for multi-segment osteotomy planning in orthognathic and craniofacial surgery*, version 1.0.0. 2026. https://github.com/cmfsx/SlicerOsteotomyCuts. DOI: *to be added after the Zenodo release*.
+> Herath M. OsteotomyCuts: a 3D Slicer extension for multi-segment osteotomy planning. 2026. Software. https://doi.org/10.5281/zenodo.23021991
+
+This DOI covers all versions. To cite v1.0.0 specifically: https://doi.org/10.5281/zenodo.23021992
 
 Citation metadata for reference managers is in [CITATION.cff](CITATION.cff).
 

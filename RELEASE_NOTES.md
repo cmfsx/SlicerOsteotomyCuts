@@ -2,6 +2,8 @@
 
 ## 1.0.0 (2026-09-28)
 
+DOI: 10.5281/zenodo.23021992
+
 First public release: virtual osteotomies for orthognathic and craniofacial surgical planning in 3D Slicer.
 
 > Research and planning software, not a medical device; use is entirely at the user's own risk. See [DISCLAIMER.md](DISCLAIMER.md).
