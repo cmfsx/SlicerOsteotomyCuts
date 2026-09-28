@@ -32,7 +32,14 @@ Build one phase at a time. Design each so later phases need no rewrite.
   Part 0b done (added 2026-09-28: a Le Fort I cut went through the whole
   skull): limited cuts with the ideal blade, "Past line ends"
   (options.endExtension), red cut outline in the preview, Le Fort I help.
-  NEXT: Part 1 (solid bone models).
+  Confirmed by the user in Slicer on 2026-09-28 (mandible; a skull that
+  did not separate turned out to be a non-solid model, which Part 1 fixes).
+  NEXT: Part 1 (solid bone models), then Parts 2-10 in order. The full
+  approved plan (Parts 0-10, with details per part) is in the user's
+  Claude plans folder: twinkly-brewing-phoenix.md.
+- To resume in a new session: check `git branch --show-current` is
+  `release` and `git log --oneline -5`, read the plan file, then start the
+  next part (plan first if the user wants to review it).
 - Workflow: implement one plan step at a time; run the headless tests,
   commit, then stop so the user can test in Slicer before the next step.
 
